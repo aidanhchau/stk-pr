@@ -1,0 +1,5 @@
+[test]
+# Real-git integration tests create repos and worktrees; 5s is too tight under load.
+timeout = 30000
+# Keeps tests off the developer's real ~/.config/stk/prefs.json.
+preload = ["./test/setup.ts"]

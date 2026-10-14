@@ -1,0 +1,8 @@
+{
+  "data": {
+    "repository": {
+      "pr10": { "reviewThreads": { "nodes": [{ "isResolved": true }, { "isResolved": false }, { "isResolved": false }] } },
+      "pr11": { "reviewThreads": { "nodes": [] } }
+    }
+  }
+}

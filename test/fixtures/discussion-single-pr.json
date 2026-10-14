@@ -1,0 +1,71 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          },
+          "nodes": []
+        },
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpO0"
+          },
+          "nodes": [
+            {
+              "author": {
+                "login": "cursor",
+                "__typename": "Bot"
+              },
+              "state": "APPROVED",
+              "body": "<!-- CURSOR_AUTOMATION_ID: 00000000-0000-0000-0000-000000000000 | RUN_ID: bc-00000000 -->\n## Risk assessment: **Very Low**\n\n**Evidence (diff only):** 1 file, 2 hunks in `test/unit/test_widget_cache.py`. Both changes add an optional `cache_id=None` parameter to test fakes, aligning them with the production signature.\n\n**Blast radius:** None for production — test-only.\n\n**Review:** Not required at this risk level.\n\n**Action:** Approved (Very Low).\n\n<sub>Sent by Cursor Automation: Assign PR reviewers</sub>",
+              "submittedAt": "2026-10-13T18:04:16Z",
+              "url": "https://github.com/acme/widgets/pull/102#pullrequestreview-6001"
+            },
+            {
+              "author": {
+                "login": "devin-ai-integration",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "## ✅ Devin Review: No Issues Found\n\nDevin Review analyzed this PR and found no bugs or issues to report.\n\n<!-- devin-review-badge-begin -->\n<a href=\"https://app.devin.ai/review/acme/widgets/pull/102\" target=\"_blank\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://static.devin.ai/assets/gh-devin-review-dark.svg?v=4\"><img src=\"https://static.devin.ai/assets/gh-devin-review-light.svg?v=4\" alt=\"Devin Review\"></picture></a>\n<!-- devin-review-badge-end -->\n\n<!-- devin-review-summary -->",
+              "submittedAt": "2026-10-13T18:04:20Z",
+              "url": "https://github.com/acme/widgets/pull/102#pullrequestreview-6002"
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW6yGXQ="
+          },
+          "nodes": [
+            {
+              "author": {
+                "login": "chatgpt-codex-connector",
+                "__typename": "Bot"
+              },
+              "body": "You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).",
+              "createdAt": "2026-10-13T18:03:42Z",
+              "url": "https://github.com/acme/widgets/pull/102#issuecomment-7101",
+              "isMinimized": false
+            },
+            {
+              "author": {
+                "login": "linear-code",
+                "__typename": "Bot"
+              },
+              "body": "<!-- linear-linkback -->\n<details>\n<summary><a href=\"https://linear.app/acme/issue/ENG-101/update-cache-test-fakes\">ENG-101 Update cache test fakes to accept cache_id</a></summary>\n<p>\n\nFix test failures by updating cache unit test fakes to accept the optional cache_id argument.\n</p>\n</details>\n<!-- linear-review-link -->\n<p><a href=\"https://linear.app/acme/review/update-cache-test-fakes-b11d3a97656e\">Review in Linear</a></p>\n",
+              "createdAt": "2026-10-13T18:14:26Z",
+              "url": "https://github.com/acme/widgets/pull/102#issuecomment-7102",
+              "isMinimized": false
+            }
+          ]
+        }
+      }
+    }
+  }
+}

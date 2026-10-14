@@ -1,0 +1,46 @@
+[
+  {
+    "number": 10,
+    "title": "Base change",
+    "url": "https://github.com/o/r/pull/10",
+    "author": { "login": "octo-dev", "is_bot": false },
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefName": "feat-a",
+    "baseRefName": "main",
+    "headRefOid": "aaa111",
+    "createdAt": "2026-10-01T10:00:00Z",
+    "updatedAt": "2026-10-02T10:00:00Z",
+    "mergeable": "MERGEABLE",
+    "reviewDecision": "",
+    "statusCheckRollup": [
+      { "__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://ci/lint" },
+      { "__typename": "CheckRun", "name": "neutral", "status": "COMPLETED", "conclusion": "NEUTRAL", "detailsUrl": "" },
+      { "__typename": "CheckRun", "name": "skipped", "status": "COMPLETED", "conclusion": "SKIPPED", "detailsUrl": "" },
+      { "__typename": "CheckRun", "name": "cancelled", "status": "COMPLETED", "conclusion": "CANCELLED", "detailsUrl": "" },
+      { "__typename": "CheckRun", "name": "timeout", "status": "COMPLETED", "conclusion": "TIMED_OUT", "detailsUrl": "" },
+      { "__typename": "CheckRun", "name": "action", "status": "COMPLETED", "conclusion": "ACTION_REQUIRED", "detailsUrl": "" },
+      { "__typename": "CheckRun", "name": "startup", "status": "COMPLETED", "conclusion": "STARTUP_FAILURE", "detailsUrl": "" },
+      { "__typename": "CheckRun", "name": "failed", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://ci/failed" },
+      { "__typename": "CheckRun", "name": "running", "status": "IN_PROGRESS", "conclusion": "", "detailsUrl": "https://ci/running" },
+      { "__typename": "StatusContext", "context": "vercel", "state": "SUCCESS", "targetUrl": "https://vercel/x" },
+      { "__typename": "StatusContext", "context": "ctx-pending", "state": "PENDING", "targetUrl": "" },
+      { "__typename": "StatusContext", "context": "ctx-error", "state": "ERROR", "targetUrl": "" },
+      { "__typename": "StatusContext", "context": "ctx-fail", "state": "FAILURE", "targetUrl": "" }
+    ]
+  },
+  {
+    "number": 11,
+    "title": "Child change",
+    "url": "https://github.com/o/r/pull/11",
+    "author": { "login": "octo-dev", "is_bot": false },
+    "state": "OPEN",
+    "isDraft": true,
+    "headRefName": "feat-b",
+    "baseRefName": "feat-a",
+    "headRefOid": "bbb222",
+    "mergeable": "CONFLICTING",
+    "reviewDecision": "APPROVED",
+    "statusCheckRollup": null
+  }
+]

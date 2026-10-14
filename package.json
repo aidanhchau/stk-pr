@@ -1,0 +1,49 @@
+{
+  "name": "stk-pr",
+  "version": "0.1.0",
+  "description": "Terminal UI for GitHub pull requests and stacks: blockers, review threads, diffs, and bottom-up stack merges.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Aidan Chau",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aidanhchau/stk-pr.git"
+  },
+  "homepage": "https://github.com/aidanhchau/stk-pr#readme",
+  "bugs": "https://github.com/aidanhchau/stk-pr/issues",
+  "keywords": [
+    "github",
+    "pull-request",
+    "stacked-prs",
+    "tui",
+    "cli",
+    "bun"
+  ],
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "bin": {
+    "stk": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "plugin",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "19",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.6.4",
+    "@opentui/react": "^0.6.4",
+    "react": "19"
+  }
+}

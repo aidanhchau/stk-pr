@@ -1,0 +1,3 @@
+node_modules
+.stk-tmp
+plugin/tern.d.luau

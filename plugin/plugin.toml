@@ -1,0 +1,8 @@
+schema = 1
+id = "stk"
+name = "stk"
+version = "0.2.0"
+description = "Launch the stk PR terminal UI beside the focused pane (optional Tern integration)."
+icon = "merge"
+window = "window.luau"
+# omp.css is NOT listed: window.luau installs it via tern.css only when "stk: Toggle OMP restyle" is on.

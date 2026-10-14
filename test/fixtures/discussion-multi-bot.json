@@ -1,0 +1,274 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QxNToyMzowMlrOq"
+          },
+          "nodes": [
+            {
+              "id": "PRRT_synthetic01",
+              "isResolved": true,
+              "isOutdated": true,
+              "path": "src/pricing/subscription-status.ts",
+              "line": null,
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QwOTozOTozMVrO"
+                },
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "chatgpt-codex-connector",
+                      "__typename": "Bot"
+                    },
+                    "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Distinguish failed first payments before activating**\n\nAn `incomplete` subscription with a bank default is not necessarily awaiting settlement: the provider documents that a subscription becomes `incomplete` when its first payment attempt fails ([Subscription status](https://docs.example.com/api/subscriptions/object)). Because this branch treats every such subscription as `ACTIVE`, a failed payment can still grant the purchased tier.\n\nUseful? React with 👍 / 👎.",
+                    "createdAt": "2026-10-13T09:37:41Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1001"
+                  },
+                  {
+                    "author": {
+                      "login": "octo-dev",
+                      "__typename": "User"
+                    },
+                    "body": "Fixed in 6b13e62. `isPendingFirstPayment` no longer keys off the default payment method; it activates only when the latest invoice is `processing`. Regression tests cover processing, failed and microdeposit cases.",
+                    "createdAt": "2026-10-13T09:39:31Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1002"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_synthetic02",
+              "isResolved": true,
+              "isOutdated": true,
+              "path": "src/onboarding/checkout-service.ts",
+              "line": null,
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QwOTozOTozMVrO"
+                },
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "chatgpt-codex-connector",
+                      "__typename": "Bot"
+                    },
+                    "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Recreate the session when the flag flips**\n\nWhen the flag is off, an open checkout session created with the bank rail is reused as-is, so the customer still sees the old payment options.\n\nUseful? React with 👍 / 👎.",
+                    "createdAt": "2026-10-13T09:37:42Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1003"
+                  },
+                  {
+                    "author": {
+                      "login": "octo-dev",
+                      "__typename": "User"
+                    },
+                    "body": "Fixed in 91ac0de. Sessions record the offered rails in metadata and are expired and recreated when they differ.",
+                    "createdAt": "2026-10-13T09:41:02Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1004"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_synthetic03",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "src/pricing/subscription-status.ts",
+              "line": 68,
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QwOTozOTozMVrO"
+                },
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "cursor",
+                      "__typename": "Bot"
+                    },
+                    "body": "### Failed bank debits stay active\n\n**High Severity**\n\n<!-- DESCRIPTION START -->\n`isPendingFirstPayment` treats every `incomplete` subscription whose `default_payment_method` is a bank account as `ACTIVE`. A failed first debit stays `incomplete` with that method still attached, so reconciliation keeps granting entitlements until expiry.\n<!-- DESCRIPTION END -->\n\n<!-- BUGBOT_BUG_ID: b69daef1-0000-0000-0000-000000000001 -->\n\n<!-- LOCATIONS START\nsrc/pricing/subscription-status.ts#L47-L60\nsrc/providers/payments/client.ts#L500-L507\nLOCATIONS END -->\n<details>\n<summary>Additional Locations (1)</summary>\n\n- [`src/providers/payments/client.ts#L500-L507`](https://github.com/acme/widgets/blob/0e03162/src/providers/payments/client.ts#L500-L507)\n\n</details>\n\n<p><a href=\"https://cursor.com/open?bugId=b69daef1-0000-0000-0000-000000000001\"><picture><img alt=\"Fix in Cursor\" src=\"https://cursor.com/assets/images/fix-in-cursor-dark.png\"></picture></a>&nbsp;<a href=\"https://cursor.com/agents?bugId=b69daef1-0000-0000-0000-000000000001\"><picture><img alt=\"Fix in Web\" src=\"https://cursor.com/assets/images/fix-in-web-dark.png\"></picture></a></p>\n\n<sub>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit 0e03162. Configure [here](https://www.cursor.com/dashboard?tab=bugbot).</sub>",
+                    "createdAt": "2026-10-13T09:38:16Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1005"
+                  },
+                  {
+                    "author": {
+                      "login": "octo-dev",
+                      "__typename": "User"
+                    },
+                    "body": "Fixed in 6b13e62. The provider now expands `latest_invoice.payment_intent`; a first debit in `requires_payment_method` stays SETUP_PENDING.",
+                    "createdAt": "2026-10-13T09:39:32Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1006"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_synthetic04",
+              "isResolved": true,
+              "isOutdated": true,
+              "path": "src/onboarding/checkout-service.ts",
+              "line": null,
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0xM1QwOTozOTozMVrO"
+                },
+                "nodes": [
+                  {
+                    "author": {
+                      "login": "cursor",
+                      "__typename": "Bot"
+                    },
+                    "body": "### Flag-off checkout reuses bank session\n\n**Medium Severity**\n\n<!-- DESCRIPTION START -->\nWith the flag off, `findOpenSession` returns a session created while it was on, so the bank rail is still offered.\n<!-- DESCRIPTION END -->\n\n<!-- BUGBOT_BUG_ID: c70dbef2-0000-0000-0000-000000000002 -->\n\n<!-- LOCATIONS START\nsrc/onboarding/checkout-service.ts#L120-L131\nsrc/onboarding/session-metadata.ts#L12-L20\nLOCATIONS END -->\n<details>\n<summary>Additional Locations (1)</summary>\n\n- [`src/onboarding/session-metadata.ts#L12-L20`](https://github.com/acme/widgets/blob/0e03162/src/onboarding/session-metadata.ts#L12-L20)\n\n</details>\n\n<p><a href=\"https://cursor.com/open?bugId=c70dbef2-0000-0000-0000-000000000002\"><picture><img alt=\"Fix in Cursor\" src=\"https://cursor.com/assets/images/fix-in-cursor-dark.png\"></picture></a>&nbsp;<a href=\"https://cursor.com/agents?bugId=c70dbef2-0000-0000-0000-000000000002\"><picture><img alt=\"Fix in Web\" src=\"https://cursor.com/assets/images/fix-in-web-dark.png\"></picture></a></p>\n\n<sub>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit 0e03162. Configure [here](https://www.cursor.com/dashboard?tab=bugbot).</sub>",
+                    "createdAt": "2026-10-13T09:38:17Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1007"
+                  },
+                  {
+                    "author": {
+                      "login": "octo-dev",
+                      "__typename": "User"
+                    },
+                    "body": "Fixed in 91ac0de, see the session metadata check.",
+                    "createdAt": "2026-10-13T09:41:03Z",
+                    "url": "https://github.com/acme/widgets/pull/101#discussion_r1008"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpO0MjAyNi0xMC0xM1QxODowNDoyMFq0"
+          },
+          "nodes": [
+            {
+              "author": {
+                "login": "cursor",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "<details>\n<summary>Stale comment</summary>\n\n<blockquote>\n\n## PR risk assessment (automation)\n\n**Risk level: Medium** (run 1) — human review required.\n\n### Evidence (from diff only)\n\n| Area | Change |\n|------|--------|\n| **Checkout** | Feature flag `fast-checkout` (off by default) offers a second payment rail. |\n| **Reuse** | Open sessions are recreated when the offered rails change. |\n\n### Reviewers\n\nRequested **@reviewer-one** and **@reviewer-two**.\n\n---\n*Assessment from diff/stat only.*\n\n<!-- cursor-automation-pr-risk -->\n\n<div><a href=\"https://cursor.com/agents/bc-00000000?cursor_ref=pr_footer&cursor_cta=open_in_web\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://cursor.com/assets/images/open-in-web-dark.png\"><img alt=\"Open in Web\" width=\"114\" height=\"28\" src=\"https://cursor.com/assets/images/open-in-web-dark.png\"></picture></a></div>\n\n<sub>Sent by Cursor Automation: Assign PR reviewers</sub>\n\n</blockquote>\n\n</details>",
+              "submittedAt": "2026-10-13T09:34:53Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5001"
+            },
+            {
+              "author": {
+                "login": "chatgpt-codex-connector",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "\n### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `0e03162`\n    \n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+              "submittedAt": "2026-10-13T09:37:41Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5002"
+            },
+            {
+              "author": {
+                "login": "cursor",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "<!-- BUGBOT_REVIEW -->\n<!-- BUGBOT_REVIEW_STALE -->\nStale Bugbot comment from a previous run.",
+              "submittedAt": "2026-10-13T09:38:15Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5003"
+            },
+            {
+              "author": {
+                "login": "cursor",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "<details>\n<summary>Stale comment</summary>\n\n<blockquote>\n\n## PR risk assessment (automation)\n\n**Risk level: Medium** (run 2) — human review required.\n\n### Evidence (from diff only)\n\n| Area | Change |\n|------|--------|\n| **Checkout** | Feature flag `fast-checkout` (off by default) offers a second payment rail. |\n| **Reuse** | Open sessions are recreated when the offered rails change. |\n\n### Reviewers\n\nRequested **@reviewer-one** and **@reviewer-two**.\n\n---\n*Assessment from diff/stat only.*\n\n<!-- cursor-automation-pr-risk -->\n\n<div><a href=\"https://cursor.com/agents/bc-00000000?cursor_ref=pr_footer&cursor_cta=open_in_web\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://cursor.com/assets/images/open-in-web-dark.png\"><img alt=\"Open in Web\" width=\"114\" height=\"28\" src=\"https://cursor.com/assets/images/open-in-web-dark.png\"></picture></a></div>\n\n<sub>Sent by Cursor Automation: Assign PR reviewers</sub>\n\n</blockquote>\n\n</details>",
+              "submittedAt": "2026-10-13T09:40:11Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5004"
+            },
+            {
+              "author": {
+                "login": "devin-ai-integration",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "> [!NOTE]\n> **Newer findings are available below.** Devin Review posted more findings on a later commit.\n\n<!-- devin-review-badge-begin -->\n<a href=\"https://app.devin.ai/review/acme/widgets/pull/101\" target=\"_blank\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://static.devin.ai/assets/gh-devin-review-dark.svg?v=4\"><img src=\"https://static.devin.ai/assets/gh-devin-review-light.svg?v=4\" alt=\"Devin Review\"></picture></a>\n<!-- devin-review-badge-end -->",
+              "submittedAt": "2026-10-13T09:42:28Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5005"
+            },
+            {
+              "author": {
+                "login": "devin-ai-integration",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "**Devin Review** found 1 new potential issue.\n\n<!-- devin-review-badge-begin -->\n<a href=\"https://app.devin.ai/review/acme/widgets/pull/101\" target=\"_blank\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://static.devin.ai/assets/gh-devin-review-dark.svg?v=4\"><img src=\"https://static.devin.ai/assets/gh-devin-review-light.svg?v=4\" alt=\"Devin Review\"></picture></a>\n<!-- devin-review-badge-end -->",
+              "submittedAt": "2026-10-13T10:19:53Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5006"
+            },
+            {
+              "author": {
+                "login": "cursor",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "<!-- BUGBOT_REVIEW -->\nCursor Bugbot has reviewed your changes and found 2 potential issues.\n\n<sub>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit 0e03162. Configure [here](https://www.cursor.com/dashboard?tab=bugbot).</sub>",
+              "submittedAt": "2026-10-13T10:21:00Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5007"
+            },
+            {
+              "author": {
+                "login": "reviewer-two",
+                "__typename": "User"
+              },
+              "state": "CHANGES_REQUESTED",
+              "body": "The checkout and reconciliation parts look good to me. My concerns are around what happens when the first payment fails after activation:\n\n- the tier is already granted\n- nothing re-checks the invoice\n\nCould we gate activation on the payment settling?",
+              "submittedAt": "2026-10-13T15:30:00Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5008"
+            },
+            {
+              "author": {
+                "login": "cursor",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "<details>\n<summary>Stale comment</summary>\n\n<blockquote>\n\n## PR risk assessment (automation)\n\n**Risk level: Medium** (run 3) — human review required.\n\n### Evidence (from diff only)\n\n| Area | Change |\n|------|--------|\n| **Checkout** | Feature flag `fast-checkout` (off by default) offers a second payment rail. |\n| **Reuse** | Open sessions are recreated when the offered rails change. |\n\n### Reviewers\n\nRequested **@reviewer-one** and **@reviewer-two**.\n\n---\n*Assessment from diff/stat only.*\n\n<!-- cursor-automation-pr-risk -->\n\n<div><a href=\"https://cursor.com/agents/bc-00000000?cursor_ref=pr_footer&cursor_cta=open_in_web\"><picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://cursor.com/assets/images/open-in-web-dark.png\"><img alt=\"Open in Web\" width=\"114\" height=\"28\" src=\"https://cursor.com/assets/images/open-in-web-dark.png\"></picture></a></div>\n\n<sub>Sent by Cursor Automation: Assign PR reviewers</sub>\n\n</blockquote>\n\n</details>",
+              "submittedAt": "2026-10-13T15:40:00Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5009"
+            },
+            {
+              "author": {
+                "login": "cursor",
+                "__typename": "Bot"
+              },
+              "state": "COMMENTED",
+              "body": "<!-- CURSOR_AUTOMATION_ID: 00000000-0000-0000-0000-000000000000 | RUN_ID: bc-00000000 -->\n## PR risk assessment (automation)\n\n**Risk:** **Medium** (unchanged on this sync)\n\n**Code review:** Required — not approving.\n\n### Evidence (diff-derived)\n\n- Checkout payment-rail selection behind flag `fast-checkout`.\n- Pricing reconciliation treats pending first payments as active.\n\n### Reviewers\nAlready at cap: @reviewer-one, @reviewer-two (2/2).\n\n---\n*Assessment from code diff only.*\n\n<div><a href=\"https://cursor.com/agents/bc-00000000?cursor_ref=pr_footer&cursor_cta=open_in_web\"><picture><img alt=\"Open in Web\" width=\"114\" height=\"28\" src=\"https://cursor.com/assets/images/open-in-web-dark.png\"></picture></a></div>\n\n<sub>Sent by Cursor Automation: Assign PR reviewers</sub>",
+              "submittedAt": "2026-10-13T15:58:01Z",
+              "url": "https://github.com/acme/widgets/pull/101#pullrequestreview-5010"
+            }
+          ]
+        },
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpHPAAAAAW6NYY0="
+          },
+          "nodes": [
+            {
+              "author": {
+                "login": "chatgpt-codex-connector",
+                "__typename": "Bot"
+              },
+              "body": "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** | `7444af5` | New commits |",
+              "createdAt": "2026-10-13T10:05:27Z",
+              "url": "https://github.com/acme/widgets/pull/101#issuecomment-7001",
+              "isMinimized": false
+            }
+          ]
+        }
+      }
+    }
+  }
+}

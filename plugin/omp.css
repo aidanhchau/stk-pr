@@ -1,0 +1,75 @@
+/* omp.css — optional calm restyle of omp's pane, installed by "stk: Toggle OMP restyle" (tern.css "omp").
+   Hooks verified against a live omp pane with `tern ctl dump`/`tree`:
+   the pane draws three regions (.sf-main, .sf-dock, .sf-layer), all `data-surface='omp.session'`.
+   Tool calls:  .sf-tool (.card | .inline) + state class .st-running / .st-done / .st-error,
+                parts .sf-tool-head .sf-tool-title .sf-tool-time .sf-tool-spin .sf-tool-body .sf-chip.st-error.
+   Sub-agents:  .sf-agent (.st-running | .st-done) .sf-agent-row .sf-agent-meter.
+   Todo list:   .sf-checklist .sf-ck-item (.st-done | .st-active | .st-pending) .sf-ck-g .sf-ck-phase.
+   Input:       .sf-dock .sf-ed-scroll (editor), .sf-status (status bar).
+   Colors, radii and hairlines only, no layout changes (no padding/margin/size/display). */
+
+.sf-region[data-surface='omp.session'] {
+	--omp-card:    light-dark(#f2f1ed, #1b1913);
+	--omp-card-2:  light-dark(#ebeae5, #201e18);
+	--omp-t2:      light-dark(#26251e99, #edecec99);
+	--omp-t3:      light-dark(#26251e66, #edecec66);
+	--omp-line:    light-dark(#26251e1a, #edecec1a);
+	--omp-line-3:  light-dark(#26251e26, #edecec26);
+	--omp-ok:      light-dark(#1f8a65, #3fb68b);
+	--omp-bad:     light-dark(#cf2d56, #e5587a);
+	--omp-accent:  #f54e00;
+
+	--card: var(--omp-card);
+	--l2: var(--omp-line);
+	--l3: var(--omp-line-3);
+	--ok: var(--omp-ok);
+	--bad: var(--omp-bad);
+	--accent: var(--omp-accent);
+	--live: var(--omp-t2);
+	--sf-c-success: var(--omp-ok);
+	--sf-c-error: var(--omp-bad);
+	--sf-c-muted: var(--omp-t2);
+	--sf-c-dim: var(--omp-t3);
+}
+
+/* Tool calls: flat card, hairline, muted head */
+.sf-main[data-surface='omp.session'] .sf-tool.card {
+	background: var(--omp-card); border: 1px solid var(--omp-line); border-radius: 8px; box-shadow: none;
+}
+.sf-main[data-surface='omp.session'] .sf-tool .sf-tool-head { color: var(--omp-t2); }
+.sf-main[data-surface='omp.session'] .sf-tool .sf-tool-title { color: var(--omp-t2); font-weight: 500; }
+.sf-main[data-surface='omp.session'] .sf-tool .sf-tool-time { color: var(--omp-t3); }
+.sf-main[data-surface='omp.session'] .sf-tool.st-error.card { border-color: color-mix(in oklab, var(--omp-bad) 35%, transparent); }
+.sf-main[data-surface='omp.session'] .sf-tool.st-running.card { border-color: color-mix(in oklab, var(--omp-accent) 40%, transparent); }
+.sf-main[data-surface='omp.session'] .sf-tool.st-running .sf-tool-spin { color: var(--omp-accent); }
+.sf-main[data-surface='omp.session'] .sf-tool .sf-chip.st-error { color: var(--omp-bad); background: color-mix(in oklab, var(--omp-bad) 8%, transparent); border-radius: 4px; }
+
+/* Code blocks inside tools */
+.sf-main[data-surface='omp.session'] .sf-code { border-radius: 8px; border: 1px solid var(--omp-line); box-shadow: none; }
+
+/* Sub-agents */
+.sf-main[data-surface='omp.session'] .sf-agent {
+	background: var(--omp-card); border: 1px solid var(--omp-line); border-radius: 8px; box-shadow: none;
+}
+.sf-main[data-surface='omp.session'] .sf-agent.st-running { border-color: color-mix(in oklab, var(--omp-accent) 40%, transparent); }
+.sf-main[data-surface='omp.session'] .sf-agent .sf-agent-name { font-weight: 500; }
+.sf-main[data-surface='omp.session'] .sf-agent .sf-agent-task,
+.sf-main[data-surface='omp.session'] .sf-agent .sf-agent-stats { color: var(--omp-t3); }
+
+/* Todo checklist */
+.sf-region[data-surface='omp.session'] .sf-checklist {
+	background: transparent; border: 1px solid var(--omp-line); border-radius: 8px; box-shadow: none;
+}
+.sf-region[data-surface='omp.session'] .sf-ck-item.st-done .sf-ck-g { color: var(--omp-ok); }
+.sf-region[data-surface='omp.session'] .sf-ck-item.st-done .sf-ck-t { color: var(--omp-t3); }
+.sf-region[data-surface='omp.session'] .sf-ck-item.st-active .sf-ck-g { color: var(--omp-accent); }
+.sf-region[data-surface='omp.session'] .sf-ck-item.st-pending .sf-ck-g { color: var(--omp-t3); }
+
+/* Input: hairline editor, orange only on focus */
+.sf-dock[data-surface='omp.session'] .sf-ed-scroll { border-radius: 8px; }
+.sf-dock[data-surface='omp.session'] .sf-ed-scroll:focus-within { outline: 1px solid color-mix(in oklab, var(--omp-accent) 60%, transparent); }
+.sf-dock[data-surface='omp.session'] .sf-caret { color: var(--omp-accent); }
+
+/* User messages and toasts */
+.sf-main[data-surface='omp.session'] .sf-card.nohead { background: var(--omp-card); border: 1px solid var(--omp-line); border-radius: 8px; box-shadow: none; }
+.sf-region[data-surface='omp.session'] .sf-toast { border: 1px solid var(--omp-line); border-radius: 8px; box-shadow: none; }
