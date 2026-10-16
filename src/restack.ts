@@ -29,6 +29,8 @@ export interface RestackInput {
    */
   mergedBaseSha: string | null;
   baseRef: string;
+  /** Heads these branches had on origin before earlier restacks of the same run: local tips at or below them are published, not unpushed work. */
+  knownHeads?: Record<string, string[]>;
 }
 
 /** A local checkout of a member's branch that is now behind origin. */
@@ -46,7 +48,18 @@ export interface RestackResult {
   behind: BehindCheckout[];
 }
 
-const NO_HOOKS = ["-c", "core.hooksPath=/dev/null"];
+/**
+ * Config pinned for every git command run in the temporary checkout, so the user's own settings cannot change what it does:
+ * no hooks, no `rebase.updateRefs` (it would move local branches pointing at replayed commits), no autosquash/autostash,
+ * no commit signing.
+ */
+const GIT_CONFIG = [
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "rebase.updateRefs=false",
+  "-c", "rebase.autoSquash=false",
+  "-c", "rebase.autoStash=false",
+  "-c", "commit.gpgSign=false",
+];
 const remoteRef = (branch: string) => `refs/remotes/origin/${branch}`;
 
 async function revParse(exec: Exec, cwd: string, rev: string): Promise<string | null> {
@@ -66,14 +79,31 @@ async function fetchRefs(exec: Exec, root: string, branches: string[]): Promise<
 export async function preflightRestack(exec: Exec, root: string, input: RestackInput): Promise<void> {
   await fetchRefs(exec, root, [input.trunk, ...input.members.map((m) => m.branch), ...(input.mergedBaseSha ? [] : [input.baseRef])]);
   const worktrees = await listWorktrees(exec, root);
-  for (const m of input.members) {
+  for (const [i, m] of input.members.entries()) {
     const remote = await revParse(exec, root, remoteRef(m.branch));
     if (remote !== m.headSha) {
       throw new StkError(`origin/${m.branch} is ${remote ?? "missing"} but the stack was read at ${m.headSha}; #${m.number} moved, so nothing was rebased`, "lease-rejected");
     }
+    // the rebase replays only what sits above the old parent tip: the member must really contain it, or superseded
+    // parent commits (an amended or force-pushed parent) would be resurrected in the member
+    const below = i === 0 ? { what: "the merged PR below it", sha: input.mergedBaseSha } : { what: `#${input.members[i - 1]!.number}`, sha: input.members[i - 1]!.headSha };
+    if (below.sha && (await git(exec, root, ["merge-base", "--is-ancestor", below.sha, m.headSha])).code !== 0) {
+      throw new StkError(
+        `#${m.number} (${m.branch}) does not contain the current head of ${below.what} (${below.sha.slice(0, 9)}): that branch was amended or force-pushed after #${m.number} was based on it; rebase #${m.number} onto it manually first`,
+        "not-linear",
+      );
+    }
     const local = await revParse(exec, root, `refs/heads/${m.branch}`);
     if (local === null || local === m.headSha) continue;
-    if ((await git(exec, root, ["merge-base", "--is-ancestor", local, m.headSha])).code !== 0) {
+    // a local tip that is (an ancestor of) a head this branch had on origin is published history, not unpushed work
+    let published = false;
+    for (const tip of [m.headSha, ...(input.knownHeads?.[m.branch] ?? [])]) {
+      if ((await git(exec, root, ["merge-base", "--is-ancestor", local, tip])).code === 0) {
+        published = true;
+        break;
+      }
+    }
+    if (!published) {
       const wt = worktreeForBranch(worktrees, m.branch);
       throw new StkError(
         `${wt ? `worktree ${wt.path}` : "this repo"} has unpushed commits on ${m.branch} (local ${local.slice(0, 9)}, origin ${m.headSha.slice(0, 9)}); push or move them first, rebasing #${m.number} would orphan them`,
@@ -111,13 +141,13 @@ export async function restackAndPush(exec: Exec, root: string, input: RestackInp
   const changed: { member: RestackMember; sha: string }[] = [];
   const tmp = mkdtempSync(join(tmpdir(), "stk-rebase-"));
   try {
-    await gitOk(exec, root, [...NO_HOOKS, "worktree", "add", "--detach", tmp, trunkTip]);
+    await gitOk(exec, root, [...GIT_CONFIG, "worktree", "add", "--detach", tmp, trunkTip]);
     let newBase = trunkTip;
     let oldBase = bottomBase;
     for (const m of input.members) {
       onStep?.(`rebasing #${m.number}`);
-      await gitOk(exec, tmp, [...NO_HOOKS, "checkout", "--detach", m.headSha]);
-      const r = await git(exec, tmp, [...NO_HOOKS, "rebase", "--no-autostash", "--onto", newBase, oldBase]);
+      await gitOk(exec, tmp, [...GIT_CONFIG, "checkout", "--detach", m.headSha]);
+      const r = await git(exec, tmp, [...GIT_CONFIG, "rebase", "--no-autostash", "--onto", newBase, oldBase]);
       if (r.code !== 0) {
         const files = await conflictedFiles(exec, tmp);
         await git(exec, tmp, ["rebase", "--abort"]);
@@ -135,7 +165,7 @@ export async function restackAndPush(exec: Exec, root: string, input: RestackInp
     if (changed.length > 0) {
       onStep?.("pushing");
       const push = await git(exec, root, [
-        ...NO_HOOKS,
+        ...GIT_CONFIG,
         "push",
         "--atomic",
         ...changed.map((c) => `--force-with-lease=refs/heads/${c.member.branch}:${c.member.headSha}`),

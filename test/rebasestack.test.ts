@@ -42,7 +42,7 @@ function fake(o: { rebase?: "ok" | "conflict" | "refuse"; localB102?: string; pu
     if (remote) return ok(`sha${remote[1]}\n`);
     if (g === "rev-parse --verify --quiet refs/heads/b102") return o.localB102 ? ok(`${o.localB102}\n`) : no();
     if (g.startsWith("rev-parse --verify --quiet refs/heads/")) return no();
-    if (g.startsWith("merge-base --is-ancestor")) return no();
+    if (g.startsWith("merge-base --is-ancestor")) return g.includes("localonly") ? no() : ok("");
     if (g.startsWith("worktree add --detach")) return ok();
     const co = /^checkout --detach sha(\d+)$/.exec(g);
     if (co) {
@@ -90,8 +90,10 @@ describe("rebaseStack", () => {
       "fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main +refs/heads/b102:refs/remotes/origin/b102 +refs/heads/b103:refs/remotes/origin/b103",
       "worktree list --porcelain",
       "rev-parse --verify --quiet refs/remotes/origin/b102",
+      "merge-base --is-ancestor sha101 sha102",
       "rev-parse --verify --quiet refs/heads/b102",
       "rev-parse --verify --quiet refs/remotes/origin/b103",
+      "merge-base --is-ancestor sha102 sha103",
       "rev-parse --verify --quiet refs/heads/b103",
       "rev-parse --verify --quiet refs/remotes/origin/main",
       `worktree add --detach ${tmp} trunk0`,
@@ -109,6 +111,19 @@ describe("rebaseStack", () => {
       "ls-remote origin refs/heads/b103",
       "worktree list --porcelain",
     ]);
+  });
+
+  test("every mutating git call pins config so the user's settings cannot change it", async () => {
+    const { ctx, calls } = fake();
+    await rebaseStack(ctx, 102);
+    const sub = (argv: string[]) => argv.filter((x, i) => !(x === "-c" || argv[i - 1] === "-c"))[1] ?? "";
+    const mutating = calls.filter((c) => c.argv[0] === "git" && ["checkout", "rebase", "push"].includes(sub(c.argv)) || (sub(c.argv) === "worktree" && c.argv.includes("add")));
+    expect(mutating.length).toBeGreaterThanOrEqual(5);
+    for (const c of mutating) {
+      for (const cfg of ["core.hooksPath=/dev/null", "rebase.updateRefs=false", "rebase.autoSquash=false", "rebase.autoStash=false", "commit.gpgSign=false"]) {
+        expect(c.argv).toContain(cfg);
+      }
+    }
   });
 
   test("never calls gh stack and never runs anything in a user worktree", async () => {

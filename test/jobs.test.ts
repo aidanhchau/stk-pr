@@ -52,6 +52,7 @@ function fakeMergeGithub(
       const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
       const none = { code: 1, stdout: "", stderr: "" };
       if (g.startsWith("fetch ") || g.startsWith("worktree add") || g.startsWith("worktree remove") || g === "worktree prune" || g.startsWith("rebase ")) return ok();
+      if (g.startsWith("merge-base --is-ancestor")) return ok();
       if (g === "worktree list --porcelain") return ok(chain.map((n) => `worktree /wt-${n}\nHEAD sha${n}\nbranch refs/heads/b${n}\n\n`).join(""));
       if (g === "rev-parse --verify --quiet refs/remotes/origin/main") return ok("trunk0\n");
       const remote = /^rev-parse --verify --quiet refs\/remotes\/origin\/b(\d+)$/.exec(g);

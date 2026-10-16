@@ -669,6 +669,8 @@ export async function stackMerge(
   const first = await planFor(ctx, n, opts);
   const { stack } = first;
   let expectedHeads: Record<number, string> = {};
+  // heads member branches had on origin before this run's restacks (see `rebaseStack`)
+  const knownHeads: Record<string, string[]> = {};
   const deps: ExecuteDeps = {
     exec: ctx.exec,
     // a native stack merge is API calls only; its rebase runs in a temporary checkout
@@ -688,7 +690,7 @@ export async function stackMerge(
         if (failing.length) throw new StkError(`checks failed on #${pr}: ${failing.join(", ")}`, "gh-failed");
       },
       rebaseStack: async (pr) => {
-        const rebased = await rebaseStack(ctx, pr);
+        const rebased = await rebaseStack(ctx, pr, { knownHeads });
         for (const n of rebased.prs) {
           if (!stack.prs.some((p) => p.number === n)) throw new StkError(`native stack gained unexpected PR #${n}; review the stack`, "gh-failed");
         }
@@ -740,7 +742,7 @@ export async function stackMerge(
     // A rebase can reset checks/reviews and split a formerly atomic clean group into individual bypass merges.
     const bottoms = selected.filter((p) => !firstIncludes.includes(p.number));
     try {
-      await preflightRestack(ctx.exec, requireRoot(ctx, "rebase a stack"), restackInput(first.trunk, remaining, stack.prs));
+      await preflightRestack(ctx.exec, requireRoot(ctx, "rebase a stack"), restackInput(first.trunk, remaining, stack.prs, knownHeads));
     } catch (e) {
       const failed: StepResult = { step: { kind: "rebase-stack", pr: bottoms[0]!.number }, ok: false, detail: e instanceof Error ? e.message : String(e) };
       // the rebase runs after the first merge lands, so that is where it sits in the plan
@@ -842,7 +844,7 @@ export interface RebaseStackResult {
 }
 
 /** What the restack needs from a stack read: the open members bottom-up, and what the bottom one sits on. */
-function restackInput(trunk: string, open: PullRequest[], all: PullRequest[]): RestackInput {
+function restackInput(trunk: string, open: PullRequest[], all: PullRequest[], knownHeads?: Record<string, string[]>): RestackInput {
   const bottom = open[0]!;
   // a squash merge leaves the merged PR's commits in the bottom's history: its head SHA is where the bottom's own commits start
   const below = all.find((p) => p.number !== bottom.number && p.headRef === bottom.baseRef);
@@ -851,6 +853,7 @@ function restackInput(trunk: string, open: PullRequest[], all: PullRequest[]): R
     members: open.map((p) => ({ number: p.number, branch: p.headRef, headSha: p.headSha })),
     mergedBaseSha: below?.headSha ?? null,
     baseRef: bottom.baseRef,
+    ...(knownHeads ? { knownHeads } : {}),
   };
 }
 
@@ -860,13 +863,19 @@ function restackInput(trunk: string, open: PullRequest[], all: PullRequest[]): R
  * detached checkout (see `restack.ts`) and pushed with leases; nothing in the user's worktrees is touched. A conflict
  * aborts with nothing pushed; unpushed local commits on a member branch are refused up front.
  */
-export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: string) => void } = {}): Promise<RebaseStackResult> {
+export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: string) => void; knownHeads?: Record<string, string[]> } = {}): Promise<RebaseStackResult> {
   const root = requireRoot(ctx, "rebase a stack");
   const detail = await nativeStackDetail(ctx.exec, at(ctx), n);
   const pr = detail?.members.find((m) => m.pr.number === n)?.pr;
   if (!detail || !pr || pr.state !== "OPEN") throw new StkError(`PR #${n} is not an open member of a GitHub stack`, "usage");
   const open = detail.members.filter((m) => m.pr.state === "OPEN").map((m) => m.pr);
-  const r = await restackAndPush(ctx.exec, root, restackInput(detail.trunk, open, detail.members.map((m) => m.pr)), opts.onStep);
+  const r = await restackAndPush(ctx.exec, root, restackInput(detail.trunk, open, detail.members.map((m) => m.pr), opts.knownHeads), opts.onStep);
+  // a run of several restacks leaves local branches at their old tips on purpose: remember those heads so the next one does not take them for unpushed work
+  if (opts.knownHeads) {
+    for (const p of open) {
+      if (r.heads[p.number] !== p.headSha) (opts.knownHeads[p.headRef] ??= []).push(p.headSha);
+    }
+  }
   const note = behindText(r.behind);
   return { prs: open.map((p) => p.number), heads: r.heads, ...(note ? { note } : {}) };
 }

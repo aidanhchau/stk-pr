@@ -330,6 +330,101 @@ describe("rebaseStack with real git", () => {
   });
 });
 
+describe("rebaseStack hardening", () => {
+  test("user config rebase.updateRefs cannot move an unchecked-out local member branch", async () => {
+    await build();
+    const old = await allHeads();
+    await git(clone, "config", "rebase.updateRefs", "true");
+    await git(clone, "config", "rebase.autoSquash", "true");
+    await git(clone, "branch", "b102", old.b102);
+    await git(clone, "branch", "b103", old.b103);
+
+    await rebaseStack(ctxWith(old), 102);
+
+    expect(await originSha("b102")).not.toBe(old.b102);
+    expect(await git(clone, "rev-parse", "refs/heads/b102")).toBe(old.b102);
+    expect(await git(clone, "rev-parse", "refs/heads/b103")).toBe(old.b103);
+  });
+
+  test("an amended parent is refused: its superseded commits are not resurrected in the child", async () => {
+    await build();
+    // b102 is amended and force-pushed while b103 still sits on the previous b102
+    await git(seed, "checkout", "-q", "b102");
+    await git(seed, "reset", "-q", "--hard", "b101");
+    await commitFile(seed, "f102.txt", "102 amended\n", "b102 amended");
+    await git(seed, "push", "-qf", "origin", "b102");
+    const before = await allHeads();
+
+    const err = await errorOf(rebaseStack(ctxWith(before), 102));
+
+    expect(err.code).toBe("not-linear");
+    expect(err.message).toContain("#103");
+    expect(err.message).toContain("#102");
+    expect(await allHeads()).toEqual(before);
+  });
+
+  test("a bottom member that does not contain the merged PR's head is refused", async () => {
+    await build();
+    // b101 (the merged PR) was force-pushed after b102 was based on it
+    await git(seed, "checkout", "-q", "b101");
+    await git(seed, "reset", "-q", "--hard", "HEAD~1");
+    await commitFile(seed, "f101b.txt", "101b amended\n", "b101 amended");
+    await git(seed, "push", "-qf", "origin", "b101");
+    const before = await allHeads();
+
+    const err = await errorOf(rebaseStack(ctxWith(before), 102));
+
+    expect(err.code).toBe("not-linear");
+    expect(err.message).toContain("#102");
+    expect(await allHeads()).toEqual(before);
+  });
+
+  test("A, B, C merged one by one with local branches: the second restack does not take the old local tips for unpushed work", async () => {
+    await build();
+    const old = await allHeads();
+    await git(clone, "branch", "b102", old.b102);
+    await git(clone, "branch", "b103", old.b103);
+    const knownHeads: Record<string, string[]> = {};
+
+    // #101 is merged: the first restack rewrites #102 and #103 and leaves the local branches at their old tips
+    await rebaseStack(ctxWith(old), 102, { knownHeads });
+    expect(knownHeads).toEqual({ b102: [old.b102], b103: [old.b103] });
+    expect(await git(clone, "rev-parse", "refs/heads/b103")).toBe(old.b103);
+    const afterFirst = await allHeads();
+
+    // then #102 lands (squash) on main
+    await git(seed, "checkout", "-q", "main");
+    await git(seed, "pull", "-q", "origin", "main");
+    await commitFile(seed, "f102.txt", "102\n", "squash b102 (#102)");
+    await git(seed, "push", "-q", "origin", "main");
+
+    // without the run's memory the stale local b103 looks like unpublished work
+    const stale = await errorOf(rebaseStack(ctxWith(afterFirst, { open: [103] }), 103));
+    expect(stale.code).toBe("diverged");
+
+    const r = await rebaseStack(ctxWith(afterFirst, { open: [103] }), 103, { knownHeads });
+    expect(r.prs).toEqual([103]);
+    expect(await ahead("main", "b103")).toBe(1);
+    expect(knownHeads.b103).toEqual([old.b103, afterFirst.b103]);
+    expect(await git(clone, "rev-parse", "refs/heads/b103")).toBe(old.b103);
+  });
+
+  test("real unpushed work on top of a known old tip is still refused", async () => {
+    await build();
+    const old = await allHeads();
+    const wt = join(base, "wt-c");
+    await addWorktree("-b", "b103", wt, old.b103);
+    await commitFile(wt, "mine.txt", "mine\n", "unpushed work on b103");
+    expectedWorktrees = await worktreeList();
+
+    const err = await errorOf(rebaseStack(ctxWith(old), 102, { knownHeads: { b103: [old.b103] } }));
+
+    expect(err.code).toBe("diverged");
+    expect(err.message).toContain(wt);
+    expect(await allHeads()).toEqual(old);
+  });
+});
+
 describe("restackAndPush / preflightRestack directly", () => {
   const input = async () => {
     const old = await allHeads();

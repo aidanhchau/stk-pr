@@ -80,7 +80,7 @@ function fakeGithub(o: { review: "required" | "approved"; checkingReads?: number
     if (remote) return ok(`${o.originMoved && Number(remote[1]) === B ? "otherB" : head(Number(remote[1]))}\n`);
     if (g === `rev-parse --verify --quiet refs/heads/b${B}`) return o.divergedLocal ? ok("localonly\n") : no();
     if (g.startsWith("rev-parse --verify --quiet refs/heads/")) return no();
-    if (g.startsWith("merge-base --is-ancestor")) return no();
+    if (g.startsWith("merge-base --is-ancestor")) return g.includes("localonly") ? no() : ok("");
     if (g.startsWith("worktree add --detach") || g.startsWith("worktree remove") || g === "worktree prune") return ok("");
     const co = /^checkout --detach (\S+)$/.exec(g);
     if (co) {
