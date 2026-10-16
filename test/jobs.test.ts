@@ -312,6 +312,15 @@ describe("jobs", () => {
     expect(j.plan!.map((s) => s.kind)).toEqual(["merge", "merge", "rebase-stack", "merge"]);
   });
 
+  test("alternating bypass and clean groups: each transition expects only its own kind of head change", async () => {
+    // #5 bypass (stk rebases and re-links #6-#8) → #6 clean (GitHub rewrites #7/#8 again: stk's pushed heads are history) → #7 bypass → #8 clean
+    const { exec, puts, rest } = fakeMergeGithub([5, 6, 7, 8], { native: true, result: "merged", blocked: [5, 7] });
+    const j = await runService({ ...stackSpec, pr: 8, force: true }, exec, true);
+    expect(j).toMatchObject({ status: "done", outcome: "merged", merged: [5, 6, 7, 8] });
+    expect(puts).toEqual([5, 6, 7, 8].map((n) => `repos/o/r/pulls/${n}/merge-async`));
+    expect(rest).toEqual(["unstack", "base 6 main", "create 6,7,8", "unstack", "base 8 main"]);
+  });
+
   test("GitHub's JSON error body is read: no raw JSON, no HTTP code", async () => {
     const body = { status: "failed", details: { message: "Rules can only be bypassed when merging the bottom-most unmerged pull request in the stack." } };
     const exec: Exec = async (argv) => (argv[1] === "repo" ? { code: 0, stdout: JSON.stringify({ owner: { login: "o" }, name: "r" }), stderr: "" } : { code: 1, stdout: `HTTP/2.0 400 Bad Request\r\n\r\n${JSON.stringify(body)}`, stderr: "" });

@@ -1026,13 +1026,13 @@ export async function setPrBase(exec: Exec, where: Where, number: number, base: 
   if (res.status !== 200) throw apiError(res, `retargeting #${number} to ${base}`);
 }
 
-/** A PR's REST state: its base branch, the stack it is in (null for none) and `mergeableState`, `unknown` while GitHub recomputes it. */
-export async function pullState(exec: Exec, where: Where, number: number): Promise<{ base: string; stack: number | null; mergeableState: string }> {
+/** A PR's REST state: its base branch, the stack it is in (null for none), the commit it merged as (null while open) and `mergeableState`, `unknown` while GitHub recomputes it. */
+export async function pullState(exec: Exec, where: Where, number: number): Promise<{ base: string; stack: number | null; mergeCommit: string | null; mergeableState: string }> {
   const { owner, name } = await slugOf(exec, where);
   const res = await ghApiRaw(exec, where, [`repos/${owner}/${name}/pulls/${number}`]);
   if (res.status !== 200) throw apiError(res, `reading #${number}`);
-  const b = res.body as { base?: { ref?: string }; mergeable_state?: string; stack?: { number?: number } | null } | null;
-  return { base: b?.base?.ref ?? "", stack: b?.stack?.number ?? null, mergeableState: b?.mergeable_state ?? "unknown" };
+  const b = res.body as { base?: { ref?: string }; mergeable_state?: string; merge_commit_sha?: string | null; stack?: { number?: number } | null } | null;
+  return { base: b?.base?.ref ?? "", stack: b?.stack?.number ?? null, mergeCommit: b?.merge_commit_sha ?? null, mergeableState: b?.mergeable_state ?? "unknown" };
 }
 
 /** Full planning data (checks, review state, unresolved threads) of several PRs in ONE aliased GraphQL call, in `numbers` order. */

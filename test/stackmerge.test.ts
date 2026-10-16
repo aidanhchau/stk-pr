@@ -30,6 +30,8 @@ interface FakeOptions {
   checkingAs?: "mergeState" | "mergeable";
   /** REST `mergeable_state` stays "unknown" for this many reads of B after its base changed. */
   unknownReads?: number;
+  /** The stack dissolves by itself after a bypass merge (stk did not re-link anything) and B is left based on main. */
+  dissolveOnBypass?: boolean;
   unexpectedDownstack?: boolean;
   staleMerged?: boolean;
   oldHeadReads?: number;
@@ -116,6 +118,10 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
       puts.push({ pr, ...(body.sha ? { sha: body.sha } : {}), bypass: body.bypass_rules === true, method: body.merge_method });
       events.push(`merge ${pr}`);
       for (const m of originalChain.filter((x) => x <= pr)) merged.add(m);
+      if (pr === A && body.bypass_rules && o.dissolveOnBypass) {
+        members = [];
+        bases[B] = "main";
+      }
       if (pr === A && !body.bypass_rules && o.githubRestacks !== undefined) {
         if (!o.githubNoRetarget) bases[B] = "main";
         if (!o.githubKeepsHeads) rebase();
@@ -276,7 +282,7 @@ describe("stackMerge on a native stack", () => {
 
   test("right after the push GitHub still computes mergeability: the re-plan waits instead of stopping", async () => {
     clearRulesCache();
-    const { ctx, puts } = fakeGithub({ review: "required", checkingReads: 2 });
+    const { ctx, puts } = fakeGithub({ review: "required", checkingReads: 3 });
     const sleeps: number[] = [];
     const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: { attempts: 5, delayMs: 7, sleep: async (ms) => void sleeps.push(ms) } });
     expect(sleeps).toEqual([7, 7]);
@@ -322,23 +328,52 @@ describe("stackMerge on a native stack", () => {
       });
     }
 
-    test("a head that never changes times out with a clear message and no local fallback", async () => {
+    /** A manual clock: sleeping advances it, so the wait is measured in elapsed time. */
+    const clock = (extra: { delayMs: number; restackWaitMs: number }) => {
+      let t = 0;
+      const sleeps: number[] = [];
+      return { sleeps, policy: { ...extra, now: () => t, sleep: async (ms: number) => { sleeps.push(ms); t += ms; } } };
+    };
+
+    test("a head that never changes times out with a clear message, the real waited time, and no local fallback", async () => {
       clearRulesCache();
       const { ctx, puts, pushes, git, rest } = fakeGithub({ review: "required", reviewRequired: [B], githubRestacks: 0, githubHeadReads: 999 });
-      const sleeps: number[] = [];
-      const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: { delayMs: 10, restackWaitMs: 100, sleep: async (ms) => void sleeps.push(ms) } }).catch((e: Error) => e);
-      expect((err as Error).message).toBe("stack merge stopped at #202: GitHub has not retargeted and rebased #202 onto main after #201 landed (waited 0s); merge again once it has, or run rebase-stack");
-      expect(sleeps).toHaveLength(10);
+      const { sleeps, policy } = clock({ delayMs: 1000, restackWaitMs: 3000 });
+      const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: policy }).catch((e: Error) => e);
+      expect((err as Error).message).toBe("stack merge stopped at #202: GitHub has not retargeted and rebased #202 onto main after #201 landed (waited 3s); merge again once it has, or run rebase-stack");
+      expect(sleeps).toEqual([1000, 1000, 1000]);
       expect(puts.map((p) => p.pr)).toEqual([A]);
       expect(pushes).toEqual([]);
       expect(git).toEqual([]);
       expect(rest).toEqual([]);
     });
 
+    test("the wait is a deadline, not a count of sleeps: the last sleep is cut to what is left", async () => {
+      clearRulesCache();
+      const { ctx } = fakeGithub({ review: "required", reviewRequired: [B], githubRestacks: 0, githubHeadReads: 999 });
+      const { sleeps, policy } = clock({ delayMs: 1000, restackWaitMs: 2500 });
+      const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: policy }).catch((e: Error) => e)) as Error;
+      expect(sleeps).toEqual([1000, 1000, 500]);
+      expect(err.message).toContain("(waited 3s)");
+    });
+
+    test("slow planning reads eat the deadline: reads that take time leave fewer sleeps", async () => {
+      clearRulesCache();
+      const { ctx } = fakeGithub({ review: "required", reviewRequired: [B], githubRestacks: 0, githubHeadReads: 999 });
+      let t = 0;
+      const sleeps: number[] = [];
+      const slow: Ctx = { ...ctx, exec: async (argv, o) => { t += 400; return ctx.exec(argv, o); } };
+      await stackMerge(slow, A, { method: "squash", force: true, upTo: B, replan: { delayMs: 1000, restackWaitMs: 3000, now: () => t, sleep: async (ms) => { sleeps.push(ms); t += ms; } } }).catch((e: Error) => e);
+      // each read costs 400ms of the 3000ms, so fewer than three full sleeps fit
+      expect(sleeps.reduce((a, b) => a + b, 0)).toBeLessThan(3000);
+      expect(sleeps.length).toBeLessThanOrEqual(3);
+    });
+
     test("a base that stays on the merged branch times out too, even once the head changed", async () => {
       clearRulesCache();
       const { ctx, puts, git, rest } = fakeGithub({ review: "required", reviewRequired: [B], githubRestacks: 0, githubNoRetarget: true });
-      const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: { delayMs: 10, restackWaitMs: 50, sleep: async () => {} } }).catch((e: Error) => e);
+      const { policy } = clock({ delayMs: 10, restackWaitMs: 50 });
+      const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: policy }).catch((e: Error) => e);
       expect((err as Error).message).toContain("GitHub has not retargeted and rebased #202 onto main after #201 landed");
       expect(puts.map((p) => p.pr)).toEqual([A]);
       expect(git).toEqual([]);
@@ -348,11 +383,20 @@ describe("stackMerge on a native stack", () => {
     test("a merge-method stack has nothing to rewrite: once the wait is over a trunk base alone is enough", async () => {
       clearRulesCache();
       const { ctx, puts } = fakeGithub({ review: "required", reviewRequired: [B], githubRestacks: 0, githubKeepsHeads: true });
-      const sleeps: number[] = [];
-      const r = await stackMerge(ctx, A, { method: "merge", force: true, upTo: B, replan: { delayMs: 10, restackWaitMs: 30, sleep: async (ms) => void sleeps.push(ms) } });
+      const { sleeps, policy } = clock({ delayMs: 10, restackWaitMs: 30 });
+      const r = await stackMerge(ctx, A, { method: "merge", force: true, upTo: B, replan: policy });
       expect(sleeps).toHaveLength(3);
       expect(puts.map((p) => `${p.pr}:${p.method}:${p.bypass}`)).toEqual(["201:merge:false", "202:merge:true"]);
       expect(r.merged).toEqual([A, B]);
+    });
+
+    test("a lone PR is only accepted as a plain PR after stk's own re-link: a stack that dissolves on its own stops the run", async () => {
+      clearRulesCache();
+      const { ctx, puts, pushes } = fakeGithub({ review: "required", dissolveOnBypass: true });
+      const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e: Error) => e)) as Error;
+      expect(err.message).toContain("native stack or trunk changed");
+      expect(puts.map((p) => p.pr)).toEqual([A]);
+      expect(pushes).toEqual([]);
     });
   });
 
@@ -381,7 +425,7 @@ describe("stackMerge on a native stack", () => {
 
   test("CLEAN snapshots with the old head after push are polled until the actual pushed SHA appears", async () => {
     clearRulesCache();
-    const { ctx, puts } = fakeGithub({ review: "required", oldHeadReads: 2 });
+    const { ctx, puts } = fakeGithub({ review: "required", oldHeadReads: 3 });
     const sleeps: number[] = [];
     const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: { attempts: 3, delayMs: 7, sleep: async (ms) => void sleeps.push(ms) } });
     expect(sleeps).toEqual([7, 7]);

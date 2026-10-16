@@ -5,7 +5,7 @@
 import { join } from "node:path";
 import type { PaletteItem } from "./fuzzy";
 import { GH_ENV, formatGhOutput, planGh, type GhResult } from "./ghproxy";
-import { listWorktrees, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
+import { git, listWorktrees, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
 import { behindText, preflightRestack, restackAndPush, type RestackInput } from "./restack";
 import { provenanceKey } from "./provenance";
 import { commitSubjects, currentBranch, localBranches, nearestParent, pushBranch, pushEmptyCommit, pushKind, RETRIGGER_MESSAGE, type PushKind } from "./branches";
@@ -632,9 +632,11 @@ export interface ReplanPolicy {
   attempts?: number;
   /** Delay between those reads. Default 2000ms. */
   delayMs?: number;
-  /** How long to wait for GitHub to retarget and rebase the next PR itself after a merge without bypass. Default 60s. */
+  /** How long to wait (elapsed time, planning reads included) for GitHub to retarget and rebase the next PR itself after a merge without bypass. Default 60s. */
   restackWaitMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Clock for the restack wait. Default `Date.now`. */
+  now?: () => number;
 }
 
 /** After a merge sent without `bypass_rules` GitHub retargets the PRs above it onto the trunk and rebases them itself: what that must look like. */
@@ -650,10 +652,12 @@ interface AwaitedRestack {
  * poll briefly while any holds. `stale` names a landed PR still open, `staleHead` a pushed head not reflected, and
  * `checking` a bottom PR whose mergeability GitHub is still computing, after attempts run out.
  *
- * With `restack` (the landed merge was not a bypass) GitHub's own retarget and rebase is awaited too, for up to
- * `restackWaitMs`: the bottom PR's base must be the trunk and every remaining head must have changed (a `merge`-method
- * stack has nothing to rewrite, so there a trunk base alone is enough once the wait is over). `restacking` names the PR
- * still waiting when that runs out. Nothing is ever pushed locally on this path: it would race GitHub's own push.
+ * With `restack` (the landed merge was not a bypass) GitHub's own retarget and rebase is awaited too, until a deadline
+ * `restackWaitMs` after the call (elapsed time, so slow planning reads count; each sleep is capped to what is left): the
+ * bottom PR's base must be the trunk and every remaining head must have changed (a `merge`-method stack has nothing to
+ * rewrite, so there the trunk base alone is enough once the deadline passed). `restacking` names the PR still waiting at
+ * the deadline and `waitedMs` is the time really spent. Once GitHub has restacked, the other conditions get `attempts`
+ * more reads. Nothing is ever pushed locally on this path: it would race GitHub's own push.
  */
 async function replanNative(
   ctx: Ctx,
@@ -663,11 +667,16 @@ async function replanNative(
   policy: ReplanPolicy,
   expectedHeads: Record<number, string>,
   restack?: AwaitedRestack,
-): Promise<{ fresh: PlanForResult; stale: number | null; staleHead: number | null; checking: number | null; restacking: number | null }> {
+): Promise<{ fresh: PlanForResult; stale: number | null; staleHead: number | null; checking: number | null; restacking: number | null; waitedMs: number }> {
   const delay = policy.delayMs ?? 2000;
-  const attempts = restack && delay > 0 ? Math.ceil((policy.restackWaitMs ?? 60_000) / delay) : (policy.attempts ?? 6);
+  const attempts = policy.attempts ?? 6;
   const sleep = policy.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  for (let i = 0; ; i++) {
+  const now = policy.now ?? Date.now;
+  const start = now();
+  const deadline = start + (policy.restackWaitMs ?? 60_000);
+  // reads made while GitHub's own restack is not being waited for
+  let reads = 0;
+  for (;;) {
     const fresh = await planFor(ctx, target, { ...opts, upTo: target });
     const stale = fresh.stack.prs.find((p) => landed.has(p.number))?.number ?? null;
     const staleHead = Object.entries(expectedHeads).find(([n, sha]) => !landed.has(Number(n)) && fresh.stack.prs.find((p) => p.number === Number(n))?.headSha !== sha);
@@ -675,13 +684,16 @@ async function replanNative(
     // a bottom still on the merged branch is rebased next, and its mergeability only matters after that push
     const rebaseNext = fresh.notes.some((x) => x.action === "rebase-stack");
     const checking = !rebaseNext && !!bottom && memberBlockers(bottom, fresh.trunk, false, fresh.rules).some((b) => b.kind === "checking") ? bottom.number : null;
+    const expired = now() >= deadline;
     const retargeted = !!bottom && bottom.baseRef === fresh.trunk;
     const unchanged = fresh.stack.prs.find((p) => p.headSha === restack?.heads[p.number]);
-    const restacking = !restack || !bottom ? null : !retargeted ? bottom.number : unchanged && !(i >= attempts && restack.method === "merge") ? unchanged.number : null;
-    if ((stale === null && checking === null && !staleHead && restacking === null) || i >= attempts) {
-      return { fresh, stale, staleHead: staleHead ? Number(staleHead[0]) : null, checking, restacking };
+    const restacking = !restack || !bottom ? null : !retargeted ? bottom.number : unchanged && !(expired && restack.method === "merge") ? unchanged.number : null;
+    const done = stale === null && checking === null && !staleHead && restacking === null;
+    if (restacking === null) reads++;
+    if (done || (restacking !== null ? expired : reads > attempts)) {
+      return { fresh, stale, staleHead: staleHead ? Number(staleHead[0]) : null, checking, restacking, waitedMs: now() - start };
     }
-    await sleep(delay);
+    await sleep(restacking !== null ? Math.min(delay, Math.max(deadline - now(), 0)) : delay);
   }
 }
 
@@ -703,6 +715,8 @@ export async function stackMerge(
   const first = await planFor(ctx, n, opts);
   const { stack } = first;
   let expectedHeads: Record<number, string> = {};
+  // the PR stk itself re-linked as the last one of the stack (it is in no stack any more); only it may be planned as a plain PR
+  let loneRelinked: number | null = null;
   // heads member branches had on origin before this run's restacks (see `rebaseStack`)
   const knownHeads: Record<string, string[]> = Object.create(null);
   const deps: ExecuteDeps = {
@@ -729,6 +743,7 @@ export async function stackMerge(
           if (!stack.prs.some((p) => p.number === n)) throw new StkError(`native stack gained unexpected PR #${n}; review the stack`, "gh-failed");
         }
         expectedHeads = rebased.heads;
+        loneRelinked = rebased.prs.length === 1 && rebased.relinked ? rebased.prs[0]! : null;
         return [rebased.relinked, rebased.note].filter(Boolean).join("; ") || undefined;
       },
     },
@@ -754,11 +769,12 @@ export async function stackMerge(
   const validateReplan = (fresh: PlanForResult, stale: number | null) => {
     // Exhausted stale-state polling must never trigger a local mutation.
     if (stale !== null) stopped(`GitHub still lists #${stale} as open after it merged`, stale);
-    // a lone PR left after the re-link is in no stack any more, and is planned as a plain PR
-    if (fresh.trunk !== first.trunk || (!fresh.stack.native && stack.prs.filter((p) => !landed.has(p.number)).length > 1)) {
+    const expected = stack.prs.filter((p) => !landed.has(p.number));
+    // a lone PR left after stk's own re-link is in no stack any more and is planned as a plain PR, on the original trunk
+    const lone = expected.length === 1 && loneRelinked === expected[0]!.number && fresh.stack.prs[0]?.baseRef === first.trunk;
+    if (fresh.trunk !== first.trunk || (!fresh.stack.native && !lone)) {
       stopped("native stack or trunk changed; review the stack and start a new merge", first.target);
     }
-    const expected = stack.prs.filter((p) => !landed.has(p.number));
     // Keep the whole original stack's order/branch identity, including unchanged members above the selected target.
     if (fresh.stack.prs.length !== expected.length || fresh.stack.prs.some((p, i) => p.number !== expected[i]?.number || p.headRef !== expected[i]?.headRef)) {
       stopped("native stack membership or order changed; review the stack and start a new merge", first.target);
@@ -806,13 +822,14 @@ export async function stackMerge(
 
     // The landed merge changes the next PR's base. After a bypass merge GitHub does nothing (rebased and re-linked below);
     // after any other it retargets and rebases the rest itself: wait for that and for its mergeability, then merge the head it ended on.
+    // The heads stk pushed for an earlier bypass merge are history then: GitHub rewrites them, so only "changed from before this merge" counts.
     const bypassed = merges[0]!.admin;
+    if (!bypassed) expectedHeads = {};
     const awaited: AwaitedRestack | undefined = bypassed ? undefined : { heads: Object.fromEntries(cur.stack.prs.filter((p) => !landed.has(p.number)).map((p) => [p.number, p.headSha])), method: opts.method };
-    let { fresh, stale, staleHead, checking, restacking } = await replanNative(ctx, first.target, opts, landed, opts.replan ?? {}, expectedHeads, awaited);
+    let { fresh, stale, staleHead, checking, restacking, waitedMs } = await replanNative(ctx, first.target, opts, landed, opts.replan ?? {}, expectedHeads, awaited);
     validateReplan(fresh, stale);
     if (restacking !== null) {
-      const waited = Math.round((opts.replan?.restackWaitMs ?? 60_000) / 1000);
-      stopped(`GitHub has not retargeted and rebased #${restacking} onto ${fresh.trunk} after #${[...landed].at(-1)} landed (waited ${waited}s); merge again once it has, or run rebase-stack`, restacking);
+      stopped(`GitHub has not retargeted and rebased #${restacking} onto ${fresh.trunk} after #${[...landed].at(-1)} landed (waited ${Math.round(waitedMs / 1000)}s); merge again once it has, or run rebase-stack`, restacking);
     }
     if (staleHead !== null) stopped(`GitHub has not reflected the pushed head of #${staleHead} (${expectedHeads[staleHead]}); refusing to merge a stale head`, staleHead);
     const note = bypassed ? fresh.notes.find((x) => x.action === "rebase-stack") : undefined;
@@ -908,12 +925,20 @@ function restackInput(trunk: string, open: PullRequest[], all: PullRequest[], kn
  * Re-link a native stack whose bottom open PR is still based on a merged branch (a bypass merge leaves GitHub's stack
  * like that: no retarget, no restack). GitHub refuses a base change while a PR is in a stack, so: unstack, point the
  * bottom PR at the trunk, re-create the stack from the open PRs (only when two or more remain; a lone PR is just a PR),
- * then wait while GitHub recomputes the bottom PR's mergeability. Never deletes the merged branch (that closes the child).
- * Returns what was done, in words, for the step output.
+ * then wait while GitHub recomputes every open PR's mergeability. Never deletes the merged branch (that closes the child).
+ * `open` is the membership that was rebased: if the stack differs when it is read again right before unstacking (a PR was
+ * added or removed meanwhile) nothing is unstacked. Throws when GitHub still reports a PR's mergeability as unknown after
+ * the polling ran out, so nothing proceeds as if it had settled. Returns what was done, in words, for the step output.
  */
 async function relinkStack(ctx: Ctx, trunk: string, open: PullRequest[], policy: ReplanPolicy): Promise<string> {
   const bottom = open[0]!;
   const stack = (await pullState(ctx.exec, at(ctx), bottom.number)).stack;
+  const now = await nativeStackDetail(ctx.exec, at(ctx), bottom.number);
+  const nowOpen = now?.members.filter((m) => m.pr.state === "OPEN").map((m) => m.pr.number) ?? [];
+  if (nowOpen.length !== open.length || nowOpen.some((n, i) => n !== open[i]!.number)) {
+    const list = (ns: number[]) => (ns.length ? ns.map((n) => `#${n}`).join(", ") : "no stack");
+    throw new StkError(`the stack changed while it was rebased (rebased ${list(open.map((p) => p.number))}, now ${list(nowOpen)}); nothing was unstacked, review it and run rebase-stack again`, "gh-failed");
+  }
   if (stack !== null) await unstackPrStack(ctx.exec, at(ctx), stack);
   try {
     await setPrBase(ctx.exec, at(ctx), bottom.number, trunk);
@@ -934,13 +959,34 @@ async function relinkStack(ctx: Ctx, trunk: string, open: PullRequest[], policy:
   }
   // right after a base change or a re-created stack GitHub reports mergeability as unknown for a few seconds: let it settle for every PR, bottom first
   const sleep = policy.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const delay = policy.delayMs ?? 2000;
+  const attempts = policy.attempts ?? 6;
   for (const p of open) {
-    for (let i = 0; i < (policy.attempts ?? 6); i++) {
-      if ((await pullState(ctx.exec, at(ctx), p.number)).mergeableState !== "unknown") break;
-      await sleep(policy.delayMs ?? 2000);
+    let state = (await pullState(ctx.exec, at(ctx), p.number)).mergeableState;
+    for (let i = 0; state === "unknown" && i < attempts; i++) {
+      await sleep(delay);
+      state = (await pullState(ctx.exec, at(ctx), p.number)).mergeableState;
+    }
+    if (state === "unknown") {
+      throw new StkError(`the stack was re-linked onto ${trunk}, but GitHub is still computing whether #${p.number} can merge (gave up after ${Math.round((attempts * delay) / 1000)}s); wait a moment, then merge again`, "gh-failed");
     }
   }
   return `unstacked, pointed #${bottom.number} at ${trunk}${recreated}`;
+}
+
+/**
+ * Whether the bottom open PR was already rebased onto its merged parent's merge commit (a run that rewrote the branches but
+ * failed while re-linking): its head then contains that commit. False when the parent's merge commit is unknown or an
+ * object is missing locally, and for a bottom that does not contain it (not rebased, or its parent was amended).
+ */
+async function bottomRestacked(ctx: Ctx, root: string, parent: PullRequest, bottom: PullRequest): Promise<boolean> {
+  const merge = (await pullState(ctx.exec, at(ctx), parent.number)).mergeCommit;
+  if (!merge) return false;
+  await git(ctx.exec, root, ["fetch", "--no-tags", "origin", merge, bottom.headSha]);
+  for (const sha of [merge, bottom.headSha]) {
+    if ((await git(ctx.exec, root, ["cat-file", "-e", `${sha}^{commit}`])).code !== 0) return false;
+  }
+  return (await git(ctx.exec, root, ["merge-base", "--is-ancestor", merge, bottom.headSha])).code === 0;
 }
 
 /**
@@ -949,7 +995,8 @@ async function relinkStack(ctx: Ctx, trunk: string, open: PullRequest[], policy:
  * detached checkout (see `restack.ts`) and pushed with leases; nothing in the user's worktrees is touched. A conflict
  * aborts with nothing pushed; unpushed local commits on a member branch are refused up front. When the bottom PR is still
  * based on a merged branch (what a bypass merge leaves), the stack is also re-linked onto the trunk (`relinkStack`);
- * that is what makes it mergeable again.
+ * that is what makes it mergeable again. A run that rewrote the branches but failed while re-linking is resumable: when
+ * the bottom PR already contains its merged parent's merge commit it is already rebased, so only the re-link is repeated.
  */
 export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: string) => void; knownHeads?: Record<string, string[]>; replan?: ReplanPolicy } = {}): Promise<RebaseStackResult> {
   const root = requireRoot(ctx, "rebase a stack");
@@ -957,8 +1004,12 @@ export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: s
   const pr = detail?.members.find((m) => m.pr.number === n)?.pr;
   if (!detail || !pr || pr.state !== "OPEN") throw new StkError(`PR #${n} is not an open member of a GitHub stack`, "usage");
   const open = detail.members.filter((m) => m.pr.state === "OPEN").map((m) => m.pr);
-  const onMergedBase = detail.members.some((m) => m.pr.state === "MERGED" && m.pr.headRef === open[0]!.baseRef);
-  const r = await restackAndPush(ctx.exec, root, restackInput(detail.trunk, open, detail.members.map((m) => m.pr), opts.knownHeads, provenanceKey(ctx.slug, root)), opts.onStep);
+  const mergedParent = detail.members.find((m) => m.pr.state === "MERGED" && m.pr.headRef === open[0]!.baseRef)?.pr;
+  const resumed = !!mergedParent && (await bottomRestacked(ctx, root, mergedParent, open[0]!));
+  if (resumed) opts.onStep?.(`#${open[0]!.number} is already rebased onto the merge of #${mergedParent!.number}; only re-linking`);
+  const r = resumed
+    ? { heads: Object.fromEntries(open.map((p) => [p.number, p.headSha])) as Record<number, string>, pushed: [] as number[], behind: [] }
+    : await restackAndPush(ctx.exec, root, restackInput(detail.trunk, open, detail.members.map((m) => m.pr), opts.knownHeads, provenanceKey(ctx.slug, root)), opts.onStep);
   // a run of several restacks leaves local branches at their old tips on purpose: remember those heads so the next one does not take them for unpushed work
   if (opts.knownHeads) {
     for (const p of open) {
@@ -968,7 +1019,7 @@ export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: s
       else Object.defineProperty(known, p.headRef, { value: [p.headSha], enumerable: true, writable: true, configurable: true });
     }
   }
-  const relinked = onMergedBase ? await relinkStack(ctx, detail.trunk, open, opts.replan ?? {}) : undefined;
+  const relinked = mergedParent ? await relinkStack(ctx, detail.trunk, open, opts.replan ?? {}) : undefined;
   if (relinked) opts.onStep?.(relinked);
   const note = behindText(r.behind);
   return { prs: open.map((p) => p.number), heads: r.heads, ...(relinked ? { relinked } : {}), ...(note ? { note } : {}) };
