@@ -6,13 +6,14 @@ import { describeBlocker, type CreatePrPlan, type RepoSlug, type MergeDryRun, ty
 import { StkError, mergeOutcomeOk, mergeOutcomeText, type Blocker, type MergeMethod, type PlanStep, type StepResult } from "../types";
 import { jobStatusText } from "../jobs";
 import { isWaitable } from "../watch";
-import { rowReason, waitLabel } from "../waiting";
+import { waitLabel } from "../waiting";
+import { planItems, prStatus, stackSummary, withExpectedRebases, worktreeNote, type PrStateKind, type PrStatus } from "../stackview";
 import { mergedPrs, stepStatuses } from "../jobview";
 import { ConfirmSheet, OutputSheet } from "./confirm";
 import { PaletteSheet } from "./palette";
 import { activeRepoKey, mergeMethodOf, useStore, useStoreInstance, type Outcome, type Sheet as SheetState } from "./store";
-import { G, reducedMotion, useTermSize, useTheme } from "./theme";
-import { Pill, RowContext, Segmented, SectionLabel, Sheet, Txt, VIM_HELP, useVimNav } from "./ui";
+import { G, reducedMotion, useTermSize, useTheme, type GlyphName } from "./theme";
+import { Pill, RowContext, Segmented, SectionLabel, Sheet, Txt, VIM_HELP, useVimNav, type Tone } from "./ui";
 
 type Active = Exclude<SheetState, null>;
 
@@ -474,52 +475,6 @@ function ReviewSheet({ n, initial }: { n: number; initial: ReviewEvent }) {
 
 type Phase = "plan" | "running" | "done" | "failed";
 
-interface Item {
-  text: string;
-  /** Indices into the plan covered by this line. */
-  steps: number[];
-}
-
-const trunkOf = (ref: string) => ref.replace(/^origin\//, "");
-
-function itemsOf(plan: PlanStep[], method: MergeMethod): Item[] {
-  const items: Item[] = [];
-  for (let i = 0; i < plan.length; i++) {
-    const s = plan[i]!;
-    switch (s.kind) {
-      case "retarget":
-        items.push({ steps: [i], text: `Retarget #${s.pr} from ${s.from} to ${s.to}` });
-        break;
-      case "restack": {
-        const next = plan[i + 1];
-        if (next?.kind === "push" && next.branch === s.branch) {
-          items.push({ steps: [i, i + 1], text: `Rebase #${s.pr} onto ${trunkOf(s.onto)}, push with lease` });
-          i++;
-        } else items.push({ steps: [i], text: `Rebase #${s.pr} onto ${trunkOf(s.onto)}` });
-        break;
-      }
-      case "push":
-        items.push({ steps: [i], text: `Push ${s.branch} with lease` });
-        break;
-      case "wait-checks":
-        items.push({ steps: [i], text: `Wait for #${s.pr} checks to pass` });
-        break;
-      case "rebase-stack":
-        items.push({ steps: [i], text: `Rebase the stack from #${s.pr} onto the trunk (gh stack)` });
-        break;
-      case "merge":
-        items.push({
-          steps: [i],
-          text:
-            (s.admin ? `Force-merge #${s.pr} (${s.method}), bypassing ${blockerWords(s.bypass) || "blockers"}` : `Merge #${s.pr} (${s.method || method})`) +
-            (s.includes && s.includes.length > 1 ? `, with ${s.includes.slice(0, -1).map((n) => `#${n}`).join(" ")} below` : ""),
-        });
-        break;
-    }
-  }
-  return items;
-}
-
 /** Greedy word wrap for sheet notes (plain text, one Line per row). */
 function wrapText(t: string, width: number): string[] {
   const out: string[] = [];
@@ -536,7 +491,27 @@ function wrapText(t: string, width: number): string[] {
 
 const prCount = (n: number) => `${n} PR${n === 1 ? "" : "s"}`;
 
-function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
+const STATUS_VIEW: Record<PrStateKind, { glyph: GlyphName; tone: Tone }> = {
+  approved: { glyph: "check", tone: "ok" },
+  ready: { glyph: "check", tone: "ok" },
+  "needs-review": { glyph: "half", tone: "warn" },
+  changes: { glyph: "half", tone: "warn" },
+  pending: { glyph: "ring", tone: "warn" },
+  other: { glyph: "warn", tone: "warn" },
+  failing: { glyph: "cross", tone: "error" },
+  conflict: { glyph: "swap", tone: "error" },
+  draft: { glyph: "hline", tone: "muted" },
+  merged: { glyph: "check", tone: "merged" },
+};
+
+/** A job's `no-worktree` failure: the branches that need a worktree before the merge can start. */
+function missingFrom(code: string | undefined, data: unknown): { pr: number; branch: string }[] {
+  if (code !== "step-failed" && code !== "no-worktree") return [];
+  const w = (data as { worktrees?: { pr: number; branch: string }[] } | undefined)?.worktrees;
+  return Array.isArray(w) && w.every((x) => typeof x?.pr === "number" && typeof x.branch === "string") ? w : [];
+}
+
+export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   const store = useStoreInstance();
   const { height: H } = useTermSize();
   const meta = useRepoMeta();
@@ -546,7 +521,9 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   const [info, setInfo] = useState<Outcome<StackInfo> | null>(null);
   const [planning, setPlanning] = useState(true);
   const [starting, setStarting] = useState(false);
+  const [creatingWt, setCreatingWt] = useState(false);
   const [tick, setTick] = useState(0);
+  const [replanTick, setReplanTick] = useState(0);
   const [startedId, setStartedId] = useState<string | null>(null);
   const [startErr, setStartErr] = useState<string | null>(null);
   const [cursor, setCursor] = useState(0);
@@ -584,7 +561,8 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   const staleNote = info?.ok ? info.value.notes.find((x) => x.action === "rebase-stack") : undefined;
   const phase: Phase = !job || (job.status !== "running" && job.id !== startedId) ? "plan" : job.status === "running" ? "running" : job.status === "done" ? "done" : "failed";
   const results: StepResult[] = phase === "plan" ? [] : (job?.steps ?? []);
-  const failMsg = phase === "failed" ? (job?.error ?? null) : startErr;
+  // the one error the sheet shows: the failed merge job, else the rebase job, else a request that did not start
+  const failMsg = phase === "failed" ? (job?.error ?? "The stack merge stopped.") : rebaseFailed && dirtyWts.length === 0 ? (rebaseJob?.error ?? "The stack rebase failed.") : startErr;
 
   useEffect(() => {
     if (phase !== "plan" || rebasing) return;
@@ -598,22 +576,29 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
     return () => {
       live = false;
     };
-  }, [store, n, method, force, phase, target, rebasing]);
+  }, [store, n, method, force, phase, target, rebasing, replanTick]);
 
-  const waiting = planning || starting || rebasing || phase === "running";
+  const waiting = planning || starting || creatingWt || rebasing || phase === "running";
   useEffect(() => {
     if (!waiting || reducedMotion()) return;
     const id = setInterval(() => setTick((t) => t + 1), 300);
     return () => clearInterval(id);
   }, [waiting]);
 
-  const plan = info?.ok ? info.value.plan : [];
+  const ok = info?.ok ? info.value : null;
+  const plan = ok ? ok.plan : [];
+  const forced = plan.some((s) => s.kind === "merge" && s.admin);
+  const trunk = ok?.stack.trunk ?? null;
   // once a job exists the sheet shows the job's own plan (the one it computed at start), not the earlier preview
-  const viewPlan = phase === "plan" ? plan : (job?.plan ?? results.map((r) => r.step));
-  const items = itemsOf(viewPlan, method);
+  const viewPlan = phase === "plan" ? withExpectedRebases(plan, ok?.stack.native === true) : (job?.plan ?? results.map((r) => r.step));
+  const items = planItems(viewPlan, trunk ?? "the trunk", method);
   const landedPrs = phase === "plan" ? new Set<number>() : mergedPrs(results, job?.merged);
-  const can = phase === "plan" && !planning && !!info && info.ok && plan.length > 0;
+  const can = phase === "plan" && !planning && !!ok && plan.length > 0;
   const tidx = Math.max(0, members.findIndex((m) => m.number === targetNum));
+  const wtOf = (pr: number) => ok?.rebaseWorktrees.find((w) => w.pr === pr);
+  // branches that need a worktree before the merge can start: known up front, or named by the failed job
+  const needWt: { pr: number; branch: string }[] =
+    phase === "plan" ? (ok?.rebaseWorktrees.filter((w) => w.kind === "none") ?? []) : missingFrom(phase === "failed" ? job?.errorCode : undefined, job?.errorData);
 
   const confirm = async () => {
     if (staleNote) {
@@ -630,6 +615,24 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
     setStarting(false);
     if (o.ok) setStartedId(o.value.jobId);
     else setStartErr(o.error.message);
+  };
+
+  const createWorktrees = async () => {
+    if (creatingWt || needWt.length === 0) return;
+    setStartErr(null);
+    setCreatingWt(true);
+    for (const w of needWt) {
+      const o = await store.openWorktree(w.pr, true);
+      if (!o.ok) {
+        setStartErr(o.error.message);
+        setCreatingWt(false);
+        return;
+      }
+    }
+    setCreatingWt(false);
+    setStartedId(null);
+    setRebaseId(null);
+    setReplanTick((t) => t + 1);
   };
 
   // The job is a merge-when-ready one that has not started merging: cancelling it is still possible.
@@ -658,9 +661,13 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   useKeyboard((k) => {
     if (waitingJob && k.name === "c" && !k.ctrl && !k.meta) return void store.cancelMergeWhenReady(waitingJob.pr);
     if (phase === "running" || rebasing) return;
+    if (k.ctrl || k.meta) return;
+    if (k.name === "c" && needWt.length > 0) return void createWorktrees();
     if (isConfirm(k)) {
       if (phase === "done") store.closeSheet();
-    } else if (phase === "plan" && !k.ctrl && !k.meta) {
+    } else if (phase === "failed" && k.name === "r") {
+      setStartedId(null);
+    } else if (phase === "plan") {
       if (k.name === "f") setForce((f) => !f);
       else if (k.name === "t") store.cycleMergeMethod();
       else if (k.name === "w") void whenReady();
@@ -669,9 +676,8 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
 
   // Status of each plan line from the live results.
   const stepStat = stepStatuses(viewPlan, results, phase === "running");
-  const failedAt = results.findIndex((r) => !r.ok);
-  const status = (it: Item): "done" | "running" | "failed" | "pending" => {
-    const st = it.steps.map((i) => stepStat[i]!);
+  const status = (steps: number[]): "done" | "running" | "failed" | "pending" => {
+    const st = steps.map((i) => stepStat[i]!);
     if (st.includes("failed")) return "failed";
     if (st.every((x) => x === "done")) return "done";
     return st.includes("running") || st.includes("done") ? (phase === "failed" ? "failed" : "running") : "pending";
@@ -680,7 +686,7 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   const lines: ReactNode[] = [];
   const rowLine: number[] = [];
   const push = (node: ReactNode) => lines.push(<Line key={lines.length}>{node}</Line>);
-  const text = (t: string, tone: "ink" | "muted" | "faint" | "error" = "ink", bold?: boolean) =>
+  const text = (t: string, tone: Tone = "ink", bold?: boolean) =>
     push(
       <box flexGrow={1} flexShrink={1} overflow="hidden">
         <Txt tone={tone} bold={bold} truncate>
@@ -688,20 +694,37 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
         </Txt>
       </box>,
     );
+  const wrapped = (t: string, tone: Tone = "ink", indent = 0) => {
+    for (const l of wrapText(t, 78 - indent)) text(`${" ".repeat(indent)}${l}`, tone);
+  };
 
-  /** One stack member: cursor marker, status glyph, number, title; rows above the target are dimmed. */
+  /** Merge order of each PR the plan lands (1 = first), by number. */
+  const order: Record<number, number> = {};
+  plan.filter((s) => s.kind === "merge").flatMap((s) => s.includes ?? [s.pr]).forEach((pr, i) => (order[pr] = i + 1));
+
+  /** One stack member: status glyph, merge order, number, title, honest status; a detail line below. */
   const memberRow = (m: (typeof members)[number], i: number) => {
-    const ok = info?.ok ? info.value : null;
     const bs = ok?.blockers[m.number] ?? [];
     const included = i <= tidx;
-    const stop = ok?.stop?.pr === m.number && included;
     const landed = landedPrs.has(m.number);
-    const bad = !landed && (ok ? bs.length > 0 || stop : m.isDraft);
+    const full = ok?.stack.prs.find((p) => p.number === m.number);
+    const st: PrStatus | null = landed
+      ? { kind: "merged", label: "merged", bypass: false, hard: false }
+      : full
+        ? prStatus(full, bs, force || forced)
+        : m.isDraft
+          ? { kind: "draft", label: "draft", bypass: false, hard: true }
+          : null;
+    const view = st ? STATUS_VIEW[st.kind] : null;
+    const dim = !included && !landed;
     rowLine[i] = lines.length;
     lines.push(
       <Line key={lines.length} selected={phase === "plan" && m.number === selPr}>
         <box width={3} flexShrink={0}>
-          <Txt tone={landed ? "merged" : !included ? "faint" : bad ? "error" : ok ? "muted" : "faint"}>{landed ? G.check : !ok ? (bad ? G.cross : G.ring) : bad ? G.cross : G.check}</Txt>
+          <Txt tone={dim ? "faint" : (view?.tone ?? "faint")}>{view ? G[view.glyph] : G.ring}</Txt>
+        </box>
+        <box width={3} flexShrink={0}>
+          <Txt tone={dim ? "faint" : "muted"}>{order[m.number] ? String(order[m.number]) : G.hline}</Txt>
         </box>
         <box width={7} flexShrink={0}>
           <Txt bold={included}>{`#${m.number}`}</Txt>
@@ -711,25 +734,27 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
             {m.title}
           </Txt>
         </box>
-        {landed && (
-          <box flexShrink={0}>
-            <Txt tone="merged">merged</Txt>
-          </box>
-        )}
-        {!landed && !included && (
-          <box flexShrink={0}>
-            <Txt tone="faint">not included</Txt>
-          </box>
-        )}
+        <box flexShrink={0} paddingLeft={1}>
+          <Txt tone={dim ? "faint" : (view?.tone ?? "faint")}>{dim ? "not included" : st ? `${st.label}${st.bypass && !landed ? " · will bypass" : ""}` : ""}</Txt>
+        </box>
       </Line>,
     );
-    if (!ok || !included || landed) return;
-    // the reason is shown once, under its row: the planner's stop reason (unless it only says "blocked", which the
-    // blocker words explain), else the soft blockers force would bypass
-    const why = stop && ok.stop!.reason !== `#${m.number} is blocked` ? rowReason(ok.stop!.reason, m.number, force) : null;
-    if (why) text(`        ${why.text}`, planning ? "faint" : why.hard ? "error" : "muted");
-    else if (bs.length) text(`        ${blockerWords(bs)}`, "muted");
-    for (const note of ok.notes.filter((x) => x.pr === m.number)) text(`        ${note.text}`, "muted");
+    // the connector down to the PR below carries what else is worth knowing about this one
+    const detail = [
+      ...(m.number === n ? ["opened here"] : []),
+      ...(included && !landed && bs.filter((b) => b.kind !== "base-not-trunk").length > 1 ? [blockerWords(bs.filter((b) => b.kind !== "base-not-trunk"))] : []),
+      ...(included && !landed ? (ok?.notes.filter((x) => x.pr === m.number).map((x) => x.text) ?? []) : []),
+    ];
+    push(
+      <>
+        <box width={3} flexShrink={0}>
+          <Txt tone="faint">{G.vbar}</Txt>
+        </box>
+        <box flexGrow={1} flexShrink={1} overflow="hidden">
+          <Txt tone="muted" truncate>{`   ${detail.join(" · ")}`}</Txt>
+        </box>
+      </>,
+    );
   };
 
   if (rebasing && rebaseJob) {
@@ -742,26 +767,42 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
     text(job ? jobStatusText(job) : "", "ink");
     for (const r of results) text(`${r.ok ? G.check : G.cross} ${r.detail}`, r.ok ? "muted" : "error");
   } else if (info && !info.ok) {
-    text(info.error.message, "error");
+    wrapped(info.error.message, "error");
   } else if (!info && members.length === 0) {
     text("Working out the plan…", "muted");
   } else {
     // Optimistic first paint (no plan yet): members the store already knows, status filling in once the plan lands.
-    const trunk = info?.ok ? info.value.stack.trunk : null;
-    push(<SectionLabel label="Stack" meta={trunk ? `bottom-up onto ${trunk} · ⏎ sets the merge target` : "working out the plan…"} />);
-    members.forEach(memberRow);
-    if (info?.ok) {
-      const { stop, notes } = info.value;
-      const landed = plan.flatMap((s) => (s.kind === "merge" ? (s.includes ?? [s.pr]) : []));
+    if (trunk) text([trunk, ...members.map((m) => `#${m.number}`)].join(` ${G.arrow === "->" ? "<-" : "←"} `), "ink", true);
+    if (ok) {
+      const summary = stackSummary({ trunk: ok.stack.trunk, method, plan, stop: ok.stop, above: members.slice(tidx + 1).map((m) => m.number) });
+      wrapped(summary, planning ? "faint" : "ink");
+    }
+    push(<Gap />);
+    push(<SectionLabel label="Stack" meta={trunk ? "top first · numbers are the merge order · ⏎ sets how far to merge" : "working out the plan…"} />);
+    // drawn bottom-to-top: the top PR first, the base branch at the bottom
+    for (let i = members.length - 1; i >= 0; i--) memberRow(members[i]!, i);
+    if (trunk) {
+      push(
+        <>
+          <box width={3} flexShrink={0}>
+            <Txt tone="muted">{G.dot}</Txt>
+          </box>
+          <box width={3} flexShrink={0} />
+          <Txt bold>{trunk}</Txt>
+          <Txt tone="muted">{"  base branch: everything lands here"}</Txt>
+        </>,
+      );
+    }
+    if (ok) {
       push(<Gap />);
       push(<SectionLabel label="Plan" meta={planning ? `${items.length} step${items.length === 1 ? "" : "s"} · ${waitLabel("updating plan", tick, reducedMotion())}` : `${items.length} step${items.length === 1 ? "" : "s"}`} />);
       if (items.length === 0) {
         text(planning ? "…" : force ? "Nothing can be merged." : "Nothing can be merged yet. Press f to plan a force merge.", planning ? "faint" : "error");
       }
       items.forEach((it, i) => {
-        const st = status(it);
+        const st = status(it.steps);
         const glyph = st === "done" ? G.check : st === "failed" ? G.cross : st === "running" ? G.dot : G.ring;
-        const tone = planning ? "faint" : st === "failed" ? "error" : st === "pending" ? "faint" : st === "done" ? "muted" : "ink";
+        const tone: Tone = planning ? "faint" : st === "failed" ? "error" : st === "pending" ? "faint" : st === "done" ? "muted" : "ink";
         push(
           <>
             <box width={3} flexShrink={0}>
@@ -777,41 +818,38 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
         if (st === "running" && job?.progress && job.progress.phase !== "merged") {
           text(`     ${job.progress.phase === "enqueued" ? "queued by GitHub" : (job.progress.message ?? "waiting for GitHub")}`, "muted");
         }
-        if (st === "failed") {
-          const r = results[failedAt];
-          text(`     ${r?.detail || failMsg || "step failed"}`, "error");
-        }
+        if (it.why) wrapped(it.why, "muted", 5);
+        const wt = phase === "plan" && it.worktreePr !== undefined ? worktreeNote(wtOf(it.worktreePr)) : null;
+        if (wt) wrapped(wt.text, wt.ok ? "faint" : "error", 5);
       });
-      if (phase === "plan" && stop && items.length > 0) {
-        push(<Gap />);
-        text(`Lands ${landed.length} of ${tidx + 1} PRs; #${stop.pr} stops it${force ? "" : " (f to include it with force)"}.`, planning ? "faint" : "muted");
-      }
-      if (!info.value.stack.native && members.length > 1) {
+      if (!ok.stack.native && members.length > 1) {
         push(<Gap />);
         text("Tip: make this a GitHub stack to merge it in one request (:create-stack)", "faint");
       }
-      for (const note of notes) {
+      for (const note of ok.notes) {
         push(<Gap />);
         for (const l of wrapText(note.fix, 76)) text(l, "muted");
       }
     }
   }
 
-  const viewH = Math.max(3, Math.min(lines.length, H - 16, 22));
+  const viewH = Math.max(3, Math.min(lines.length, H - 16, 26));
   const rowMode = phase === "plan" && members.length > 0;
   const selIdx = Math.max(0, members.findIndex((m) => m.number === selPr));
+  // rows are drawn top PR first, so the cursor counts from the top of the stack
+  const flip = (i: number) => members.length - 1 - i;
   const scrollTo = (c: number) => {
     if (rowMode) {
-      setSelPr(members[c]?.number ?? selPr);
-      scroll.current?.scrollTo(Math.max(0, (rowLine[c] ?? 0) - 1));
+      const i = flip(c);
+      setSelPr(members[i]?.number ?? selPr);
+      scroll.current?.scrollTo(Math.max(0, (rowLine[i] ?? 0) - 1));
     } else {
       setCursor(c);
       scroll.current?.scrollTo(c);
     }
   };
-  useVimNav({ count: rowMode ? members.length : lines.length, cursor: rowMode ? selIdx : cursor, setCursor: scrollTo, pageSize: viewH, enabled: true, sheet: true, onOpen });
+  useVimNav({ count: rowMode ? members.length : lines.length, cursor: rowMode ? flip(selIdx) : cursor, setCursor: scrollTo, pageSize: viewH, enabled: true, sheet: true, onOpen });
 
-  const forced = plan.some((s) => s.kind === "merge" && s.admin);
   const count = info?.ok && plan.length > 0 ? plan.flatMap((s) => (s.kind === "merge" ? (s.includes ?? [s.pr]) : [])).length : tidx + 1;
   const what =
     members.length <= 1
@@ -822,7 +860,13 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
           ? `#${targetNum} only`
           : `up to #${targetNum} (${prCount(count)})`;
   const label = `${force || forced ? "Force merge" : "Merge"} ${what}`;
-  const title = phase === "done" ? `Stack #${job?.pr ?? topNum} finished` : `${force ? "Force merge stack" : "Merge stack"} #${topNum}`;
+  const title = phase === "done" ? `Stack #${job?.pr ?? topNum} finished` : `${force || forced ? "Force merge stack" : "Merge stack"} #${topNum}`;
+  const keys =
+    phase === "plan"
+      ? `↑↓ ⏎ target · f force · t ${method}${canWait ? " · w when ready" : ""}${needWt.length > 0 ? " · c create worktree" : ""}`
+      : phase === "failed"
+        ? `r plan again${needWt.length > 0 ? " · c create worktree" : ""}`
+        : "";
 
   return (
     <Sheet title={title} meta={meta} width={84}>
@@ -830,10 +874,12 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
       <scrollbox ref={scroll} height={viewH} flexShrink={0} scrollY>
         <box flexDirection="column">{lines}</box>
       </scrollbox>
-      {phase === "failed" && (
+      {failMsg && dirtyWts.length === 0 && (
         <>
           <Gap />
-          <Txt tone="error">{failMsg ?? "The stack merge stopped."}</Txt>
+          {wrapText(failMsg, 80).map((l, i) => (
+            <Txt key={i} tone="error">{l}</Txt>
+          ))}
         </>
       )}
       {phase === "done" && (
@@ -848,12 +894,6 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
           <Txt tone="muted">{`Rewrites and force-pushes ${prCount(members.length)}.`}</Txt>
         </>
       )}
-      {rebaseFailed && dirtyWts.length === 0 && (
-        <>
-          <Gap />
-          <Txt tone="error">{rebaseJob?.error ?? "The stack rebase failed."}</Txt>
-        </>
-      )}
       {dirtyWts.length > 0 && (
         <>
           <Gap />
@@ -864,14 +904,16 @@ function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
           <Txt tone="muted">⏎ stashes them, rebases, then restores them.</Txt>
         </>
       )}
-      <Footer left={rebasing ? "runs in background · esc to close" : phase === "plan" ? `↑↓ ⏎ target · f force · t ${method}${canWait ? " · w when ready" : ""}` : waitingJob ? "runs in background · c cancel waiting · esc to close" : phase === "running" ? "runs in background · esc to close" : ""} cancel={phase === "plan" && !rebasing ? "Cancel" : "Close"}>
+      <Footer left={rebasing ? "runs in background · esc to close" : phase === "plan" || phase === "failed" ? keys : waitingJob ? "runs in background · c cancel waiting · esc to close" : phase === "running" ? "runs in background · esc to close" : ""} cancel={phase === "plan" && !rebasing ? "Cancel" : "Close"}>
+        {needWt.length > 0 && !rebasing && <Pill label={creatingWt ? waitLabel("Creating", tick, reducedMotion()) : "Create worktree"} hint="c" variant="secondary" disabled={creatingWt} onPress={() => void createWorktrees()} />}
         {canWait && <Pill label="Merge when ready" hint="w" variant="secondary" disabled={starting} onPress={() => void whenReady()} />}
+        {phase === "failed" && !rebasing && <Pill label="Plan again" hint="r" variant="primary" onPress={() => setStartedId(null)} />}
         {phase === "plan" && !rebasing && (
           <Pill
             label={starting ? waitLabel("Starting", tick, reducedMotion()) : planning ? waitLabel("Planning", tick, reducedMotion()) : staleNote ? (dirtyWts.length > 0 ? "Stash and rebase" : "Rebase stack") : label}
             hint="⏎"
             variant={staleNote ? "primary" : force || forced ? "secondary" : "primary"}
-            disabled={starting || planning || (staleNote ? false : !can)}
+            disabled={starting || planning || creatingWt || needWt.length > 0 || (staleNote ? false : !can)}
             onPress={() => void confirm()}
           />
         )}

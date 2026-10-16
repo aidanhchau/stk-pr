@@ -1176,7 +1176,15 @@ export class Store {
   }
 
   openWorktree(n: number, create = false, repo?: RepoSlug): Promise<Outcome<OpenResult>> {
-    return this.run("opening worktree", (c) => openWorktree(c, n, { create }), { n, repo, quiet: true });
+    return this.run("opening worktree", async (c) => {
+      const res = await openWorktree(c, n, { create });
+      // a new worktree changes which stack steps can run: drop the cached plans so the next one sees it
+      if (res.created) {
+        const r = repo ?? this.activeRepo();
+        if (r) this.dropStackInfo(repoKey(r));
+      }
+      return res;
+    }, { n, repo, quiet: true });
   }
 
   /** Dry run: what would a (force) merge do. Errors are returned, not toasted. */

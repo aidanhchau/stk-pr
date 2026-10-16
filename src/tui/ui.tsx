@@ -11,7 +11,7 @@ const LEADER = "┈".repeat(400);
 
 // ---------- text ----------
 
-export type Tone = "ink" | "muted" | "faint" | "error" | "cobalt" | "merged";
+export type Tone = "ink" | "muted" | "faint" | "error" | "cobalt" | "merged" | "ok" | "warn";
 export const RowContext = createContext(false);
 
 /** Colour for a tone, aware of selection fill (muted becomes mutedOnSel inside a selected Row). */

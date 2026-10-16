@@ -5,7 +5,7 @@
 import { join } from "node:path";
 import type { PaletteItem } from "./fuzzy";
 import { GH_ENV, formatGhOutput, planGh, type GhResult } from "./ghproxy";
-import { isClean, listWorktrees, remoteSha, repoRoot, worktreeForBranch } from "./git";
+import { attachBranch, isClean, listWorktrees, remoteSha, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
 import { commitSubjects, currentBranch, localBranches, nearestParent, pushBranch, pushEmptyCommit, pushKind, RETRIGGER_MESSAGE, type PushKind } from "./branches";
 import {
   closePr,
@@ -162,6 +162,21 @@ export interface StackInfo {
   /** Set when a PR at or below `target` is not in the plan: which one, and why, in words. */
   stop: { pr: number; reason: string } | null;
   notes: StackNote[];
+  /** PRs the merge rebases in a worktree: where each would run (`detached` = a detached HEAD at the tip, switched to the branch first). */
+  rebaseWorktrees: RebaseWorktree[];
+}
+
+/** A PR the rebase step runs for, and the worktree it would use. */
+export interface RebaseWorktree {
+  pr: number;
+  branch: string;
+  kind: "branch" | "detached" | "none";
+  path?: string;
+}
+
+/** `StkError` data of a `no-worktree` failure. */
+export interface MissingWorktrees {
+  worktrees: { pr: number; branch: string }[];
 }
 export interface StackMergeResult {
   results: StepResult[];
@@ -388,8 +403,8 @@ export async function prFiles(ctx: Ctx, n: number, file?: string): Promise<PrFil
 export async function openWorktree(ctx: Ctx, n: number, opts: { create?: boolean } = {}): Promise<OpenResult> {
   const pr = await getPr(ctx.exec, at(ctx), n);
   const branch = pr.headRef;
-  const existing = worktreeForBranch(ctx.worktrees, branch);
-  if (existing) return { branch, worktree: existing.path, created: false };
+  const existing = resolveWorktree(ctx.worktrees, branch, pr.headSha);
+  if (existing.kind !== "none") return { branch, worktree: existing.worktree.path, created: false };
   if (!opts.create) return { branch, worktree: null, created: false };
   const root = requireRoot(ctx, "create a worktree");
   const git = async (args: string[]) => {
@@ -607,7 +622,20 @@ export async function stackInfo(
 ): Promise<StackInfo> {
   const { trunk, stack, forks, plan, target, notes, rules } = await planFor(ctx, n, opts);
   const perPr = blockersByPr(stack, trunk, rules);
-  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes };
+  const rebasing = notes.some((x) => x.action === "rebase-stack") ? [stack.prs[0]!] : nativeRebaseBottoms(stack, plan, target);
+  const rebaseWorktrees = rebasing.map((p): RebaseWorktree => {
+    const found = resolveWorktree(ctx.worktrees, p.headRef, p.headSha);
+    return { pr: p.number, branch: p.headRef, kind: found.kind, ...(found.kind === "none" ? {} : { path: found.worktree.path }) };
+  });
+  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes, rebaseWorktrees };
+}
+
+/** The PRs a native plan with several merge steps rebases (each bottom after the first merge lands): the ones that need a worktree. */
+function nativeRebaseBottoms(stack: Stack, plan: PlanStep[], target: number): PullRequest[] {
+  const merges = plan.filter((s) => s.kind === "merge");
+  if (!stack.native || merges.length <= 1) return [];
+  const first = merges[0]!.includes ?? [merges[0]!.pr];
+  return stack.prs.slice(0, stack.prs.findIndex((p) => p.number === target) + 1).filter((p) => !first.includes(p.number));
 }
 
 /** Per-member blockers of a stack: a native stack lands on the trunk, so no member is judged by its own base. */
@@ -717,8 +745,8 @@ export async function stackMerge(
   const landedBy = (rs: StepResult[]) => {
     for (const r of rs) if (r.ok && r.step.kind === "merge" && !r.enqueued) for (const m of r.step.includes ?? [r.step.pr]) landed.add(m);
   };
-  const stopped = (reason: string, pr: number): never => {
-    throw new StkError(`stack merge stopped at #${pr}: ${reason}`, "step-failed", { results });
+  const stopped = (reason: string, pr: number, extra: object = {}): never => {
+    throw new StkError(`stack merge stopped at #${pr}: ${reason}`, "step-failed", { results, ...extra });
   };
   const selected = stack.prs.slice(0, stack.prs.findIndex((p) => p.number === first.target) + 1);
   const validateReplan = (fresh: PlanForResult, stale: number | null) => {
@@ -749,10 +777,11 @@ export async function stackMerge(
       await preflightNativeRebase(ctx, remaining, bottoms);
     } catch (e) {
       const failed: StepResult = { step: { kind: "rebase-stack", pr: bottoms[0]!.number }, ok: false, detail: e instanceof Error ? e.message : String(e) };
-      opts.onPlan?.([failed.step, ...first.plan]);
+      // the rebase runs after the first merge lands, so that is where it sits in the plan
+      opts.onPlan?.([first.plan[0]!, failed.step, ...first.plan.slice(1)]);
       results.push(failed);
       opts.onStep?.(failed);
-      stopped(failed.detail, bottoms[0]!.number);
+      stopped(failed.detail, bottoms[0]!.number, e instanceof StkError && e.code === "no-worktree" ? { worktrees: (e.data as MissingWorktrees).worktrees } : {});
     }
   }
 
@@ -859,15 +888,25 @@ async function preflightNativeRebase(ctx: Ctx, open: PullRequest[], bottoms: Pul
   }
   const worktrees = await listWorktrees(ctx.exec, root);
   const cwds: Record<number, string> = {};
-  // Every segment's bottom must already have its branch checked out; gh stack may not switch an unrelated worktree.
+  const attach: { path: string; branch: string; tip: string }[] = [];
+  const missing: MissingWorktrees["worktrees"] = [];
+  // Every segment's bottom must already have its branch checked out (or be detached at its tip); gh stack may not switch an unrelated worktree.
   for (const pr of bottoms) {
-    const cwd = worktreeForBranch(worktrees, pr.headRef)?.path;
-    if (!cwd) throw new StkError(`no worktree has #${pr.number}'s branch (${pr.headRef}) checked out; open one first (stk worktree ${pr.number})`, "not-a-repo");
-    cwds[pr.number] = cwd;
+    const found = resolveWorktree(worktrees, pr.headRef, pr.headSha);
+    if (found.kind === "none") missing.push({ pr: pr.number, branch: pr.headRef });
+    else {
+      cwds[pr.number] = found.worktree.path;
+      if (found.kind === "detached") attach.push({ path: found.worktree.path, branch: pr.headRef, tip: pr.headSha });
+    }
+  }
+  if (missing.length > 0) {
+    const what = missing.map((m) => `#${m.pr}'s branch (${m.branch})`).join(" or ");
+    throw new StkError(`no worktree has ${what} checked out; open one with: stk worktree ${missing[0]!.pr}`, "no-worktree", { worktrees: missing });
   }
   const dirty: DirtyWorktree[] = [];
   for (const pr of open) {
-    const path = worktreeForBranch(worktrees, pr.headRef)?.path;
+    const found = resolveWorktree(worktrees, pr.headRef, pr.headSha);
+    const path = found.kind === "none" ? undefined : found.worktree.path;
     if (!path || dirty.some((d) => d.path === path)) continue;
     const st = await ctx.exec(["git", "status", "--porcelain"], { cwd: path });
     if (st.code !== 0) throw new StkError(`git status failed in ${path}: ${st.stderr.trim()}`, "git-failed");
@@ -881,7 +920,7 @@ async function preflightNativeRebase(ctx: Ctx, open: PullRequest[], bottoms: Pul
       { worktrees: dirty },
     );
   }
-  return { cwds, dirty };
+  return { cwds, dirty, attach };
 }
 
 /**
@@ -901,8 +940,13 @@ export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: s
   const open = detail.members.filter((m) => m.pr.state === "OPEN").map((m) => m.pr);
   const prs = open.map((m) => m.number);
   const gh = async (args: string[], cwd: string) => ctx.exec(["gh", "stack", ...args], { cwd });
-  const { cwds, dirty } = await preflightNativeRebase(ctx, open, [pr], opts.stash);
+  const { cwds, dirty, attach } = await preflightNativeRebase(ctx, open, [pr], opts.stash);
   const cwd = cwds[n]!;
+  // an agent's worktree sits on a detached HEAD at the branch tip: `gh stack` needs the branch itself checked out
+  for (const a of attach) {
+    opts.onStep?.(`checking out ${a.branch} in ${a.path}`);
+    await attachBranch(ctx.exec, a.path, a.branch, a.tip);
+  }
 
   const label = `stk rebase-stack ${opts.label ?? n}`;
   const stashed: { path: string; sha: string }[] = [];

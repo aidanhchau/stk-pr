@@ -46,6 +46,40 @@ export function worktreeForBranch(worktrees: Worktree[], branch: string): Worktr
   return worktrees.find((w) => !w.bare && w.branch === branch) ?? null;
 }
 
+/** Where a PR branch can be worked on: checked out under its own name, or in a worktree whose detached HEAD sits at its tip. */
+export type WorktreeLookup = { kind: "branch"; worktree: Worktree } | { kind: "detached"; worktree: Worktree } | { kind: "none" };
+
+/**
+ * Find a worktree to run git commands for `branch`. Agents leave worktrees on a detached HEAD, so a worktree detached
+ * exactly at `tip` (the branch's current remote tip) counts as having the branch: callers check the branch out there
+ * with `attachBranch`. A detached worktree at any other commit is not the branch and is ignored.
+ */
+export function resolveWorktree(worktrees: Worktree[], branch: string, tip: string): WorktreeLookup {
+  const own = worktreeForBranch(worktrees, branch);
+  if (own) return { kind: "branch", worktree: own };
+  const detached = worktrees.find((w) => !w.bare && w.branch === null && w.head === tip);
+  return detached ? { kind: "detached", worktree: detached } : { kind: "none" };
+}
+
+/**
+ * Check `branch` out in a worktree that is detached at `tip`. Creates the local branch there when it does not exist; an
+ * existing local branch is moved to `tip` only when it is behind it (no commit can be lost).
+ */
+export async function attachBranch(exec: Exec, dir: string, branch: string, tip: string): Promise<void> {
+  const local = await git(exec, dir, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+  if (local.code !== 0) {
+    await gitOk(exec, dir, ["switch", "-c", branch]);
+    await git(exec, dir, ["branch", "--set-upstream-to", `origin/${branch}`]);
+    return;
+  }
+  const at = local.stdout.trim();
+  if (at === tip) return void (await gitOk(exec, dir, ["switch", branch]));
+  if ((await git(exec, dir, ["merge-base", "--is-ancestor", at, tip])).code !== 0) {
+    throw new StkError(`local ${branch} (${at.slice(0, 9)}) has commits that are not on origin; ${dir} is detached at origin's ${tip.slice(0, 9)}. Push or move ${branch} first`, "diverged");
+  }
+  await gitOk(exec, dir, ["switch", "-C", branch]);
+}
+
 export async function repoRoot(exec: Exec, cwd: string): Promise<string> {
   const r = await git(exec, cwd, ["rev-parse", "--show-toplevel"]);
   if (r.code !== 0) throw new StkError(`not a git repository: ${cwd}`, "not-a-repo");

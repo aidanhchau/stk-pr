@@ -199,6 +199,8 @@ export class StkError extends Error {
     message: string,
     readonly code:
       | "not-a-repo"
+      /** A stack rebase needs a worktree for a branch that none has; `data.worktrees` lists them. */
+      | "no-worktree"
       | "gh-failed"
       | "git-failed"
       | "dirty-worktree"
