@@ -295,6 +295,14 @@ describe("stackMerge on a native stack", () => {
     expect(puts.map((p) => p.sha)).toEqual(["shaA", "new203"]);
   });
 
+  test("a member that keeps showing as conflicting after the re-link stops the run with that reason instead of a silent partial merge", async () => {
+    clearRulesCache();
+    const { ctx, puts } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 999 });
+    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, replan: noSleep }).catch((e: Error) => e)) as Error;
+    expect(err.message).toContain("stack merge stopped at #203: GitHub still reports #203 as conflicting after the stack was re-linked");
+    expect(puts.map((p) => p.pr)).toEqual([A]);
+  });
+
   test("right after the push GitHub still computes mergeability: the re-plan waits instead of stopping", async () => {
     clearRulesCache();
     const { ctx, puts } = fakeGithub({ review: "required", checkingReads: 3 });

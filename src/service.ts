@@ -845,6 +845,10 @@ export async function stackMerge(
       ({ fresh, stale, staleHead, checking } = await replanNative(ctx, first.target, opts, landed, opts.replan ?? {}, expectedHeads, undefined, true));
       validateReplan(fresh, stale);
       if (staleHead !== null) stopped(`GitHub has not reflected the pushed head of #${staleHead} (${expectedHeads[staleHead]}); refusing to merge a stale head`, staleHead);
+      // a member still shown as conflicting after the re-link would silently cut the plan short: say so instead
+      const targetAt = fresh.stack.prs.findIndex((p) => p.number === fresh.target);
+      const conflicted = fresh.stack.prs.find((p, i) => i <= targetAt && memberBlockers(p, fresh.trunk, i > 0, fresh.rules).some((b) => b.kind === "conflict"));
+      if (conflicted) stopped(`GitHub still reports #${conflicted.number} as conflicting after the stack was re-linked; its mergeability may be stale (closing and reopening it makes GitHub recompute), merge again once it clears`, conflicted.number);
     }
     if (checking !== null) stopped(`GitHub is still checking it for conflicts after #${[...landed].at(-1)} landed; merge again once that settles`, checking);
     opts.onPlan?.([...results.map((r) => r.step), ...fresh.plan]);
