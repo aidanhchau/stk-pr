@@ -1296,7 +1296,9 @@ export class Store {
     if (!r) return { ok: false, error: new Error("repository not open") };
     try {
       const ctx = await this.ctxFor(r);
-      const { id } = await startJob({ kind, repo: r, pr: n, method, force, ...(stash ? { stash } : {}), ...(stack ? { stack } : {}), ...(ctx.root ? { repoDir: ctx.root } : {}) });
+      // a stack job must not overlap a running job on any PR of its stack
+      const stackPrs = kind === "merge" ? [] : this.stackPreview(n, r).map((e) => e.number);
+      const { id } = await startJob({ kind, repo: r, pr: n, method, force, ...(stash ? { stash } : {}), ...(stack ? { stack } : {}), ...(ctx.root ? { repoDir: ctx.root } : {}) }, { stackPrs });
       this.trackJob(id);
       return { ok: true, value: { jobId: id } };
     } catch (e) {

@@ -189,10 +189,14 @@ function spawnRunner(id: string): number {
   return proc.pid;
 }
 
-/** Create the job file and start its detached runner. Refuses when the PR already has a running job. */
-export async function startJob(spec: JobSpec, opts: JobOpts & { spawn?: (id: string) => number } = {}): Promise<{ id: string }> {
-  const running = listJobs({ repo: spec.repo, pr: spec.pr, alive: opts.alive }).find((j) => j.status === "running");
-  if (running) throw new StkError(`#${spec.pr} is already being merged`, "usage");
+/**
+ * Create the job file and start its detached runner. Refuses when the PR already has a running job; `stackPrs` (the
+ * other PRs of the stack a stack job works on) extends that to a running job on any of them.
+ */
+export async function startJob(spec: JobSpec, opts: JobOpts & { spawn?: (id: string) => number; stackPrs?: number[] } = {}): Promise<{ id: string }> {
+  const covered = [spec.pr, ...(opts.stackPrs ?? [])];
+  const running = listJobs({ repo: spec.repo, alive: opts.alive }).find((j) => j.status === "running" && covered.some((n) => jobCovers(j, spec.repo, n)));
+  if (running) throw new StkError(running.pr === spec.pr ? `#${spec.pr} is already being merged` : `#${running.pr} is already being merged in this stack`, "usage");
   const id = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 6)}`;
   const now = Date.now();
   // Sub-millisecond start time so jobs started in the same millisecond still sort newest first.

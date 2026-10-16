@@ -3,8 +3,9 @@ import type { TestRendererSetup } from "@opentui/core/testing";
 import { testRender } from "@opentui/react/test-utils";
 import type { StackInfo } from "../src/service";
 import { StackSheet } from "../src/tui/sheets";
-import { Store, StoreContext, type Outcome } from "../src/tui/store";
+import { Store, StoreContext, repoKey, type Outcome } from "../src/tui/store";
 import { ThemeContext, dark } from "../src/tui/theme";
+import type { Job } from "../src/jobs";
 import type { PlanStep, PullRequest } from "../src/types";
 
 let setup: TestRendererSetup | null = null;
@@ -64,8 +65,10 @@ async function settle(): Promise<string> {
   return frame();
 }
 
-async function mount(prs: PullRequest[], props: { n: number; upTo?: number | "top" }, wt: "none" | "detached" = "detached") {
+async function mount(prs: PullRequest[], props: { n: number; upTo?: number | "top" }, wt: "none" | "detached" = "detached", jobs: Job[] = []) {
   const store = new Stub(prs, wt);
+  const seeded = Object.fromEntries(jobs.map((j) => [`${repoKey(j.repo)}#${j.pr}`, j]));
+  (store as unknown as { set: (p: object) => void }).set({ jobs: seeded });
   setup = await testRender(
     <ThemeContext.Provider value={{ name: "dark", p: dark }}>
       <StoreContext.Provider value={store}>
@@ -162,4 +165,27 @@ test("an explicit upTo wins over the PR the sheet was opened on", async () => {
   expect(whole.text).not.toContain("stays open");
   // opened on the whole stack from elsewhere (the board), so no PR is "opened here"
   expect(whole.text).not.toContain("opened here");
+});
+
+test("reopened from a lower member, the sheet shows the running whole-stack job instead of planning again", async () => {
+  const repo = { owner: "maple", name: "maple-gtm" };
+  const job: Job = {
+    id: "j1",
+    kind: "stack-merge",
+    repo,
+    pr: 2464,
+    method: "squash",
+    force: true,
+    status: "running",
+    steps: [],
+    total: 3,
+    plan: [merge(2462), merge(2463), merge(2464)],
+    prs: [2462, 2463, 2464],
+    pid: process.pid,
+    startedAt: 1,
+    updatedAt: 1,
+  };
+  const { text } = await mount([A, B, C], { n: 2462 }, "detached", [job]);
+  expect(text).toContain("runs in background");
+  expect(text).not.toContain("merge up to here ·");
 });

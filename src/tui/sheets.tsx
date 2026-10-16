@@ -540,15 +540,15 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
     info?.ok ? info.value.stack.prs.map((p) => ({ number: p.number, title: p.title, isDraft: p.isDraft })) : preview.map((e) => ({ number: e.number, title: e.title, isDraft: e.isDraft }));
   const topNum = members[members.length - 1]?.number ?? n;
   const targetNum = target === "top" ? topNum : target;
-  // The job file is the source of truth: a running job shows even when this sheet was opened after it started.
+  // The job file is the source of truth: a running job shows even when this sheet was opened after it started, and
+  // even from a lower member than the job's target (its key is the target PR, any member of this stack).
   const job = useStore((s) => {
     const key = activeRepoKey(s);
     if (!key) return undefined;
-    for (const pr of [targetNum, n]) {
-      const j = s.jobs[`${key}#${pr}`];
-      if (j?.kind === "stack-merge" || (j?.kind === "merge-when-ready" && j.stack)) return j;
-    }
-    return undefined;
+    const found = [targetNum, n, ...members.map((m) => m.number)]
+      .map((pr) => s.jobs[`${key}#${pr}`])
+      .filter((j) => j?.kind === "stack-merge" || (j?.kind === "merge-when-ready" && j.stack));
+    return found.find((j) => j?.status === "running") ?? found[0];
   });
   // A rebase job of this stack: while it runs the sheet shows it, and when it ends the plan is made again.
   const rebaseJob = useStore((s) => {

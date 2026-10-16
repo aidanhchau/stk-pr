@@ -126,6 +126,13 @@ describe("jobs", () => {
     await expect(startJob(spec, { alive: dead, spawn: () => 1 })).resolves.toHaveProperty("id");
   });
 
+  test("a stack job is refused while a job runs on any PR of its stack", async () => {
+    await startJob({ ...spec, kind: "stack-merge", pr: 9 }, { alive, spawn: () => 1 });
+    await expect(startJob({ ...spec, kind: "stack-merge", pr: 7 }, { alive, spawn: () => 1, stackPrs: [7, 8, 9] })).rejects.toThrow("#9 is already being merged in this stack");
+    // other stacks are unaffected
+    await expect(startJob({ ...spec, kind: "stack-merge", pr: 3 }, { alive, spawn: () => 1, stackPrs: [2, 3] })).resolves.toHaveProperty("id");
+  });
+
   test("lifecycle: running -> steps/progress recorded after each update -> done", async () => {
     const { id } = await startJob(spec, { alive, spawn: () => process.pid });
     const seen: Job[] = [];
