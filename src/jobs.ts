@@ -286,7 +286,8 @@ export const serviceRunner: JobRunner = async (job, update, ctx) => {
   }
   if (job.kind === "rebase-stack") {
     const r = await rebaseStack(c, job.pr, { onStep: (message) => update({ progress: { pr: job.pr, phase: "pending", message } }) });
-    update({ prs: r.prs, ...(r.note ? { note: r.note } : {}) });
+    const note = [r.relinked, r.note].filter(Boolean).join("; ");
+    update({ prs: r.prs, ...(note ? { note } : {}) });
     return;
   }
   const info = await stackInfo(c, job.pr, { method, force, upTo: job.pr });

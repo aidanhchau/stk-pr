@@ -9,42 +9,52 @@ import { slugCtx } from "../src/service";
 
 /**
  * Fake GitHub for the real merge path: open PRs `chain` (one native stack when `native`), mergeable with green
- * checks except `blocked` (review required). merge-async answers `result` (`enqueued` = merge queue).
+ * checks except `blocked` (review required). merge-async answers `result` (`enqueued` = merge queue). It behaves like
+ * GitHub: a merge without bypass retargets the next PR onto main and rebases the rest; a bypass merge does neither, and
+ * the base of a PR in a stack cannot be changed until the stack is dissolved (unstack, then PATCH, then re-create).
  */
 function fakeMergeGithub(
   chain: number[],
   o: { native: boolean; result: "merged" | "enqueued"; blocked?: number[] },
-): { exec: Exec; puts: string[] } {
+): { exec: Exec; puts: string[]; rest: string[] } {
   const { native, result, blocked = [] } = o;
   const puts: string[] = [];
-  const head = (n: number) => (rebased ? `new${n}` : `sha${n}`);
-  const pr = (n: number) => {
-    const at = chain.indexOf(n);
-    return {
-      number: n, title: `PR ${n}`, url: `https://github.com/o/r/pull/${n}`, author: { login: "me" }, state: merged.has(n) ? "MERGED" : "OPEN", isDraft: false,
-      headRefName: `b${n}`, baseRefName: at > 0 && !rebased ? `b${chain[at - 1]}` : "main", headRefOid: head(n), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
-      reviewDecision: blocked.includes(n) ? "REVIEW_REQUIRED" : "APPROVED", statusCheckRollup: [],
-      createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z", body: "", files: [],
-    };
-  };
+  const rest: string[] = [];
+  const heads: Record<number, string> = Object.fromEntries(chain.map((n) => [n, `sha${n}`]));
+  const bases: Record<number, string> = Object.fromEntries(chain.map((n, i) => [n, i > 0 ? `b${chain[i - 1]}` : "main"]));
+  // the PRs GitHub still lists in the stack (merged ones stay until it is dissolved)
+  let members = native ? [...chain] : [];
+  const pr = (n: number) => ({
+    number: n, title: `PR ${n}`, url: `https://github.com/o/r/pull/${n}`, author: { login: "me" }, state: merged.has(n) ? "MERGED" : "OPEN", isDraft: false,
+    headRefName: `b${n}`, baseRefName: bases[n], headRefOid: heads[n], mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+    reviewDecision: blocked.includes(n) ? "REVIEW_REQUIRED" : "APPROVED", statusCheckRollup: [],
+    createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z", body: "", files: [],
+  });
   const ok = (v: unknown) => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
+  const http = (status: number, body: unknown) => ({ code: 0, stdout: `HTTP/2.0 ${status} X\r\n\r\n${body === null ? "" : JSON.stringify(body)}`, stderr: "" });
   const page = { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] };
   const merged = new Set<number>();
-  // the leased push of the restack moves the open PRs onto the trunk (GitHub leaves them on the merged branch until then)
-  let rebased = false;
   let checkedOut = "";
   const exec: Exec = async (argv, opts) => {
     const a = argv.join(" ");
     if (a.includes("merge-async")) {
       const path = argv.find((x) => x.includes("merge-async"))!;
       const n = Number(/pulls\/(\d+)\//.exec(path)![1]);
+      const bypass = !!opts?.stdin && JSON.parse(opts.stdin).bypass_rules;
+      const fail = (message: string) => ({ code: 1, stdout: `HTTP/2.0 400 Bad Request\r\n\r\n${JSON.stringify({ status: "failed", details: { message } })}`, stderr: "" });
       // GitHub: rules can only be bypassed on the bottom-most unmerged PR of a stack
-      if (opts?.stdin && JSON.parse(opts.stdin).bypass_rules && n !== chain.find((m) => !merged.has(m))) {
-        const body = { status: "failed", details: { message: "Rules can only be bypassed when merging the bottom-most unmerged pull request in the stack." } };
-        return { code: 1, stdout: `HTTP/2.0 400 Bad Request\r\n\r\n${JSON.stringify(body)}`, stderr: "" };
-      }
+      if (bypass && n !== chain.find((m) => !merged.has(m))) return fail("Rules can only be bypassed when merging the bottom-most unmerged pull request in the stack.");
+      // a child left on its merged parent's branch conflicts with the squash commit
+      if (native && bases[n] !== "main" && merged.has(chain[chain.indexOf(n) - 1]!)) return fail("Pull request cannot be merged because it has a merge conflict.");
       puts.push(path);
-      if (result === "merged") for (const m of native ? chain.filter((x) => x <= n) : [n]) merged.add(m);
+      if (result === "merged") {
+        for (const m of native ? chain.filter((x) => x <= n) : [n]) merged.add(m);
+        const open = chain.filter((m) => !merged.has(m));
+        if (native && !bypass && open.length) {
+          bases[open[0]!] = "main";
+          for (const m of open) heads[m] = `gh${m}`;
+        }
+      }
       return { code: 0, stdout: `HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ status: result, details: {} })}`, stderr: "" };
     }
     if (argv[0] === "git") {
@@ -56,22 +66,45 @@ function fakeMergeGithub(
       if (g === "worktree list --porcelain") return ok(chain.map((n) => `worktree /wt-${n}\nHEAD sha${n}\nbranch refs/heads/b${n}\n\n`).join(""));
       if (g === "rev-parse --verify --quiet refs/remotes/origin/main") return ok("trunk0\n");
       const remote = /^rev-parse --verify --quiet refs\/remotes\/origin\/b(\d+)$/.exec(g);
-      if (remote) return ok(`${head(Number(remote[1]))}\n`);
+      if (remote) return ok(`${heads[Number(remote[1])]}\n`);
       // local branches sit at the planned heads
       const local = /^rev-parse --verify --quiet refs\/heads\/b(\d+)$/.exec(g);
       if (local) return ok(`sha${local[1]}\n`);
-      if (g.startsWith("checkout --detach ")) {
-        checkedOut = g.slice("checkout --detach sha".length);
+      const co = /^checkout --detach \D*(\d+)$/.exec(g);
+      if (co) {
+        checkedOut = co[1]!;
         return ok();
       }
       if (g === "rev-parse HEAD") return ok(`new${checkedOut}\n`);
       if (g.startsWith("push --atomic")) {
-        rebased = true;
+        for (const m of chain.filter((x) => !merged.has(x))) heads[m] = `new${m}`;
         return ok();
       }
       const ls = /^ls-remote origin refs\/heads\/b(\d+)$/.exec(g);
-      if (ls) return ok(`${head(Number(ls[1]))}\trefs/heads/b${ls[1]}\n`);
+      if (ls) return ok(`${heads[Number(ls[1])]}\trefs/heads/b${ls[1]}\n`);
       return none;
+    }
+    const api = /^gh api -i (?:-X (\w+) )?repos\/o\/r\/(pulls\/\d+|stacks(?:\/\d+\/unstack)?)(?: |$)/.exec(a);
+    if (api) {
+      const method = api[1] ?? "GET";
+      const path = api[2]!;
+      const input = opts?.stdin ? (JSON.parse(opts.stdin) as { base?: string; pull_requests?: number[] }) : {};
+      const n = Number(/pulls\/(\d+)/.exec(path)?.[1]);
+      if (method === "GET") return http(200, { base: { ref: bases[n] }, mergeable_state: "clean", stack: members.includes(n) ? { number: 9 } : null });
+      if (method === "POST" && path.endsWith("/unstack")) {
+        rest.push("unstack");
+        members = members.filter((m) => merged.has(m));
+        return members.length ? http(200, {}) : http(204, null);
+      }
+      if (method === "POST") {
+        rest.push(`create ${input.pull_requests!.join(",")}`);
+        members = input.pull_requests!;
+        return http(201, { number: 10, pull_requests: members });
+      }
+      if (members.includes(n)) return http(422, { message: "Cannot change the base branch because the pull request is part of a stack." });
+      rest.push(`base ${n} ${input.base}`);
+      bases[n] = input.base!;
+      return http(200, {});
     }
     if (argv[1] === "repo") return ok({ owner: { login: "o" }, name: "r", defaultBranchRef: { name: "main" } });
     if (argv[1] === "pr" && argv[2] === "list") return ok(chain.filter((n) => !merged.has(n)).map(pr));
@@ -79,26 +112,26 @@ function fakeMergeGithub(
     const query = argv.find((x) => x.startsWith("query=")) ?? "";
     if (query.includes("stackEntry")) {
       const n = Number(argv[argv.indexOf("-F") + 1]!.slice(2));
-      if (!native || !chain.includes(n)) return ok({ data: { repository: { pullRequest: { stackEntry: null, stack: null } } } });
+      if (!members.includes(n)) return ok({ data: { repository: { pullRequest: { stackEntry: null, stack: null } } } });
       const full = query.includes("headRefOid");
-      const nodes = chain.map((m, i) => ({
+      const nodes = members.map((m, i) => ({
         position: i + 1,
         pullRequest: full
           ? { ...pr(m), statusCheckRollup: null, reviewThreads: { nodes: [] } }
           : { number: m, title: `PR ${m}`, state: merged.has(m) ? "MERGED" : "OPEN", isDraft: false, statusCheckRollup: null },
       }));
-      const repository = { defaultBranchRef: { name: "main" }, pullRequest: { stackEntry: { position: chain.indexOf(n) + 1 }, stack: { size: nodes.length, entries: { nodes } } } };
+      const repository = { defaultBranchRef: { name: "main" }, pullRequest: { stackEntry: { position: members.indexOf(n) + 1 }, stack: { size: nodes.length, entries: { nodes } } } };
       return ok({ data: { repository } });
     }
     if (/pr\d+: pullRequest/.test(query)) {
       const repo: Record<string, unknown> = {};
-      for (const m of query.matchAll(/pr(\d+): pullRequest/g)) repo[`pr${m[1]}`] = { reviewThreads: { nodes: [] } };
+      for (const m of query.matchAll(/pr(\d+): pullRequest/g)) repo[`pr${m[1]}`] = query.includes("headRefOid") ? { ...pr(Number(m[1])), statusCheckRollup: null, reviewThreads: { nodes: [] } } : { reviewThreads: { nodes: [] } };
       return ok({ data: { repository: repo } });
     }
     if (query) return ok({ data: { repository: { pullRequest: { reviewThreads: page, reviews: page, comments: page } } } });
     return { code: 1, stdout: "", stderr: `unexpected: ${a}` };
   };
-  return { exec, puts };
+  return { exec, puts, rest };
 }
 
 const repo = { owner: "o", name: "r" };
@@ -269,12 +302,14 @@ describe("jobs", () => {
   });
 
   test("a forced native stack merges a bypassed PR alone once everything below it has landed", async () => {
-    const { exec, puts } = fakeMergeGithub([5, 6, 7], { native: true, result: "merged", blocked: [6] });
+    const { exec, puts, rest } = fakeMergeGithub([5, 6, 7], { native: true, result: "merged", blocked: [6] });
     const j = await runService({ ...stackSpec, force: true }, exec, true);
     expect(puts).toEqual(["repos/o/r/pulls/5/merge-async", "repos/o/r/pulls/6/merge-async", "repos/o/r/pulls/7/merge-async"]);
-    // the job's plan grew the rebase that GitHub needs between the merges
+    // #5 lands without bypass (GitHub restacks #6/#7 itself, stk only waits); only the bypass merge of #6 is followed by
+    // the rebase and re-link of the one PR left, which is then in no stack and merges as a plain PR
+    expect(rest).toEqual(["unstack", "base 7 main"]);
     expect(j).toMatchObject({ status: "done", outcome: "merged", merged: [5, 6, 7], total: 4 });
-    expect(j.plan!.map((s) => s.kind)).toEqual(["merge", "rebase-stack", "merge", "merge"]);
+    expect(j.plan!.map((s) => s.kind)).toEqual(["merge", "merge", "rebase-stack", "merge"]);
   });
 
   test("GitHub's JSON error body is read: no raw JSON, no HTTP code", async () => {

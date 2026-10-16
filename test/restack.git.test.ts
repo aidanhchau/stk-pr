@@ -117,6 +117,8 @@ function ctxWith(heads: Heads, opts: { open?: number[]; wrap?: (argv: string[]) 
     }
     const a = argv.join(" ");
     if (a.startsWith("gh repo view")) return { code: 0, stdout: JSON.stringify({ owner: { login: "o" }, name: "r" }), stderr: "" };
+    // the re-link after the rebase (pull state, unstack, retarget, re-create): all succeed
+    if (argv[1] === "api" && argv[2] === "-i") return { code: 0, stdout: `HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ number: 1, base: { ref: "main" }, mergeable_state: "clean", stack: { number: 1 } })}`, stderr: "" };
     if (argv.some((x) => x.startsWith("query="))) {
       const nodes = numbers.map((n, i) => ({ position: i + 1, pullRequest: member(n) }));
       const repository = { defaultBranchRef: { name: "main" }, pullRequest: { stackEntry: { position: 1 }, stack: { size: numbers.length, entries: { nodes } } } };
