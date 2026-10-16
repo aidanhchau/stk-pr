@@ -8,7 +8,7 @@
  * Only https is ever fetched. Credentials are used only for github.com and the GitHub host of the PR on screen (`setPrHost`); a lookalike
  * such as github.attacker.example is just another anonymous URL. SVGs are rasterised in a worker (svg-worker.ts); PNG/JPEG/WebP/GIF pass through.
  */
-import { imageInfo } from "@opentui/core";
+import { imageInfo, NativeImage } from "@opentui/core";
 import { exec, execBytes } from "./exec";
 import { Failure, guardedGet, MAX_BYTES, statusReason, TIMEOUT_MS } from "./image-net";
 import type { SvgReply, SvgRequest } from "./svg-worker";
@@ -111,6 +111,8 @@ export interface Decoded {
   /** Logical size in pixels: the SVG's own size, or the raster's. Never upscale past it. */
   width: number;
   height: number;
+  /** The SVG source, for re-rasterising at the size it is drawn at (`data` is a size-independent fallback). */
+  svg?: string;
 }
 
 const looksSvg = (b: Uint8Array): boolean => /<svg[\s>]/i.test(new TextDecoder().decode(b.subarray(0, 4096)));
@@ -143,18 +145,22 @@ function svgWorker(): Worker {
   return w;
 }
 
-function rasterize(svg: string): Promise<Decoded> {
+/** `targetWidth`: raster exactly that wide (bounded); omitted, a size-independent 1.2k-2.4k px wide fallback. */
+function rasterize(svg: string, targetWidth?: number): Promise<Decoded> {
   const { promise, resolve, reject } = Promise.withResolvers<Decoded>();
   const id = nextId++;
   // one stuck render would block the worker's queue: past the deadline, kill the worker and fail everything waiting on it
   const timer = setTimeout(() => resetWorker("timeout"), SVG_DEADLINE_MS);
   pending.set(id, { ok: resolve, fail: reject });
-  svgWorker().postMessage({ id, svg } satisfies SvgRequest);
+  svgWorker().postMessage({ id, svg, targetWidth } satisfies SvgRequest);
   return promise.finally(() => clearTimeout(timer));
 }
 
 async function decodeBytes(bytes: Uint8Array): Promise<Decoded> {
-  if (looksSvg(bytes)) return rasterize(new TextDecoder().decode(bytes));
+  if (looksSvg(bytes)) {
+    const svg = new TextDecoder().decode(bytes);
+    return { ...(await rasterize(svg)), svg };
+  }
   try {
     const info = imageInfo(bytes);
     return { data: bytes, width: info.width, height: info.height };
@@ -172,19 +178,28 @@ export interface ImageStore {
   peek(src: string): ImageState | undefined;
   /** Like `peek`, but starts the load the first time. */
   request(src: string): ImageState;
+  /** `src` rendered at exactly `w`x`h` px (SVGs re-rasterised, big rasters downscaled once), or undefined while that is being made or when the base image already fits; starts the work the first time and notifies subscribers when done. */
+  variant(src: string, w: number, h: number): NativeImage | undefined;
   subscribe(fn: () => void): () => void;
   version(): number;
 }
+
+const PENDING = Symbol("pending");
 
 /**
  * Bounded cache. Entries are kept by recency of use, so what the page is showing is what stays. A URL that was evicted and is asked
  * for again is re-fetched, but at most `maxFetches` times a session: past that it stays an error, so a page showing more images than the
  * cache holds cannot loop downloading.
  */
-export function createImageStore(load: (src: string) => Promise<ImageState>, o: { maxEntries?: number; concurrency?: number; maxFetches?: number } = {}): ImageStore {
-  const { maxEntries = 64, concurrency = 3, maxFetches = 3 } = o;
+export function createImageStore(
+  load: (src: string) => Promise<ImageState>,
+  o: { maxEntries?: number; concurrency?: number; maxFetches?: number; maxVariants?: number; makeVariant?: (d: Decoded, w: number, h: number) => Promise<NativeImage | null> } = {},
+): ImageStore {
+  const { maxEntries = 64, concurrency = 3, maxFetches = 3, maxVariants = 24, makeVariant } = o;
   const states = new Map<string, ImageState>();
   const fetches = new Map<string, number>();
+  /** Pixel-exact renderings by `src` and size; null: none needed (the base image is already right) or it failed. */
+  const variants = new Map<string, NativeImage | null | typeof PENDING>();
   const listeners = new Set<() => void>();
   const queue: (() => void)[] = [];
   let running = 0;
@@ -205,6 +220,13 @@ export function createImageStore(load: (src: string) => Promise<ImageState>, o: 
       running++;
       queue.shift()!();
     }
+  };
+
+  const settle = (key: string, img: NativeImage | null) => {
+    if (variants.get(key) !== PENDING) return void img?.dispose();
+    variants.set(key, img);
+    version++;
+    for (const l of listeners) l();
   };
 
   return {
@@ -244,6 +266,30 @@ export function createImageStore(load: (src: string) => Promise<ImageState>, o: 
       pump();
       return loading;
     },
+    variant(src, w, h) {
+      const st = states.get(src);
+      if (st?.status !== "ready" || !makeVariant) return undefined;
+      const key = `${src}\0${w}x${h}`;
+      const hit = variants.get(key);
+      if (hit !== undefined) {
+        variants.delete(key);
+        variants.set(key, hit);
+        return hit === PENDING ? undefined : (hit ?? undefined);
+      }
+      variants.set(key, PENDING);
+      for (const [k, v] of variants) {
+        if (variants.size <= maxVariants) break;
+        if (v !== PENDING) {
+          variants.delete(k);
+          v?.dispose();
+        }
+      }
+      makeVariant(st, w, h).then(
+        (img) => settle(key, img),
+        () => settle(key, null),
+      );
+      return undefined;
+    },
     subscribe(fn) {
       listeners.add(fn);
       return () => void listeners.delete(fn);
@@ -265,8 +311,21 @@ async function loadReal(src: string): Promise<ImageState> {
   }
 }
 
-const store = createImageStore(loadReal);
+/** Cell-box sized pixels of `d`: SVGs are rasterised at exactly that width, rasters downscaled once (never upscaled). null: the base image is already right. */
+async function makeVariant(d: Decoded, w: number, h: number): Promise<NativeImage | null> {
+  if (d.svg !== undefined) return NativeImage.decode((await rasterize(d.svg, w)).data);
+  if (w >= d.width && h >= d.height) return null;
+  const full = NativeImage.decode(d.data);
+  try {
+    return full.resize({ width: Math.min(w, d.width), height: Math.min(h, d.height), kernel: "catmull-rom" });
+  } finally {
+    full.dispose();
+  }
+}
+
+const store = createImageStore(loadReal, { makeVariant });
 export const imageState = store.peek;
 export const requestImage = store.request;
+export const imageVariant = store.variant;
 export const subscribeImages = store.subscribe;
 export const imagesVersion = store.version;

@@ -6,6 +6,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { App } from "./app";
+import { installImageDensity } from "./image-density";
 import { Store, StoreContext } from "./store";
 import { envTheme, palettes } from "./theme";
 
@@ -41,6 +42,7 @@ export async function runTui(opts: TuiOptions): Promise<number> {
   // xterm title stack: save the current title now, restore it on exit (OSC 2 is set by App once the repo is known).
   process.stdout.write("\x1b[22;0t");
   quietWarnings();
+  installImageDensity();
   const renderer = await createCliRenderer({
     exitOnCtrlC: true,
     backgroundColor: palettes[envTheme()].ground,

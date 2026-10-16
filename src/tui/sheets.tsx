@@ -10,6 +10,7 @@ import { waitLabel } from "../waiting";
 import { planItems, prStatus, stackSummary, withExpectedRebases, worktreeNote, type PrStateKind, type PrStatus } from "../stackview";
 import { mergedPrs, stepStatuses } from "../jobview";
 import { ConfirmSheet, OutputSheet } from "./confirm";
+import { ImageSheet } from "./image-sheet";
 import { PaletteSheet } from "./palette";
 import { activeRepoKey, mergeMethodOf, useStore, useStoreInstance, type Outcome, type Sheet as SheetState } from "./store";
 import { G, reducedMotion, useTermSize, useTheme, type GlyphName } from "./theme";
@@ -39,6 +40,8 @@ export function Sheets({ sheet }: { sheet: Active }) {
       return <OutputSheet sheet={sheet} />;
     case "create-pr":
       return <CreatePrSheet plan={sheet.plan} repo={sheet.repo} />;
+    case "image":
+      return <ImageSheet sheet={sheet} />;
   }
 }
 

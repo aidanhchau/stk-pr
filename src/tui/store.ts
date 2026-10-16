@@ -124,7 +124,8 @@ export type Sheet =
   | { kind: "palette"; /** initial command-line text */ query?: string }
   | { kind: "output"; title: string; command: string; output: string; code: number }
   | { kind: "create-pr"; plan: CreatePrPlan; repo?: RepoSlug }
-  | { kind: "confirm"; title: string; body: string; label: string; onConfirm: () => void };
+  | { kind: "confirm"; title: string; body: string; label: string; onConfirm: () => void }
+  | { kind: "image"; src: string; alt: string };
 
 export interface Toast {
   id: number;

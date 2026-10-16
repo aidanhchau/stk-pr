@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createImageStore, isTrustedHost, resolveSource, type ImageState } from "../src/images";
+import type { NativeImage } from "@opentui/core";
 
 const SHA = "ebb07850d77813b35601e9f26f634903c7629d59";
 
@@ -107,5 +108,58 @@ describe("image store", () => {
     await Bun.sleep(5);
     expect(store.peek("a")).toBeDefined();
     expect(store.peek("b")).toBeUndefined();
+  });
+});
+
+describe("image variants", () => {
+  const ready: ImageState = { status: "ready", data: new Uint8Array(1), width: 1000, height: 380 };
+  const fake = () => {
+    const img = { disposed: false, dispose() { this.disposed = true; } };
+    return img as unknown as NativeImage & { disposed: boolean };
+  };
+
+  test("made once per size, undefined until done, then handed out and announced", async () => {
+    const made: string[] = [];
+    const img = fake();
+    const store = createImageStore(async () => ready, { makeVariant: async (_d, w, h) => (made.push(`${w}x${h}`), img) });
+    let notified = 0;
+    store.subscribe(() => notified++);
+    store.request("a");
+    await Bun.sleep(5);
+    const before = notified;
+    expect(store.variant("a", 1600, 608)).toBeUndefined();
+    expect(store.variant("a", 1600, 608)).toBeUndefined();
+    await Bun.sleep(5);
+    expect(made).toEqual(["1600x608"]);
+    expect(notified).toBe(before + 1);
+    expect(store.variant("a", 1600, 608)).toBe(img);
+    expect(store.variant("a", 800, 304)).toBeUndefined();
+    await Bun.sleep(5);
+    expect(made).toEqual(["1600x608", "800x304"]);
+  });
+
+  test("no variant before the image is loaded, or when none is needed", async () => {
+    const store = createImageStore(async () => ready, { makeVariant: async () => null });
+    expect(store.variant("a", 10, 10)).toBeUndefined();
+    store.request("a");
+    await Bun.sleep(5);
+    expect(store.variant("a", 10, 10)).toBeUndefined();
+    await Bun.sleep(5);
+    expect(store.variant("a", 10, 10)).toBeUndefined();
+  });
+
+  test("bounded: the least recently used variant is disposed", async () => {
+    const made: ReturnType<typeof fake>[] = [];
+    const store = createImageStore(async () => ready, { maxVariants: 2, makeVariant: async () => (made.push(fake()), made.at(-1)!) });
+    store.request("a");
+    await Bun.sleep(5);
+    for (const w of [10, 20]) {
+      store.variant("a", w, 5);
+      await Bun.sleep(5);
+    }
+    store.variant("a", 10, 5);
+    store.variant("a", 30, 5);
+    await Bun.sleep(5);
+    expect(made.map((m) => m.disposed)).toEqual([false, true, false]);
   });
 });
