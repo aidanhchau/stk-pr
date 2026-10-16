@@ -6,7 +6,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { App } from "./app";
-import { installImageDensity } from "./image-density";
+import { installImageDensity, watchImageCapabilities } from "./image-density";
 import { Store, StoreContext } from "./store";
 import { envTheme, palettes } from "./theme";
 
@@ -48,6 +48,7 @@ export async function runTui(opts: TuiOptions): Promise<number> {
     backgroundColor: palettes[envTheme()].ground,
   });
   renderer.setMaxListeners(100);
+  watchImageCapabilities(renderer);
   (renderer.keyInput as unknown as EventEmitter).setMaxListeners?.(100);
   const store = new Store(opts.repoDir, { pr: opts.pr, gh: opts.gh, sessionPane: opts.sessionPane });
   // Terminal focus reports: an unfocused pane stops polling GitHub (see Store.poll).

@@ -14,8 +14,9 @@ import type { PrDetail } from "../service";
 import { isWaitable } from "../watch";
 import { nativeUpTo, type Blocker, type CheckState, type ConversationEntry, type MergeMethod } from "../types";
 import { activityId, activityLayout, activityMeta, bodyRows, defaultLevel, foldBots, groupActivity, lowSignalTag, rowsHeight, type ActivityItem, type BotFold, type Level, type RL } from "./activity";
-import { imagesVersion, imageState, imageVariant, requestImage, setPrHost, subscribeImages } from "../images";
-import { imageTarget, useImageCell } from "./image-density";
+import { imagesVersion, imageState, requestImage, setPrHost, subscribeImages } from "../images";
+import { useImageCell } from "./image-density";
+import { useImageSource } from "./use-image";
 import { layoutBlocks, parseComment, preview, threadFix, type ImageEnv, type Span } from "./markdown";
 import { jobDockText, type Job } from "../jobs";
 import { diffKey, mergeMethodOf, runningJobOf, useStore, useStoreInstance, type Store } from "./store";
@@ -597,11 +598,7 @@ interface Reply {
 function ImageRow({ r, rail }: { r: Extract<RL, { t: "image" }>; rail?: string }) {
   const store = useStoreInstance();
   const covered = useStore((s) => s.sheet !== null);
-  useImageCell();
-  useSyncExternalStore(subscribeImages, imagesVersion);
-  const img = imageState(r.src);
-  const target = imageTarget(r.cols, r.rows);
-  const variant = target ? imageVariant(r.src, target.w, target.h) : undefined;
+  const img = useImageSource(r.src, r.cols, r.rows, !covered);
   const open = (e: TuiMouseEvent) => {
     e.stopPropagation();
     store.openSheet({ kind: "image", src: r.src, alt: r.alt });
@@ -613,8 +610,8 @@ function ImageRow({ r, rail }: { r: Extract<RL, { t: "image" }>; rail?: string }
           {Array.from({ length: r.rows }, () => "│ ").join("\n")}
         </text>
       )}
-      {img?.status === "ready" && !covered && (
-        <image source={variant ?? img.data} fit="fill" protocol="auto" width={r.cols} height={r.rows} marginLeft={r.indent} flexShrink={0} onMouseDown={open} onMouseUp={(e) => e.stopPropagation()} />
+      {img && !covered && (
+        <image source={img.source} fit="fill" protocol="auto" width={r.cols} height={r.rows} marginLeft={r.indent} flexShrink={0} onMouseDown={open} onMouseUp={(e) => e.stopPropagation()} />
       )}
     </box>
   );
@@ -648,6 +645,7 @@ function RowsView({
   const p = useTheme();
   const bodySel = selected && !headOnly;
   const rail = accent ? lerpHex(accent, p.ground, 0.4) : p.faint;
+  const covered = useStore((s) => s.sheet !== null);
   const headClick = useClick(selected, onSelect, onOpen, { stop: true });
   return (
     <Sel selected={bodySel} current={selected} h={rowsHeight(rows)} onSelect={onSelect} onOpen={onOpen} body>
@@ -697,7 +695,7 @@ function RowsView({
             return (
               <box key={i} height={1} flexShrink={0} paddingLeft={2} onMouseDown={(e) => e.stopPropagation()} onMouseUp={(e) => e.stopPropagation()}>
                 <input
-                  focused
+                  focused={!covered}
                   value={reply?.value ?? ""}
                   placeholder={`Reply${G.ellipsis}  ⌘⏎ send ${G.sep} esc cancel`}
                   onInput={onInput}
@@ -1000,6 +998,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   );
   useKeyboard((k) => {
     const s = store.getState();
+    if (s.sheet) return; // a sheet owns the keys; an open reply keeps its draft
     const { reply: r, openFile: f } = live.current;
     if (k.name === "escape" && r) {
       k.stopPropagation();
