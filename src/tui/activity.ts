@@ -10,7 +10,7 @@
  */
 import type { ReviewThread } from "../github";
 import type { ConversationEntry } from "../types";
-import { clipSpans, findingsSpan, imageStart, isNoise, layoutBlocks, lineUnits, parseComment, preview, shortAuthor, shortPath, suggestionTarget, threadFix, threadTrail, withoutTitle, type ImageEnv, type Span } from "./markdown";
+import { clipSpans, findingsSpan, isNoise, layoutRows, parseComment, preview, shortAuthor, shortPath, suggestionTarget, threadFix, threadTrail, withoutTitle, type ImageEnv, type Span } from "./markdown";
 
 // ---------- levels + rows ----------
 
@@ -202,18 +202,17 @@ export function activityMeta(c: ActivityCounts & { lowHidden?: boolean; botsHidd
 
 // ---------- rows ----------
 
-/** Body lines at `level`; level 1 caps at BODY_CAP with a trailing "… N more lines". A drawn image counts as one line however tall it is. */
+/** Body lines at `level`; level 1 caps at BODY_CAP with a trailing "… N more lines". A drawn image counts as one line however tall it is; only images that survive the cap are requested. */
 export function bodyRows(body: string, level: Level, w: number, cap = BODY_CAP, removed?: string[], dropTitle = false, images?: ImageEnv): RL[] {
   const blocks = parseComment(body).blocks;
-  const units = lineUnits(layoutBlocks(dropTitle ? withoutTitle(blocks) : blocks, w, { details: level === 2, removed, images }));
-  const shown = level === 2 ? units : units.slice(0, cap);
-  const rows: RL[] = shown.flatMap((unit): RL[] => {
-    const img = imageStart(unit[0]!);
-    if (img) return [{ t: "image", ...img.image, indent: img.indent }];
-    const spans = unit[0]!;
-    return [spans.length ? { t: "text", spans } : { t: "gap" }];
+  const all = layoutRows(dropTitle ? withoutTitle(blocks) : blocks, w, { details: level === 2, removed, images });
+  const shown = level === 2 ? all : all.slice(0, cap);
+  const rows: RL[] = shown.map((r): RL => {
+    if (r.t === "image") return { t: "image", src: r.src, cols: r.cols, rows: r.rows, indent: r.indent };
+    if (r.image) images?.request(r.image);
+    return r.spans.length ? { t: "text", spans: r.spans } : { t: "gap" };
   });
-  if (shown.length < units.length) rows.push({ t: "text", spans: [{ text: `${ELLIPSIS} ${units.length - shown.length} more lines`, style: "muted" }] });
+  if (shown.length < all.length) rows.push({ t: "text", spans: [{ text: `${ELLIPSIS} ${all.length - shown.length} more lines`, style: "muted" }] });
   return rows;
 }
 

@@ -10,12 +10,10 @@
  */
 
 /** `author` / `rail`: a human's name and conversation rail, coloured per person by the view. */
-export type SpanStyle = "plain" | "bold" | "subhead" | "code" | "pill" | "muted" | "add" | "del" | "warn" | "link" | "author" | "rail" | "image";
+export type SpanStyle = "plain" | "bold" | "subhead" | "code" | "pill" | "muted" | "add" | "del" | "warn" | "link" | "author" | "rail";
 export interface Span {
   text: string;
   style: SpanStyle;
-  /** `style: "image"` only: the first row of a drawn image (`rows` tall, `cols` wide). Its following rows hold fill spans without this field. */
-  image?: { src: string; cols: number; rows: number };
 }
 
 export type Block =
@@ -518,7 +516,10 @@ export interface LayoutOpts {
 
 /** What the layout needs to know about an image to reserve rows for it; structurally the `ImageState` of `../images`. */
 export interface ImageEnv {
+  /** What is known of an image; measuring a layout must never start a download. */
   lookup(src: string): { status: "loading" } | { status: "error"; reason: string } | { status: "ready"; width: number; height: number };
+  /** Starts loading an image the view is about to show (idempotent). Layout itself never calls this. */
+  request(src: string): void;
   /** Terminal cell size in pixels. */
   cell: { w: number; h: number };
 }
@@ -534,23 +535,18 @@ export function fitImage(width: number, height: number, maxCols: number, cell: {
   return { cols, rows: Math.min(maxRows, heightFor(cols)) };
 }
 
-/** The drawn image a layout row starts, with the columns of indent before it; null for any other row. */
-export function imageStart(row: Span[]): { image: NonNullable<Span["image"]>; indent: number } | null {
-  const at = row.findIndex((s) => s.image);
-  return at < 0 ? null : { image: row[at]!.image!, indent: row.slice(0, at).reduce((n, s) => n + width(s.text), 0) };
-}
+/**
+ * A laid-out row: a line of styled spans, or a drawn image `rows` cells tall. `image` on a text row names the image it stands in for
+ * (loading / failed): the view starts that download only if the row is actually shown.
+ */
+export type Row = { t: "text"; spans: Span[]; image?: string } | { t: "image"; src: string; alt: string; cols: number; rows: number; indent: number };
 
-/** Rows below an image's first row that the image covers. */
-export const isImageFill = (row: Span[]): boolean => row.some((s) => s.style === "image" && !s.image);
+const textRows = (rows: Span[][]): Row[] => rows.map((spans) => ({ t: "text", spans }));
+const isBlank = (r: Row): boolean => r.t === "text" && !r.spans.length;
 
-/** Layout rows grouped into display lines: a drawn image and its fill rows count as one line (for caps and `N lines`). */
-export function lineUnits(rows: Span[][]): Span[][][] {
-  const out: Span[][][] = [];
-  for (const r of rows) {
-    if (isImageFill(r) && out.length) out[out.length - 1]!.push(r);
-    else out.push([r]);
-  }
-  return out;
+/** `layoutRows` as plain text lines (search text, previews, tests): a drawn image is its `▣ alt` line. */
+export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span[][] {
+  return layoutRows(blocks, w, opts).map((r) => (r.t === "text" ? r.spans : [{ text: `▣ ${r.alt}`, style: "muted" as const }]));
 }
 
 function codeLines(text: string, w: number, diff = false): Span[][] {
@@ -563,11 +559,13 @@ function codeLines(text: string, w: number, diff = false): Span[][] {
   return out;
 }
 
-export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span[][] {
-  const out: Span[][] = [];
+export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] {
+  const out: Row[] = [];
   const blank = () => {
-    if (out.length && out[out.length - 1]!.length) out.push([]);
+    if (out.length && !isBlank(out[out.length - 1]!)) out.push({ t: "text", spans: [] });
   };
+  /** Appends text lines. */
+  const emit = (rows: Span[][]) => out.push(...textRows(rows));
   w = Math.max(8, w);
   const pw = Math.max(8, Math.min(w, opts.measure ?? PROSE_MEASURE));
   /** "list" | "para" | "head" for the previous prose block; drives the blank lines between kinds. */
@@ -588,19 +586,19 @@ export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span
         const pad = " ".repeat(b.indent);
         const first: Span[] = [...(pad ? [{ text: pad, style: "plain" as const }] : []), ...(b.bullet ? [{ text: `${b.bullet} `, style: "muted" as const }] : [])];
         const hang = b.bullet ? `${pad}${" ".repeat(width(b.bullet) + 1)}` : pad;
-        out.push(...wrapSpans(b.spans, pw, first, hang));
+        emit(wrapSpans(b.spans, pw, first, hang));
         if (b.heading && (b.level ?? 1) <= 2) afterTopHead = true;
         break;
       }
       case "code":
-        out.push(...codeLines(b.text.replace(/^/, "  "), w, b.diff));
+        emit(codeLines(b.text.replace(/^/, "  "), w, b.diff));
         break;
       case "suggestion": {
-        out.push([{ text: "suggested change", style: "muted" }]);
-        const rows = (sign: string, lines: string[], style: "del" | "add") => {
-          for (const l of lines) {
+        emit([[{ text: "suggested change", style: "muted" }]]);
+        const rows = (sign: string, items: string[], style: "del" | "add") => {
+          for (const l of items) {
             const room = Math.max(1, w - 2);
-            for (let at = 0, first = true; first || at < l.length; at += room, first = false) out.push([{ text: `${first ? sign : " "} ${l.slice(at, at + room)}`, style }]);
+            for (let at = 0, first = true; first || at < l.length; at += room, first = false) emit([[{ text: `${first ? sign : " "} ${l.slice(at, at + room)}`, style }]]);
           }
         };
         rows("-", opts.removed ?? [], "del");
@@ -616,27 +614,25 @@ export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span
           for (const r of b.rows.slice(b.rows.length > 1 ? 1 : 0)) {
             const spans: Span[] = [{ text: r[0] ?? "", style: "bold" }];
             if (r.length > 1) spans.push({ text: ` ${r.slice(1).join(" · ")}`, style: "plain" });
-            out.push(...wrapSpans(spans, w, "", "  "));
+            emit(wrapSpans(spans, w, "", "  "));
           }
           break;
         }
         b.rows.forEach((r, ri) => {
           const text = r.map((c, ci) => c + " ".repeat(ws[ci]! - width(c))).join("  ").trimEnd();
-          out.push([{ text, style: ri === 0 && b.rows.length > 1 ? "bold" : "plain" }]);
+          emit([[{ text, style: ri === 0 && b.rows.length > 1 ? "bold" : "plain" }]]);
         });
         break;
       }
       case "image": {
         blank();
-        const label = b.alt || "image";
+        const alt = b.alt || "image";
         const meta = opts.images?.lookup(b.src);
         if (opts.images && meta?.status === "ready") {
-          const { cols, rows } = fitImage(meta.width, meta.height, w, opts.images.cell);
-          out.push([{ text: label, style: "image", image: { src: b.src, cols, rows } }]);
-          for (let r = 1; r < rows; r++) out.push([{ text: "", style: "image" }]);
+          out.push({ t: "image", src: b.src, alt, indent: 0, ...fitImage(meta.width, meta.height, w, opts.images.cell) });
         } else {
-          const note = meta?.status === "loading" ? " · loading image" : meta?.status === "error" ? ` · ${meta.reason}` : "";
-          out.push(...wrapSpans([{ text: `▣ ${label}${note}`, style: "muted" }], w));
+          const note = !opts.images ? "" : meta?.status === "error" ? ` · ${meta.reason}` : " · loading image";
+          out.push(...wrapSpans([{ text: `▣ ${alt}${note}`, style: "muted" }], w).map((spans): Row => ({ t: "text", spans, image: opts.images ? b.src : undefined })));
         }
         blank();
         break;
@@ -644,16 +640,18 @@ export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span
       case "details": {
         const preview = /^Preview\b/i.test(plain(b.summary)) && b.body.some((x) => x.t === "code" && x.diff);
         if (!opts.details || (preview && !opts.previews)) {
-          out.push(...wrapSpans([{ text: `▸ ${plain(b.summary)}`, style: "muted" }], w));
+          emit(wrapSpans([{ text: `▸ ${plain(b.summary)}`, style: "muted" }], w));
         } else {
-          out.push(...wrapSpans([{ text: `▾ ${plain(b.summary)}`, style: "muted" }], w));
-          for (const l of layoutBlocks(b.body, w - 2, opts)) out.push(l.length ? [{ text: "  ", style: "plain" }, ...l] : l);
+          emit(wrapSpans([{ text: `▾ ${plain(b.summary)}`, style: "muted" }], w));
+          for (const r of layoutRows(b.body, w - 2, opts)) {
+            out.push(r.t === "image" ? { ...r, indent: r.indent + 2 } : r.spans.length ? { ...r, spans: [{ text: "  ", style: "plain" }, ...r.spans] } : r);
+          }
         }
         break;
       }
     }
   }
-  while (out.length && !out[out.length - 1]!.length) out.pop();
+  while (out.length && isBlank(out[out.length - 1]!)) out.pop();
   return out;
 }
 

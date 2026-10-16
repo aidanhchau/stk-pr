@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { bodyRows, rowsHeight } from "../src/tui/activity";
-import { fitImage, imageStart, layoutBlocks, lineUnits, parseComment, plain, preview, type ImageEnv } from "../src/tui/markdown";
+import { fitImage, layoutBlocks, layoutRows, parseComment, plain, preview, type ImageEnv } from "../src/tui/markdown";
 
 const SVG = "https://github.com/o/r/blob/abc1234/change.svg?raw=true";
 const images = (c: string) => parseComment(c).blocks.filter((b) => b.t === "image");
@@ -62,43 +62,51 @@ describe("fitImage", () => {
 });
 
 describe("image rows", () => {
+  const requested: string[] = [];
   const env = (status: "ready" | "loading" | "error"): ImageEnv => ({
     cell: { w: 10, h: 20 },
+    request: (src) => void requested.push(src),
     lookup: () => (status === "ready" ? { status, width: 1000, height: 380 } : status === "error" ? { status, reason: "404" } : { status }),
   });
-  const laid = (e: ImageEnv, details = true) => layoutBlocks(parseComment(`intro\n\n![change](${SVG})\n\noutro`).blocks, 80, { details, images: e });
+  const rows = (e: ImageEnv, details = true, body = `intro\n\n![change](${SVG})\n\noutro`) => layoutRows(parseComment(body).blocks, 80, { details, images: e });
 
-  test("a ready image reserves rows: one start row plus fill rows, then text", () => {
-    const rows = laid(env("ready"));
-    const start = rows.findIndex((r) => imageStart(r));
-    expect(imageStart(rows[start]!)).toEqual({ image: { src: SVG, cols: 80, rows: 15 }, indent: 0 });
-    expect(rows.slice(start, start + 15).every((r) => r.length === 1)).toBe(true);
-    expect(plain(rows[start + 15]!)).toBe("");
-    expect(plain(rows[start + 16]!)).toBe("outro");
-    expect(lineUnits(rows).map((u) => u.length)).toEqual([1, 1, 15, 1, 1]);
+  test("a ready image is one row carrying its height, between blank lines", () => {
+    const r = rows(env("ready"));
+    expect(r.map((x) => (x.t === "image" ? `image ${x.cols}x${x.rows}` : plain(x.spans)))).toEqual(["intro", "", "image 80x15", "", "outro"]);
   });
 
-  test("loading and failed images are one muted line", () => {
-    expect(laid(env("loading")).map(plain)).toContain("▣ change · loading image");
-    const failed = laid(env("error"));
-    expect(failed.map(plain)).toContain("▣ change · 404");
-    expect(failed.every((r) => !imageStart(r))).toBe(true);
+  test("loading and failed images are one muted line that names the image to request", () => {
+    expect(rows(env("loading"))[2]).toEqual({ t: "text", spans: [{ text: "▣ change · loading image", style: "muted" }], image: SVG });
+    expect(rows(env("error"))[2]).toMatchObject({ t: "text", image: SVG });
+    expect(layoutBlocks(parseComment(`![change](${SVG})`).blocks, 80, { details: true, images: env("error") }).map(plain)).toEqual(["▣ change · 404"]);
   });
 
-  test("inside open <details> the image is indented and keeps its indent", () => {
-    const rows = layoutBlocks(parseComment(`<details><summary>s</summary>\n\n![c](${SVG})\n\n</details>`).blocks, 80, { details: true, images: env("ready") });
-    expect(imageStart(rows.find((r) => imageStart(r))!)).toMatchObject({ indent: 2, image: { cols: 78 } });
-    expect(layoutBlocks(parseComment(`<details><summary>s</summary>\n\n![c](${SVG})\n\n</details>`).blocks, 80, { details: false, images: env("ready") }).map(plain)).toEqual(["▸ s"]);
+  test("layout alone never requests anything", () => {
+    requested.length = 0;
+    rows(env("loading"));
+    expect(requested).toEqual([]);
   });
 
-  test("height accounting: bodyRows counts an image as one line for the cap, rowsHeight as all its rows", () => {
+  test("inside open <details> the image is indented; closed details hide it", () => {
+    const body = `<details><summary>s</summary>\n\n![c](${SVG})\n\n</details>`;
+    expect(rows(env("ready"), true, body).find((x) => x.t === "image")).toMatchObject({ indent: 2, cols: 78 });
+    expect(rows(env("ready"), false, body).map((x) => x.t === "text" && plain(x.spans))).toEqual(["▸ s"]);
+  });
+
+  test("bodyRows: an image is one line for the cap, rowsHeight counts its rows, and only shown images are requested", () => {
     const body = `![change](${SVG})\n\n${Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n\n")}`;
-    const rows = bodyRows(body, 1, 80, 4, undefined, false, env("ready"));
-    // image + 3 text lines + their gaps stay within 4 units; the rest is summarised
-    expect(rows[0]).toMatchObject({ t: "image", rows: 15, cols: 80, indent: 0 });
-    const last = rows.at(-1);
+    const out = bodyRows(body, 1, 80, 4, undefined, false, env("ready"));
+    expect(out[0]).toMatchObject({ t: "image", rows: 15, cols: 80, indent: 0 });
+    const last = out.at(-1);
     expect(last?.t === "text" && plain(last.spans)).toMatch(/more lines$/);
-    expect(rowsHeight(rows)).toBe(rows.length - 1 + 15);
-    expect(rowsHeight(bodyRows(body, 1, 80, 4, undefined, false, env("loading")))).toBe(bodyRows(body, 1, 80, 4, undefined, false, env("loading")).length);
+    expect(rowsHeight(out)).toBe(out.length - 1 + 15);
+
+    const hidden = `${Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n\n")}\n\n![late](https://x.test/late.png)\n\n![early](https://x.test/early.png)`;
+    requested.length = 0;
+    bodyRows(hidden, 1, 80, 4, undefined, false, env("loading"));
+    expect(requested).toEqual([]);
+    requested.length = 0;
+    bodyRows(`![early](https://x.test/early.png)\n\nx`, 1, 80, 4, undefined, false, env("loading"));
+    expect(requested).toEqual(["https://x.test/early.png"]);
   });
 });

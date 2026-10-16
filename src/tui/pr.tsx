@@ -14,7 +14,7 @@ import type { PrDetail } from "../service";
 import { isWaitable } from "../watch";
 import { nativeUpTo, type Blocker, type CheckState, type ConversationEntry, type MergeMethod } from "../types";
 import { activityId, activityLayout, activityMeta, bodyRows, defaultLevel, foldBots, groupActivity, lowSignalTag, rowsHeight, type ActivityItem, type BotFold, type Level, type RL } from "./activity";
-import { imagesVersion, peekImage, subscribeImages } from "../images";
+import { imagesVersion, imageState, requestImage, setPrHost, subscribeImages } from "../images";
 import { layoutBlocks, parseComment, preview, threadFix, type ImageEnv, type Span } from "./markdown";
 import { jobDockText, type Job } from "../jobs";
 import { diffKey, mergeMethodOf, runningJobOf, useStore, useStoreInstance, type Store } from "./store";
@@ -651,7 +651,7 @@ function RowsView({
               </box>
             );
           case "image": {
-            const img = peekImage(r.src);
+            const img = imageState(r.src);
             return (
               <box key={i} height={r.rows} flexShrink={0} flexDirection="row" paddingLeft={r.rail ? (r.railIndent ?? 0) : 2}>
                 {r.rail && (
@@ -659,7 +659,7 @@ function RowsView({
                     {Array.from({ length: r.rows }, () => "│ ").join("\n")}
                   </text>
                 )}
-                {img.status === "ready" && <image source={img.data} fit="fill" protocol="auto" width={r.cols} height={r.rows} marginLeft={r.indent} flexShrink={0} />}
+                {img?.status === "ready" && <image source={img.data} fit="fill" protocol="auto" width={r.cols} height={r.rows} marginLeft={r.indent} flexShrink={0} />}
               </box>
             );
           }
@@ -743,7 +743,13 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   // images arrive after layout: rows are re-derived (and heights re-accounted) whenever one finishes loading
   useSyncExternalStore(subscribeImages, imagesVersion);
   const res = renderer.resolution;
-  const images: ImageEnv = { lookup: peekImage, cell: res && renderer.terminalWidth > 0 ? { w: res.width / renderer.terminalWidth, h: res.height / renderer.terminalHeight } : { w: 8, h: 16 } };
+  // credentials for images go only to github.com and this PR's own GitHub host
+  setPrHost(URL.canParse(pr.url) ? new URL(pr.url).hostname : null);
+  const images: ImageEnv = {
+    lookup: (src) => imageState(src) ?? { status: "loading" },
+    request: requestImage,
+    cell: res && renderer.terminalWidth > 0 ? { w: res.width / renderer.terminalWidth, h: res.height / renderer.terminalHeight } : { w: 8, h: 16 },
+  };
 
   const focus = useStore((s) => (s.screen.kind === "pr" ? s.screen.focus : undefined));
   const [curId, setCurId] = useState<string | null>(focus?.key ?? null);

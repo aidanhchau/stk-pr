@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveSource } from "../src/images";
+import { createImageStore, isTrustedHost, resolveSource, type ImageState } from "../src/images";
 
 const SHA = "ebb07850d77813b35601e9f26f634903c7629d59";
 
@@ -39,8 +39,18 @@ describe("resolveSource", () => {
     });
   });
 
-  test("a GitHub Enterprise host keeps its hostname", () => {
-    expect(resolveSource("https://github.corp.example/o/r/blob/main/a.png")).toMatchObject({ kind: "contents", host: "github.corp.example", owner: "o", repo: "r" });
+  test("only github.com and the PR's own host are GitHub hosts; lookalikes and http get nothing authenticated", () => {
+    expect(resolveSource("https://github.corp.example/o/r/blob/main/a.png", "github.corp.example")).toMatchObject({ kind: "contents", host: "github.corp.example", owner: "o", repo: "r" });
+    for (const host of ["github.attacker.example", "github.com.evil.test", "evilgithub.com", "github.corp.example"]) {
+      expect(resolveSource(`https://${host}/o/r/blob/main/a.png`)).toMatchObject({ kind: "url" });
+      expect(resolveSource(`https://${host}/user-attachments/assets/1`)).toMatchObject({ kind: "url" });
+    }
+    expect(resolveSource("https://github.com/o/r/blob/main/a.png")).toMatchObject({ kind: "contents" });
+    expect(resolveSource("http://github.com/user-attachments/assets/1")).toBeNull();
+    expect(resolveSource("http://raw.githubusercontent.com/o/r/main/a.png")).toBeNull();
+    expect(isTrustedHost("github.com", null)).toBe(true);
+    expect(isTrustedHost("github.attacker.example", "github.corp.example")).toBe(false);
+    expect(isTrustedHost("github.corp.example", "GitHub.Corp.Example")).toBe(true);
   });
 
   test("user-attachments and legacy /assets uploads need the gh token", () => {
@@ -56,5 +66,46 @@ describe("resolveSource", () => {
     expect(resolveSource("data:image/png;base64,AAAA")).toBeNull();
     expect(resolveSource("./local.png")).toBeNull();
     expect(resolveSource("file:///tmp/a.png")).toBeNull();
+  });
+});
+
+describe("image store", () => {
+  const ready: ImageState = { status: "ready", data: new Uint8Array(1), width: 1, height: 1 };
+
+  test("more images on screen than the cache holds cannot loop: each URL is fetched at most 3 times", async () => {
+    const loads = new Map<string, number>();
+    const store = createImageStore(async (src) => (loads.set(src, (loads.get(src) ?? 0) + 1), ready), { maxEntries: 4, maxFetches: 3 });
+    const urls = Array.from({ length: 10 }, (_, i) => `https://x.test/${i}.png`);
+    // every completion re-renders, and a render requests every image again
+    store.subscribe(() => urls.forEach((u) => store.request(u)));
+    urls.forEach((u) => store.request(u));
+    await Bun.sleep(50);
+    expect(Math.max(...loads.values())).toBeLessThanOrEqual(3);
+    expect(loads.size).toBe(10);
+  });
+
+  test("peek never starts a load; request does, once", async () => {
+    let n = 0;
+    const store = createImageStore(async () => (n++, ready));
+    expect(store.peek("https://x.test/a.png")).toBeUndefined();
+    expect(n).toBe(0);
+    store.request("https://x.test/a.png");
+    store.request("https://x.test/a.png");
+    await Bun.sleep(10);
+    expect(n).toBe(1);
+    expect(store.peek("https://x.test/a.png")).toBe(ready);
+  });
+
+  test("entries in use survive eviction (recency, not insertion order)", async () => {
+    const store = createImageStore(async () => ready, { maxEntries: 2 });
+    store.request("a");
+    await Bun.sleep(5);
+    store.request("b");
+    await Bun.sleep(5);
+    store.peek("a");
+    store.request("c");
+    await Bun.sleep(5);
+    expect(store.peek("a")).toBeDefined();
+    expect(store.peek("b")).toBeUndefined();
   });
 });
