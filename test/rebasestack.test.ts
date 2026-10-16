@@ -10,8 +10,11 @@ type Call = { argv: string[]; cwd?: string };
  * Fake gh/git for a native stack whose #101 already merged (so #102's base is the merged branch b101). Origin heads are
  * `sha<n>`, the trunk is at `trunk0`, and rebasing in the temporary worktree yields `new<n>` for the member checked out.
  */
-function fake(o: { rebase?: "ok" | "conflict" | "refuse"; localB102?: string; push?: "ok" | "reject"; wt?: boolean } = {}): { ctx: Ctx; calls: Call[]; git: () => string[] } {
+function fake(o: { rebase?: "ok" | "conflict" | "refuse"; localB102?: string; push?: "ok" | "reject"; wt?: boolean; restacked?: boolean; stackGrows?: boolean; unknownForever?: boolean; unstack?: "conflict" } = {}): { ctx: Ctx; calls: Call[]; git: () => string[]; rest: string[] } {
   const calls: Call[] = [];
+  const rest: string[] = [];
+  let unstacked = false;
+  let retargeted = false;
   const member = (n: number) => ({
     number: n, title: `PR ${n}`, url: "", author: { login: "me" }, state: n === 101 ? "MERGED" : "OPEN", isDraft: false,
     headRefName: `b${n}`, baseRefName: n === 101 ? "main" : `b${n - 1}`, headRefOid: `sha${n}`, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
@@ -26,14 +29,36 @@ function fake(o: { rebase?: "ok" | "conflict" | "refuse"; localB102?: string; pu
     const a = argv.join(" ");
     const query = argv.find((x) => x.startsWith("query=")) ?? "";
     if (query.includes("stackEntry")) {
-      const nodes = CHAIN.map((n, i) => ({ position: i + 1, pullRequest: member(n) }));
+      const nodes = (pushed && o.stackGrows ? [...CHAIN, 104] : CHAIN).map((n, i) => ({ position: i + 1, pullRequest: member(n) }));
       const repository = { defaultBranchRef: { name: "main" }, pullRequest: { stackEntry: { position: 3 }, stack: { size: 3, entries: { nodes } } } };
       return ok(JSON.stringify({ data: { repository } }));
     }
     if (a.startsWith("gh repo view")) return ok(JSON.stringify({ owner: { login: "o" }, name: "r", defaultBranchRef: { name: "main" } }));
+    // the stack API: GitHub refuses a base change until the stack is dissolved
+    const api = /^gh api -i (?:-X (\w+) )?repos\/o\/r\/(pulls\/(\d+)|stacks(?:\/\d+\/unstack)?)(?: |$)/.exec(a);
+    if (api) {
+      const http = (status: number, body: unknown) => ok(`HTTP/2.0 ${status} X\r\n\r\n${body === null ? "" : JSON.stringify(body)}`);
+      const input = opts?.stdin ? (JSON.parse(opts.stdin) as { base?: string; pull_requests?: number[] }) : {};
+      if (!api[1]) return http(200, { base: { ref: retargeted ? "main" : "b101" }, mergeable_state: o.unknownForever ? "unknown" : "clean", stack: unstacked ? null : { number: 7 }, merge_commit_sha: api[3] === "101" && o.restacked ? "mc101" : null });
+      if (api[1] === "POST" && api[2]!.endsWith("/unstack")) {
+        if (o.unstack === "conflict") return http(409, { message: "stack is being modified" });
+        rest.push("unstack");
+        unstacked = true;
+        return http(200, {});
+      }
+      if (api[1] === "POST") {
+        rest.push(`create ${input.pull_requests!.join(",")}`);
+        return http(201, { number: 8, pull_requests: input.pull_requests });
+      }
+      if (!unstacked) return http(422, { message: "Cannot change the base branch because the pull request is part of a stack." });
+      rest.push(`base ${api[3]} ${input.base}`);
+      retargeted = true;
+      return http(200, {});
+    }
     if (argv[0] !== "git") return no(`unexpected: ${a}`);
     const g = argv.filter((x, i) => !(x === "-c" || argv[i - 1] === "-c")).slice(1).join(" ");
     if (g.startsWith("fetch ")) return ok();
+    if (g.startsWith("cat-file -e ")) return ok();
     if (g === "worktree list --porcelain") {
       return ok(`worktree /repo\nHEAD h0\nbranch refs/heads/main\n\n${o.wt === false ? "" : "worktree /wt-102\nHEAD sha102\nbranch refs/heads/b102\n\n"}`);
     }
@@ -68,7 +93,7 @@ function fake(o: { rebase?: "ok" | "conflict" | "refuse"; localB102?: string; pu
     return no(`unexpected: ${a}`);
   };
   const ctx: Ctx = { exec, root: "/repo", slug: { owner: "o", name: "r" }, worktrees: [{ path: "/wt-102", branch: "b102", head: "sha102", bare: false }] };
-  return { ctx, calls, git: () => calls.filter((c) => c.argv[0] === "git").map((c) => c.argv.slice(1).filter((x, i, all) => !(x === "-c" || all[i - 1] === "-c")).join(" ")) };
+  return { ctx, calls, rest, git: () => calls.filter((c) => c.argv[0] === "git").map((c) => c.argv.slice(1).filter((x, i, all) => !(x === "-c" || all[i - 1] === "-c")).join(" ")) };
 }
 
 /** The temporary worktree path the run created. */
@@ -84,7 +109,7 @@ describe("rebaseStack", () => {
     const r = await rebaseStack(ctx, 102, { onStep: (s) => steps.push(s) });
     expect(r.prs).toEqual([102, 103]);
     expect(r.heads).toEqual({ 102: "new102", 103: "new103" });
-    expect(steps).toEqual(["fetching", "rebasing #102", "rebasing #103", "pushing"]);
+    expect(steps).toEqual(["fetching", "rebasing #102", "rebasing #103", "pushing", "unstacked, pointed #102 at main and re-created the stack (#102, #103 as stack 8)"]);
     const tmp = tmpOf(calls);
     expect(git()).toEqual([
       "fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main +refs/heads/b102:refs/remotes/origin/b102 +refs/heads/b103:refs/remotes/origin/b103",
@@ -111,6 +136,48 @@ describe("rebaseStack", () => {
       "ls-remote origin refs/heads/b103",
       "worktree list --porcelain",
     ]);
+  });
+
+  test("a stack left on a merged branch is also re-linked: unstack, retarget, re-create, in that order and after the push", async () => {
+    const { ctx, calls, rest } = fake();
+    const r = await rebaseStack(ctx, 102);
+    expect(rest).toEqual(["unstack", "base 102 main", "create 102,103"]);
+    expect(r.relinked).toBe("unstacked, pointed #102 at main and re-created the stack (#102, #103 as stack 8)");
+    const order = calls.map((c) => c.argv.join(" ")).filter((s) => s.includes("push --atomic") || s.includes("unstack") || s.includes("PATCH") || /-X POST \S+\/stacks /.test(s));
+    expect(order.map((s) => (s.includes("push") ? "push" : s.includes("unstack") ? "unstack" : s.includes("PATCH") ? "patch" : "create"))).toEqual(["push", "unstack", "patch", "create"]);
+    expect(calls.some((c) => c.argv.some((x) => x.includes("DELETE") || x.includes("git/refs")))).toBe(false);
+  });
+
+  test("resumable: a bottom PR that already contains its parent's merge commit is not rebased again, only re-linked", async () => {
+    const { ctx, git, rest } = fake({ restacked: true });
+    const steps: string[] = [];
+    const r = await rebaseStack(ctx, 102, { onStep: (s) => steps.push(s) });
+    expect(git()).toContain("merge-base --is-ancestor mc101 sha102");
+    expect(git().some((c) => c.startsWith("worktree add") || c.startsWith("push") || c.startsWith("rebase"))).toBe(false);
+    expect(steps[0]).toBe("#102 is already rebased onto the merge of #101; only re-linking");
+    expect(rest).toEqual(["unstack", "base 102 main", "create 102,103"]);
+    expect(r.heads).toEqual({ 102: "sha102", 103: "sha103" });
+  });
+
+  test("a failed unstack leaves the branches rewritten and says so; nothing is retargeted", async () => {
+    const { ctx, rest } = fake({ unstack: "conflict" });
+    const e = (await rebaseStack(ctx, 102).catch((x: unknown) => x)) as StkError;
+    expect(e.message).toContain("GitHub is modifying stack 7");
+    expect(rest).toEqual([]);
+  });
+
+  test("a PR added to the stack while it was rebased stops before anything is unstacked", async () => {
+    const { ctx, rest } = fake({ stackGrows: true });
+    const e = (await rebaseStack(ctx, 102).catch((x: unknown) => x)) as StkError;
+    expect(e.message).toBe("the stack changed while it was rebased (rebased #102, #103, now #102, #103, #104); nothing was unstacked, review it and run rebase-stack again");
+    expect(rest).toEqual([]);
+  });
+
+  test("mergeability that stays unknown after the re-link is reported, naming the PR, not treated as settled", async () => {
+    const { ctx, rest } = fake({ unknownForever: true });
+    const e = (await rebaseStack(ctx, 102, { replan: { attempts: 2, delayMs: 5, sleep: async () => {} } }).catch((x: unknown) => x)) as StkError;
+    expect(e.message).toContain("re-linked onto main, but GitHub is still computing whether #102 can merge");
+    expect(rest).toEqual(["unstack", "base 102 main", "create 102,103"]);
   });
 
   test("every mutating git call pins config so the user's settings cannot change it", async () => {
@@ -205,7 +272,7 @@ describe("rebaseStack", () => {
       expect.objectContaining({
         pr: 102,
         action: "rebase-stack",
-        fix: `GitHub does not allow changing the base of a stacked PR; the stack needs a rebase (GitHub's "Rebase stack", or stk's rebase-stack).`,
+        fix: "GitHub did not retarget it and refuses a base change while it is stacked; stk's rebase-stack rebases it onto main, unstacks, points it at main and re-creates the stack.",
       }),
     ]);
   });

@@ -149,9 +149,9 @@ export interface PlanItem {
 }
 
 /**
- * The plan lines. A native stack's merges after the first need the stack rebased onto the trunk once the PR below
- * them lands (GitHub leaves it on the merged branch, and will not let its base be changed), so that rebase is listed
- * where it runs: `withExpectedRebases` adds it to a plan that does not carry it yet.
+ * The plan lines. After a bypass merge GitHub neither rebases nor retargets a native stack's next PR (and refuses to let
+ * its base be edited while it is stacked), so that merge is followed by a rebase and re-link, listed where it runs:
+ * `withExpectedRebases` adds it to a plan that does not carry it yet. After any other merge GitHub restacks by itself.
  */
 export function planItems(plan: PlanStep[], trunk: string, method: MergeMethod): PlanItem[] {
   const items: PlanItem[] = [];
@@ -180,8 +180,8 @@ export function planItems(plan: PlanStep[], trunk: string, method: MergeMethod):
       case "rebase-stack":
         items.push({
           steps: [i],
-          text: `Rebase #${s.pr} onto ${trunk}${lastLanded === null ? "" : " and everything above it"}`,
-          why: `${lastLanded === null ? "GitHub left it on a merged branch" : `after #${lastLanded} lands; GitHub leaves it on the merged branch`}; runs in a temporary checkout`,
+          text: `Rebase #${s.pr} onto ${trunk}${lastLanded === null ? "" : " and everything above it"} and point it at ${trunk} (re-links the stack)`,
+          why: `${lastLanded === null ? "GitHub left it on a merged branch" : `after #${lastLanded} lands; a bypass merge leaves it on the merged branch`}; runs in a temporary checkout`,
         });
         break;
       case "merge": {
@@ -200,15 +200,15 @@ export function planItems(plan: PlanStep[], trunk: string, method: MergeMethod):
   return items;
 }
 
-/** A native plan lists its merges; every merge after the first is preceded by the rebase it needs. */
+/** A native plan lists its merges; every merge that follows a bypass merge is preceded by the rebase and re-link it needs. */
 export function withExpectedRebases(plan: PlanStep[], native: boolean): PlanStep[] {
   if (!native) return plan;
   const out: PlanStep[] = [];
-  let seen = false;
+  let afterBypass = false;
   for (const s of plan) {
     if (s.kind === "merge") {
-      if (seen && out.at(-1)?.kind !== "rebase-stack") out.push({ kind: "rebase-stack", pr: (s.includes ?? [s.pr])[0]! });
-      seen = true;
+      if (afterBypass && out.at(-1)?.kind !== "rebase-stack") out.push({ kind: "rebase-stack", pr: (s.includes ?? [s.pr])[0]! });
+      afterBypass = s.admin;
     }
     out.push(s);
   }

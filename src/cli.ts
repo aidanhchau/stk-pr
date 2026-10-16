@@ -11,6 +11,7 @@ import {
   prDetail,
   prFiles,
   reply,
+  rebaseStack,
   resolve,
   review,
   stackInfo,
@@ -44,6 +45,7 @@ usage: stk [--repo DIR] [--json] <command>
   resolve <threadId>                   resolve a review thread
   merge <n> [--method squash|merge|rebase] [--force] [--dry-run]
   stack <n> [--merge] [--force] [--method M]   show the plan, or execute it with --merge
+  rebase-stack <n>                     rebase a native stack onto its trunk and re-link it (unstack, retarget, re-create); fixes a stack a bypass merge left on a merged branch
   jobs [--gh OWNER/NAME] [--json]      recent merge jobs (merges run detached and survive closing the TUI)
   session [--pane ID]                  PRs mentioned in a Tern pane's agent session (default: the agent pane next to $TERN_PANE)
   doctor                               check gh, auth, Tern, rate limits, cache and repo detection (--json; exit 1 on a failure)
@@ -235,6 +237,13 @@ async function cmdStack(ctx: Ctx, o: Opts, args: string[], deps: CliDeps, json: 
   };
 }
 
+async function cmdRebaseStack(ctx: Ctx, args: string[], deps: CliDeps, json: boolean): Promise<Result> {
+  const n = parseNumber(args[0], "rebase-stack");
+  const r = await rebaseStack(ctx, n, { onStep: (what) => { if (!json) deps.stdout(`ok   ${what}\n`); } });
+  const text = `rebased ${r.prs.map((p) => `#${p}`).join(", ")} onto the trunk${r.relinked ? `; ${r.relinked}` : ""}${r.note ? `; ${r.note}` : ""}`;
+  return { data: r, text };
+}
+
 async function cmdSession(deps: CliDeps, o: Opts): Promise<Result> {
   const origin = process.env.TERN_PANE;
   const pane = o.pane ?? (origin ? (await agentPanes(deps.exec, origin).catch(() => []))[0]?.id : undefined);
@@ -349,7 +358,7 @@ export async function main(argv: string[], deps: CliDeps): Promise<number> {
       deps.stdout(json ? `${JSON.stringify({ ok: true, data: { jobs } })}\n` : `${jobs.length ? jobs.map(line).join("\n") : "no recent merge jobs"}\n`);
       return 0;
     }
-    const known = ["prs", "pr", "diff", "open", "review", "reply", "resolve", "merge", "stack"];
+    const known = ["prs", "pr", "diff", "open", "review", "reply", "resolve", "merge", "stack", "rebase-stack"];
     if (!cmd || !known.includes(cmd)) usage(cmd ? `unknown command: ${cmd}` : "missing command");
 
     const ctx = await openCtx(deps.exec, o.repo ?? process.cwd());
@@ -364,6 +373,7 @@ export async function main(argv: string[], deps: CliDeps): Promise<number> {
       case "reply": result = await cmdReply(ctx, o, args); break;
       case "resolve": result = await cmdResolve(ctx, args); break;
       case "merge": result = await cmdMerge(ctx, o, args); break;
+      case "rebase-stack": result = await cmdRebaseStack(ctx, args, deps, json); break;
       default: result = await cmdStack(ctx, o, args, deps, json); break;
     }
     deps.stdout(json ? `${JSON.stringify({ ok: true, data: result.data })}\n` : `${result.text}\n`);

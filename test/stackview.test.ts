@@ -56,15 +56,24 @@ describe("stackSummary", () => {
 });
 
 describe("plan lines", () => {
-  test("the rebase sits after the first merge, with the reason, and only when a later merge needs it", () => {
+  test("the rebase and re-link sit after a bypass merge, with the reason, and only when a later merge needs it", () => {
     const plan = [merge(2462, [review]), merge(2463, [review])];
     const shown = withExpectedRebases(plan, true);
     expect(shown.map((s) => `${s.kind}:${"pr" in s ? s.pr : ""}`)).toEqual(["merge:2462", "rebase-stack:2463", "merge:2463"]);
     expect(planItems(shown, "main", "squash")).toEqual([
       { steps: [0], text: "Merge #2462 into main (squash)", why: "bypasses review" },
-      { steps: [1], text: "Rebase #2463 onto main and everything above it", why: "after #2462 lands; GitHub leaves it on the merged branch; runs in a temporary checkout" },
+      {
+        steps: [1],
+        text: "Rebase #2463 onto main and everything above it and point it at main (re-links the stack)",
+        why: "after #2462 lands; a bypass merge leaves it on the merged branch; runs in a temporary checkout",
+      },
       { steps: [2], text: "Merge #2463 into main (squash)", why: "bypasses review" },
     ]);
+  });
+
+  test("a merge without bypass needs no rebase: GitHub restacks the PRs above it itself", () => {
+    const plan = [merge(2461), merge(2462, [review]), merge(2463)];
+    expect(withExpectedRebases(plan, true).map((s) => `${s.kind}:${"pr" in s ? s.pr : ""}`)).toEqual(["merge:2461", "merge:2462", "rebase-stack:2463", "merge:2463"]);
   });
 
   test("one merge request needs no rebase, and a classic stack is left as planned", () => {

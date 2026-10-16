@@ -1005,6 +1005,36 @@ export async function createPrStack(exec: Exec, where: Where, prs: number[]): Pr
   throw apiError(res, "creating the stack");
 }
 
+/**
+ * Remove every unmerged PR from a stack (REST `POST /repos/{o}/{r}/stacks/{n}/unstack`: 200 with what is left, or 204 when
+ * the stack dissolved). GitHub refuses to change the base of a PR while it is in a stack, so this comes before a retarget.
+ */
+export async function unstackPrStack(exec: Exec, where: Where, stack: number): Promise<void> {
+  const { owner, name } = await slugOf(exec, where);
+  const res = await ghApiRaw(exec, where, ["-X", "POST", `repos/${owner}/${name}/stacks/${stack}/unstack`]);
+  if (res.status === 200 || res.status === 204) return;
+  const msg = (res.body as { message?: string } | null)?.message;
+  if (res.status === 409) throw new StkError(`GitHub is modifying stack ${stack}; try again in a moment${msg ? `: ${msg}` : ""}`, "gh-failed");
+  if (res.status === 422) throw new StkError(`GitHub cannot unstack stack ${stack}${msg ? `: ${msg}` : ""}`, "gh-failed");
+  throw apiError(res, `unstacking stack ${stack}`);
+}
+
+/** Point a PR at another base branch (REST `PATCH pulls/{n}`). GitHub answers 422 while the PR is still in a stack. */
+export async function setPrBase(exec: Exec, where: Where, number: number, base: string): Promise<void> {
+  const { owner, name } = await slugOf(exec, where);
+  const res = await ghApiRaw(exec, where, ["-X", "PATCH", `repos/${owner}/${name}/pulls/${number}`, "--input", "-"], JSON.stringify({ base }));
+  if (res.status !== 200) throw apiError(res, `retargeting #${number} to ${base}`);
+}
+
+/** A PR's REST state: its base branch, the stack it is in (null for none), the commit it merged as (null while open) and `mergeableState`, `unknown` while GitHub recomputes it. */
+export async function pullState(exec: Exec, where: Where, number: number): Promise<{ base: string; stack: number | null; mergeCommit: string | null; mergeableState: string }> {
+  const { owner, name } = await slugOf(exec, where);
+  const res = await ghApiRaw(exec, where, [`repos/${owner}/${name}/pulls/${number}`]);
+  if (res.status !== 200) throw apiError(res, `reading #${number}`);
+  const b = res.body as { base?: { ref?: string }; mergeable_state?: string; merge_commit_sha?: string | null; stack?: { number?: number } | null } | null;
+  return { base: b?.base?.ref ?? "", stack: b?.stack?.number ?? null, mergeCommit: b?.merge_commit_sha ?? null, mergeableState: b?.mergeable_state ?? "unknown" };
+}
+
 /** Full planning data (checks, review state, unresolved threads) of several PRs in ONE aliased GraphQL call, in `numbers` order. */
 export async function prDetails(exec: Exec, where: Where, numbers: number[]): Promise<PullRequest[]> {
   if (numbers.length === 0) return [];

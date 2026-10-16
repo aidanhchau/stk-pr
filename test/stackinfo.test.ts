@@ -105,7 +105,7 @@ describe("stackInfo on a native stack", () => {
     expect(info.notes).toHaveLength(1);
     expect(info.notes[0]).toMatchObject({ pr: 102 });
     expect(info.notes[0]!.text).toBe("#102's base is a merged branch (b101)");
-    expect(info.notes[0]!.fix).toContain("Rebase stack");
+    expect(info.notes[0]!.fix).toContain("rebase-stack");
   });
 });
 
