@@ -33,6 +33,8 @@ interface FakeOptions {
   /** The stack dissolves by itself after a bypass merge (stk did not re-link anything) and B is left based on main. */
   dissolveOnBypass?: boolean;
   unexpectedDownstack?: boolean;
+  /** After the push, #203 shows as conflicting (DIRTY, stale from before its base was recomputed) for this many reads. */
+  dirtyReads?: number;
   staleMerged?: boolean;
   oldHeadReads?: number;
   divergedLocal?: boolean;
@@ -62,6 +64,7 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
   const heads: Record<number, string> = { [A]: "shaA", [B]: "shaB0", [C]: "sha203" };
   let members = [...originalChain];
   let checkingLeft = 0;
+  let dirtyLeft = 0;
   let oldHeadLeft = 0;
   let unknownLeft = 0;
   let checkedOut = 0;
@@ -73,8 +76,8 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
   const member = (n: number) => ({
     number: n, title: `PR ${n}`, url: "", author: { login: "me" }, state: merged.has(n) && !o.staleMerged ? "MERGED" : "OPEN", isDraft: false,
     headRefName: `b${n}`, baseRefName: bases[n], headRefOid: n === B && oldHeadLeft > 0 ? "shaB0" : heads[n],
-    mergeable: n === B && checkingLeft > 0 && o.checkingAs === "mergeable" ? "UNKNOWN" : "MERGEABLE",
-    mergeStateStatus: n === B && checkingLeft > 0 ? (o.checkingAs === "mergeable" ? "BLOCKED" : "UNKNOWN") : "CLEAN",
+    mergeable: n === C && dirtyLeft > 0 ? "CONFLICTING" : n === B && checkingLeft > 0 && o.checkingAs === "mergeable" ? "UNKNOWN" : "MERGEABLE",
+    mergeStateStatus: n === C && dirtyLeft > 0 ? "DIRTY" : n === B && checkingLeft > 0 ? (o.checkingAs === "mergeable" ? "BLOCKED" : "UNKNOWN") : "CLEAN",
     reviewDecision: requires(n) ? "REVIEW_REQUIRED" : "APPROVED", statusCheckRollup: null, createdAt: "", updatedAt: "", reviewThreads: { nodes: [] },
   });
   const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
@@ -83,6 +86,7 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
   const settle = () => {
     if (checkingLeft > 0) checkingLeft--;
     if (oldHeadLeft > 0) oldHeadLeft--;
+    if (dirtyLeft > 0) dirtyLeft--;
   };
   const exec: Exec = async (argv, opts) => {
     const a = argv.join(" ");
@@ -185,6 +189,7 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
       rebase();
       checkingLeft = o.checkingReads ?? 0;
       oldHeadLeft = o.oldHeadReads ?? 0;
+      dirtyLeft = o.dirtyReads ?? 0;
       return ok("");
     }
     const ls = /^ls-remote origin refs\/heads\/b(\d+)$/.exec(g);
@@ -278,6 +283,16 @@ describe("stackMerge on a native stack", () => {
     expect(rest).toEqual(["unstack", "base 202 main", "create 202,203"]);
     expect(events).toEqual(["merge 201", "push", "unstack", "base 202 main", "create 202,203", "merge 203"]);
     expect(r.results.find((x) => x.step.kind === "rebase-stack")!.detail).toContain("re-created the stack (#202, #203 as stack 5)");
+  });
+
+  test("a member above the bottom that still shows as conflicting right after the re-link is re-read, not dropped from the plan", async () => {
+    clearRulesCache();
+    const { ctx, puts } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 4 });
+    const sleeps: number[] = [];
+    const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, replan: { attempts: 6, delayMs: 7, sleep: async (ms) => void sleeps.push(ms) } });
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(r.merged).toEqual([A, B, C]);
+    expect(puts.map((p) => p.sha)).toEqual(["shaA", "new203"]);
   });
 
   test("right after the push GitHub still computes mergeability: the re-plan waits instead of stopping", async () => {

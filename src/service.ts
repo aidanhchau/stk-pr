@@ -657,7 +657,7 @@ interface AwaitedRestack {
  * bottom PR's base must be the trunk and every remaining head must have changed (a `merge`-method stack has nothing to
  * rewrite, so there the trunk base alone is enough once the deadline passed). `restacking` names the PR still waiting at
  * the deadline and `waitedMs` is the time really spent. Once GitHub has restacked, the other conditions get `attempts`
- * more reads. Nothing is ever pushed locally on this path: it would race GitHub's own push.
+ * more reads (`afterRelink` also holds off on a conflict shown right after a re-link, which GitHub may not have recomputed yet). Nothing is ever pushed locally on this path: it would race GitHub's own push.
  */
 async function replanNative(
   ctx: Ctx,
@@ -667,6 +667,7 @@ async function replanNative(
   policy: ReplanPolicy,
   expectedHeads: Record<number, string>,
   restack?: AwaitedRestack,
+  afterRelink = false,
 ): Promise<{ fresh: PlanForResult; stale: number | null; staleHead: number | null; checking: number | null; restacking: number | null; waitedMs: number }> {
   const delay = policy.delayMs ?? 2000;
   const attempts = policy.attempts ?? 6;
@@ -688,7 +689,9 @@ async function replanNative(
     const retargeted = !!bottom && bottom.baseRef === fresh.trunk;
     const unchanged = fresh.stack.prs.find((p) => p.headSha === restack?.heads[p.number]);
     const restacking = !restack || !bottom ? null : !retargeted ? bottom.number : unchanged && !(expired && restack.method === "merge") ? unchanged.number : null;
-    const done = stale === null && checking === null && !staleHead && restacking === null;
+    // right after a re-link GitHub may still show a member as conflicting from before its base was recomputed: give it the same few reads
+    const settlingConflict = afterRelink && fresh.stack.prs.some((p, i) => memberBlockers(p, fresh.trunk, i > 0, fresh.rules).some((b) => b.kind === "conflict"));
+    const done = stale === null && checking === null && !staleHead && restacking === null && !settlingConflict;
     if (restacking === null) reads++;
     if (done || (restacking !== null ? expired : reads > attempts)) {
       return { fresh, stale, staleHead: staleHead ? Number(staleHead[0]) : null, checking, restacking, waitedMs: now() - start };
@@ -839,7 +842,7 @@ export async function stackMerge(
       const rebased = await executePlan([rebase], deps);
       results.push(...rebased);
       if (rebased.some((r) => !r.ok)) break;
-      ({ fresh, stale, staleHead, checking } = await replanNative(ctx, first.target, opts, landed, opts.replan ?? {}, expectedHeads));
+      ({ fresh, stale, staleHead, checking } = await replanNative(ctx, first.target, opts, landed, opts.replan ?? {}, expectedHeads, undefined, true));
       validateReplan(fresh, stale);
       if (staleHead !== null) stopped(`GitHub has not reflected the pushed head of #${staleHead} (${expectedHeads[staleHead]}); refusing to merge a stale head`, staleHead);
     }
