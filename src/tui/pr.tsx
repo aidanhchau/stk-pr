@@ -15,6 +15,8 @@ import { isWaitable } from "../watch";
 import { nativeUpTo, type Blocker, type CheckState, type ConversationEntry, type MergeMethod } from "../types";
 import { activityId, activityLayout, activityMeta, bodyRows, defaultLevel, foldBots, groupActivity, lowSignalTag, rowsHeight, type ActivityItem, type BotFold, type Level, type RL } from "./activity";
 import { imagesVersion, imageState, requestImage, setPrHost, subscribeImages } from "../images";
+import { useImageCell } from "./image-density";
+import { useImageSource } from "./use-image";
 import { layoutBlocks, parseComment, preview, threadFix, type ImageEnv, type Span } from "./markdown";
 import { jobDockText, type Job } from "../jobs";
 import { diffKey, mergeMethodOf, runningJobOf, useStore, useStoreInstance, type Store } from "./store";
@@ -590,6 +592,32 @@ interface Reply {
 }
 
 /**
+ * A drawn image. Sent at the pixel size it is drawn at (`imageVariant`; the base image until that is ready). A click opens it large and
+ * stops there: the comment's own click (select, then fold) is not also triggered. Hidden while a sheet is open, so no placement lingers over it.
+ */
+function ImageRow({ r, rail }: { r: Extract<RL, { t: "image" }>; rail?: string }) {
+  const store = useStoreInstance();
+  const covered = useStore((s) => s.sheet !== null);
+  const img = useImageSource(r.src, r.cols, r.rows, !covered);
+  const open = (e: TuiMouseEvent) => {
+    e.stopPropagation();
+    store.openSheet({ kind: "image", src: r.src, alt: r.alt });
+  };
+  return (
+    <box height={r.rows} flexShrink={0} flexDirection="row" paddingLeft={rail ? (r.railIndent ?? 0) : 2}>
+      {rail && (
+        <text fg={rail} selectable={false} wrapMode="none">
+          {Array.from({ length: r.rows }, () => "│ ").join("\n")}
+        </text>
+      )}
+      {img && !covered && (
+        <image source={img.source} fit="fill" protocol="auto" width={r.cols} height={r.rows} marginLeft={r.indent} flexShrink={0} onMouseDown={open} onMouseUp={(e) => e.stopPropagation()} />
+      )}
+    </box>
+  );
+}
+
+/**
  * Rows of one comment/thread: 2-col left pad, right pad via `bodyWidth`. The selection fill spans the block, or only the head row when `headOnly` (long bodies keep ground contrast).
  * `accent` is the person's colour: their name, and a dimmed rail in the left pad of `rail` rows. Only the head row opens on click; body text is free to select.
  */
@@ -617,6 +645,7 @@ function RowsView({
   const p = useTheme();
   const bodySel = selected && !headOnly;
   const rail = accent ? lerpHex(accent, p.ground, 0.4) : p.faint;
+  const covered = useStore((s) => s.sheet !== null);
   const headClick = useClick(selected, onSelect, onOpen, { stop: true });
   return (
     <Sel selected={bodySel} current={selected} h={rowsHeight(rows)} onSelect={onSelect} onOpen={onOpen} body>
@@ -650,19 +679,8 @@ function RowsView({
                 <SpanText spans={r.spans} tone={muted ? "muted" : "ink"} sel={bodySel} accent={accent} rail={rail} />
               </box>
             );
-          case "image": {
-            const img = imageState(r.src);
-            return (
-              <box key={i} height={r.rows} flexShrink={0} flexDirection="row" paddingLeft={r.rail ? (r.railIndent ?? 0) : 2}>
-                {r.rail && (
-                  <text fg={rail} selectable={false} wrapMode="none">
-                    {Array.from({ length: r.rows }, () => "│ ").join("\n")}
-                  </text>
-                )}
-                {img?.status === "ready" && <image source={img.data} fit="fill" protocol="auto" width={r.cols} height={r.rows} marginLeft={r.indent} flexShrink={0} />}
-              </box>
-            );
-          }
+          case "image":
+            return <ImageRow key={i} r={r} rail={r.rail ? rail : undefined} />;
           case "gap":
             return r.rail ? (
               <box key={i} height={1} flexShrink={0} paddingLeft={r.indent ?? 0}>
@@ -677,7 +695,7 @@ function RowsView({
             return (
               <box key={i} height={1} flexShrink={0} paddingLeft={2} onMouseDown={(e) => e.stopPropagation()} onMouseUp={(e) => e.stopPropagation()}>
                 <input
-                  focused
+                  focused={!covered}
                   value={reply?.value ?? ""}
                   placeholder={`Reply${G.ellipsis}  ⌘⏎ send ${G.sep} esc cancel`}
                   onInput={onInput}
@@ -739,16 +757,15 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   const diffRef = useRef<DiffRenderable>(null);
   const { pr } = d;
   const history = useCommitHistory(n, d.repo);
-  const renderer = useRenderer();
   // images arrive after layout: rows are re-derived (and heights re-accounted) whenever one finishes loading
   useSyncExternalStore(subscribeImages, imagesVersion);
-  const res = renderer.resolution;
+  const cell = useImageCell();
   // credentials for images go only to github.com and this PR's own GitHub host
   setPrHost(URL.canParse(pr.url) ? new URL(pr.url).hostname : null);
   const images: ImageEnv = {
     lookup: (src) => imageState(src) ?? { status: "loading" },
     request: requestImage,
-    cell: res && renderer.terminalWidth > 0 ? { w: res.width / renderer.terminalWidth, h: res.height / renderer.terminalHeight } : { w: 8, h: 16 },
+    cell,
   };
 
   const focus = useStore((s) => (s.screen.kind === "pr" ? s.screen.focus : undefined));
@@ -981,6 +998,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   );
   useKeyboard((k) => {
     const s = store.getState();
+    if (s.sheet) return; // a sheet owns the keys; an open reply keeps its draft
     const { reply: r, openFile: f } = live.current;
     if (k.name === "escape" && r) {
       k.stopPropagation();

@@ -63,6 +63,10 @@ An image standing on its own line in a PR description, comment, review or review
 
 Drawing uses the terminal's graphics: the kitty protocol (kitty, Ghostty, WezTerm, Tern), else sixel, else half-block cells; inside tmux it falls back to half-blocks. Badges (shields.io and similar), bot buttons (`Fix in Cursor`, `Open in Web`, Devin Review, …), `P1`-style severity pills and images inline in prose are not drawn, as before.
 
+Images are sent at the pixel size they are drawn at, so they are sharp on Retina and other high-DPI screens: SVGs are rasterised at exactly that width, large rasters are downscaled once. (Some terminals, Tern among them, report their size in logical pixels; stk sends twice what is reported so the terminal never has to enlarge a smaller bitmap.)
+
+Click an image to enlarge it: it opens full screen, fitted to the terminal, with its alt text as the title. `esc`, `q` or another click closes it. The click only opens the image; it does not select or fold the comment around it.
+
 Private images go through `gh`: `github.com/<owner>/<repo>/blob/<ref>/<path>` and `raw.githubusercontent.com` URLs (the usual way a diagram committed to a private repo is embedded) are read with `gh api repos/<owner>/<repo>/contents/<path>?ref=<ref>`, and `github.com/user-attachments/assets/...` uploads are fetched with the token from `gh auth token` (sent to GitHub only, not to the storage host GitHub redirects to; held in memory, never written or logged). Other `https` images are fetched directly. Results, failures included, are cached for the session, so a broken link is not retried on every redraw.
 
 ### Keys

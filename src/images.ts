@@ -8,10 +8,12 @@
  * Only https is ever fetched. Credentials are used only for github.com and the GitHub host of the PR on screen (`setPrHost`); a lookalike
  * such as github.attacker.example is just another anonymous URL. SVGs are rasterised in a worker (svg-worker.ts); PNG/JPEG/WebP/GIF pass through.
  */
-import { imageInfo } from "@opentui/core";
+import { imageInfo, NativeImage } from "@opentui/core";
 import { exec, execBytes } from "./exec";
 import { Failure, guardedGet, MAX_BYTES, statusReason, TIMEOUT_MS } from "./image-net";
-import type { SvgReply, SvgRequest } from "./svg-worker";
+import { createVariantCache } from "./image-variants";
+import type { RasterPixelsReply, RasterRequest } from "./raster-worker";
+import type { SvgPixelsReply, SvgPngReply, SvgRequest } from "./svg-worker";
 
 export type Source =
   | { kind: "contents"; host: string; owner: string; repo: string; /** Ref/path splits, shortest ref first (branch names may hold slashes). */ candidates: { ref: string; path: string }[] }
@@ -111,50 +113,82 @@ export interface Decoded {
   /** Logical size in pixels: the SVG's own size, or the raster's. Never upscale past it. */
   width: number;
   height: number;
+  /** The SVG source, for re-rasterising at the size it is drawn at (`data` is a size-independent fallback). */
+  svg?: string;
 }
 
 const looksSvg = (b: Uint8Array): boolean => /<svg[\s>]/i.test(new TextDecoder().decode(b.subarray(0, 4096)));
 
-const SVG_DEADLINE_MS = 15_000;
-let worker: Worker | null = null;
-let nextId = 1;
-const pending = new Map<number, { ok: (d: Decoded) => void; fail: (e: Failure) => void }>();
+const WORKER_DEADLINE_MS = 15_000;
 
-/** Fails every queued job and drops the worker (a fresh one starts on the next SVG). */
-function resetWorker(reason: string) {
-  worker?.terminate();
-  worker = null;
-  for (const p of pending.values()) p.fail(new Failure(reason));
-  pending.clear();
-}
+/**
+ * A worker that takes one job at a time from a queue. Past the deadline one stuck job would block everything behind it, so the worker is
+ * killed, every waiting job fails, and a fresh worker starts on the next job. Jobs wait for the worker's `{ ready: true }`.
+ */
+function createJobWorker<Req extends { id: number }, Rep extends { id: number }>(file: string) {
+  let worker: Worker | null = null;
+  let ready = false;
+  let nextId = 1;
+  const waiting: Req[] = [];
+  const pending = new Map<number, { ok: (r: Rep) => void; fail: (e: Failure) => void }>();
 
-function svgWorker(): Worker {
-  if (worker) return worker;
-  const w = new Worker(new URL("./svg-worker.ts", import.meta.url).href);
-  w.onmessage = ({ data }: MessageEvent<SvgReply>) => {
-    const p = pending.get(data.id);
-    pending.delete(data.id);
-    if (!p) return;
-    if ("error" in data) p.fail(new Failure("unsupported"));
-    else p.ok({ data: data.png, width: data.width, height: data.height });
+  const reset = (reason: string) => {
+    worker?.terminate();
+    worker = null;
+    ready = false;
+    waiting.length = 0;
+    for (const p of pending.values()) p.fail(new Failure(reason));
+    pending.clear();
   };
-  w.onerror = () => resetWorker("unsupported");
-  worker = w;
-  return w;
+  const start = (): Worker => {
+    if (worker) return worker;
+    const w = new Worker(new URL(file, import.meta.url).href);
+    w.onmessage = ({ data }: MessageEvent<Rep | { ready: true }>) => {
+      if ("ready" in data) {
+        ready = true;
+        for (const r of waiting.splice(0)) w.postMessage(r);
+        return;
+      }
+      const p = pending.get(data.id);
+      pending.delete(data.id);
+      if (!p) return;
+      if ("error" in data) p.fail(new Failure("unsupported"));
+      else p.ok(data);
+    };
+    w.onerror = () => reset("unsupported");
+    worker = w;
+    return w;
+  };
+
+  return {
+    run(req: Omit<Req, "id">): Promise<Rep> {
+      const { promise, resolve, reject } = Promise.withResolvers<Rep>();
+      const job = { ...req, id: nextId++ } as Req;
+      const timer = setTimeout(() => reset("timeout"), WORKER_DEADLINE_MS);
+      pending.set(job.id, { ok: resolve, fail: reject });
+      const w = start();
+      if (ready) w.postMessage(job);
+      else waiting.push(job);
+      return promise.finally(() => clearTimeout(timer));
+    },
+  };
 }
 
-function rasterize(svg: string): Promise<Decoded> {
-  const { promise, resolve, reject } = Promise.withResolvers<Decoded>();
-  const id = nextId++;
-  // one stuck render would block the worker's queue: past the deadline, kill the worker and fail everything waiting on it
-  const timer = setTimeout(() => resetWorker("timeout"), SVG_DEADLINE_MS);
-  pending.set(id, { ok: resolve, fail: reject });
-  svgWorker().postMessage({ id, svg } satisfies SvgRequest);
-  return promise.finally(() => clearTimeout(timer));
+const svgWorker = createJobWorker<SvgRequest, SvgPngReply | SvgPixelsReply>("./svg-worker.ts");
+const rasterWorker = createJobWorker<RasterRequest, RasterPixelsReply>("./raster-worker.ts");
+
+/** A size-independent 1.2k-2.4k px wide PNG of an SVG. */
+async function rasterize(svg: string): Promise<Decoded> {
+  const r = await svgWorker.run({ svg });
+  if (!("png" in r)) throw new Failure("unsupported");
+  return { data: r.png, width: r.width, height: r.height };
 }
 
 async function decodeBytes(bytes: Uint8Array): Promise<Decoded> {
-  if (looksSvg(bytes)) return rasterize(new TextDecoder().decode(bytes));
+  if (looksSvg(bytes)) {
+    const svg = new TextDecoder().decode(bytes);
+    return { ...(await rasterize(svg)), svg };
+  }
   try {
     const info = imageInfo(bytes);
     return { data: bytes, width: info.width, height: info.height };
@@ -172,19 +206,35 @@ export interface ImageStore {
   peek(src: string): ImageState | undefined;
   /** Like `peek`, but starts the load the first time. */
   request(src: string): ImageState;
+  /** `src` rendered at exactly `w`x`h` px (SVGs re-rasterised, big rasters downscaled once), prepared off the render path: undefined while that is being made, when the base image already fits, or when the cache is full of renderings in use. Asks for it the first time and notifies subscribers when done. */
+  variant(src: string, w: number, h: number): NativeImage | undefined;
+  /** Keeps that rendering cached until released: pin what is on screen, so visible images never evict each other. */
+  pinVariant(src: string, w: number, h: number): () => void;
   subscribe(fn: () => void): () => void;
   version(): number;
 }
+
+const variantKey = (src: string, w: number, h: number) => `${src}\0${w}x${h}`;
 
 /**
  * Bounded cache. Entries are kept by recency of use, so what the page is showing is what stays. A URL that was evicted and is asked
  * for again is re-fetched, but at most `maxFetches` times a session: past that it stays an error, so a page showing more images than the
  * cache holds cannot loop downloading.
  */
-export function createImageStore(load: (src: string) => Promise<ImageState>, o: { maxEntries?: number; concurrency?: number; maxFetches?: number } = {}): ImageStore {
-  const { maxEntries = 64, concurrency = 3, maxFetches = 3 } = o;
+export function createImageStore(
+  load: (src: string) => Promise<ImageState>,
+  o: { maxEntries?: number; concurrency?: number; maxFetches?: number; maxVariants?: number; makeVariant?: (d: Decoded, w: number, h: number) => Promise<NativeImage | null> } = {},
+): ImageStore {
+  const { maxEntries = 64, concurrency = 3, maxFetches = 3, maxVariants = 24, makeVariant } = o;
   const states = new Map<string, ImageState>();
   const fetches = new Map<string, number>();
+  const variants = createVariantCache<NativeImage>({
+    max: maxVariants,
+    notify: () => {
+      version++;
+      for (const l of listeners) l();
+    },
+  });
   const listeners = new Set<() => void>();
   const queue: (() => void)[] = [];
   let running = 0;
@@ -244,6 +294,12 @@ export function createImageStore(load: (src: string) => Promise<ImageState>, o: 
       pump();
       return loading;
     },
+    variant(src, w, h) {
+      const st = states.get(src);
+      if (st?.status !== "ready" || !makeVariant) return undefined;
+      return variants.get(variantKey(src, w, h), src, () => makeVariant(st, w, h));
+    },
+    pinVariant: (src, w, h) => variants.pin(variantKey(src, w, h)),
     subscribe(fn) {
       listeners.add(fn);
       return () => void listeners.delete(fn);
@@ -265,8 +321,22 @@ async function loadReal(src: string): Promise<ImageState> {
   }
 }
 
-const store = createImageStore(loadReal);
+/** Cell-box sized pixels of `d`, prepared off the UI thread: SVGs are rasterised at exactly that width, rasters downscaled once (never upscaled). null: the base image is already right. */
+async function makeVariant(d: Decoded, w: number, h: number): Promise<NativeImage | null> {
+  if (d.svg !== undefined) {
+    const r = await svgWorker.run({ svg: d.svg, targetWidth: w });
+    if (!("pixels" in r)) return null;
+    return NativeImage.fromRgba(r.pixels, r.pxWidth, r.pxHeight);
+  }
+  if (w >= d.width && h >= d.height) return null;
+  const r = await rasterWorker.run({ data: d.data, width: Math.min(w, d.width), height: Math.min(h, d.height) });
+  return NativeImage.fromRgba(r.pixels, r.pxWidth, r.pxHeight);
+}
+
+const store = createImageStore(loadReal, { makeVariant });
 export const imageState = store.peek;
 export const requestImage = store.request;
+export const imageVariant = store.variant;
+export const pinImageVariant = store.pinVariant;
 export const subscribeImages = store.subscribe;
 export const imagesVersion = store.version;

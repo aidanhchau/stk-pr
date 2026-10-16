@@ -20,7 +20,7 @@ export type RL =
   | { t: "text"; spans: Span[]; muted?: boolean; rail?: boolean; indent?: number }
   | { t: "gap"; rail?: boolean; indent?: number }
   /** A drawn image, `rows` cells tall. `indent`: columns before the image; `railIndent`: columns before the rail (see `indentRow`). */
-  | { t: "image"; src: string; cols: number; rows: number; indent: number; rail?: boolean; railIndent?: number }
+  | { t: "image"; src: string; alt: string; cols: number; rows: number; indent: number; rail?: boolean; railIndent?: number }
   | { t: "input" };
 
 /** Cells a row occupies. */
@@ -208,7 +208,7 @@ export function bodyRows(body: string, level: Level, w: number, cap = BODY_CAP, 
   const all = layoutRows(dropTitle ? withoutTitle(blocks) : blocks, w, { details: level === 2, removed, images });
   const shown = level === 2 ? all : all.slice(0, cap);
   const rows: RL[] = shown.map((r): RL => {
-    if (r.t === "image") return { t: "image", src: r.src, cols: r.cols, rows: r.rows, indent: r.indent };
+    if (r.t === "image") return { t: "image", src: r.src, alt: r.alt, cols: r.cols, rows: r.rows, indent: r.indent };
     if (r.image) images?.request(r.image);
     return r.spans.length ? { t: "text", spans: r.spans } : { t: "gap" };
   });
