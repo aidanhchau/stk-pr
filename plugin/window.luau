@@ -54,12 +54,64 @@ local function existing_tui(cx: WindowCx, repo: string): number?
 	return nil
 end
 
+-- Since Tern 0.9.0, cx.layout:split returns nil and cx.layout:close does nothing for panes opened after the
+-- session daemon's handover (the window's plugin API doesn't know their ids), while the `tern` CLI still finds
+-- them, under the pane id or that id plus the host bit (2^44). `tern split` on an unknown id still spawns a
+-- detached shell, so `tern inspect` picks the id first. Plugin processes don't inherit the app's PATH, so
+-- prefer the binary inside the app bundle.
+local TERN_APP_BIN = "/Applications/Tern.app/Contents/MacOS/tern"
+local TERN_BIN = if tern.fs.exists(TERN_APP_BIN) then TERN_APP_BIN else "tern"
+local HOST_BIT = 2 ^ 44
+
+local function cli_failure(result: ProcessResult): string
+	local why = string.gsub(result.stderr, "%s+$", "")
+	return if why ~= "" then why else "tern exited " .. tostring(result.status)
+end
+
+-- Runs `tern <build(block)>` against `pane`; `done(ok, why, cx)` gets the verdict.
+local function tern_cli(pane: number, build: (string) -> { string }, done: (boolean, string, WindowCx?) -> ())
+	tern.process.run({ TERN_BIN, "inspect", "--json" }, { timeout_ms = 10000 }, function(found: ProcessResult, fcx: WindowCx?)
+		local ok, parsed = pcall(tern.json.decode, found.stdout)
+		if found.status ~= 0 or not ok then return done(false, cli_failure(found), fcx) end
+		local block: number? = nil
+		for _, info in parsed.panes or {} do
+			if info.pane == pane or info.pane == pane + HOST_BIT then block = info.pane end
+		end
+		if block == nil then return done(false, "no such pane in tern inspect", fcx) end
+		local argv = { TERN_BIN }
+		for _, arg in build(string.format("%d", block)) do table.insert(argv, arg) end
+		tern.process.run(argv, { timeout_ms = 10000 }, function(result: ProcessResult, ncx: WindowCx?)
+			done(result.status == 0, if result.status == 0 then "" else cli_failure(result), ncx)
+		end)
+	end)
+end
+
+-- Opens `launch` in a split to the right of `pane`. The window API first; the CLI for panes it doesn't know.
+-- Only when neither can split does it open a tab, and says why.
+local function split_right(cx: WindowCx, pane: number, launch: Launch)
+	if cx.layout:split(pane, "right", launch) ~= nil then return end
+	local line = launch.command or STK
+	tern_cli(pane, function(block: string): { string }
+		local args = { "split", block, "right" }
+		if launch.cwd then
+			table.insert(args, "--cwd")
+			table.insert(args, launch.cwd)
+		end
+		for _, arg in { "--", tern.getenv("SHELL") or "/bin/zsh", "-lic", line } do table.insert(args, arg) end
+		return args
+	end, function(ok: boolean, why: string, ncx: WindowCx?)
+		if ok then return end
+		local wcx = ncx or cx
+		if wcx.layout:new_tab(launch) == nil then
+			wcx:toast("error", "Could not open the stk TUI", why)
+		else
+			wcx:toast("warn", "Opened stk in a new tab: could not split", why)
+		end
+	end)
+end
+
 local function launch(cx: WindowCx, pane: number, repo: string, pr: number?)
-	local new = cx.layout:split(pane, "right", { cwd = repo, command = tui_command(repo, pr) })
-	if new == nil then
-		new = cx.layout:new_tab({ cwd = repo, command = tui_command(repo, pr) })
-	end
-	if new == nil then cx:toast("error", "Could not open the stk TUI") end
+	split_right(cx, pane, { cwd = repo, command = tui_command(repo, pr) })
 end
 
 -- Launch the TUI beside `pane` with a pre-built stk subcommand line (repo-less: cwd = the pane's dir
@@ -68,9 +120,7 @@ local function launch_line(cx: WindowCx, pane: number, cwd: string?, args: strin
 	local line = STK .. " tui " .. args
 	local launch: Launch = { command = line }
 	if cwd and cwd ~= "" then launch.cwd = cwd end
-	local new = cx.layout:split(pane, "right", launch)
-	if new == nil then new = cx.layout:new_tab(launch) end
-	if new == nil then cx:toast("error", "Could not open the stk TUI") end
+	split_right(cx, pane, launch)
 end
 
 local function pane_cwd(cx: WindowCx, id: number): string?
@@ -106,12 +156,16 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx)
 	return { handled = true }
 end)
 
--- Closing a stk TUI pane skips Tern's confirmation (layout:close is the raw close).
+-- Closing a stk TUI pane skips Tern's confirmation (`tern close` is the raw close; cx.layout:close silently
+-- does nothing for panes the window API doesn't know, see tern_cli). The override runs on a 50 ms budget, so
+-- the close happens in the CLI's callback.
 tern.override("close_pane", function(cx: WindowCx)
 	local id = cx.session:focused()
 	for _, p in cx.session:panes() do
 		if p.pane == id and p.kind ~= "browser" and is_stk_pane(p) then
-			cx.layout:close(p.pane)
+			tern_cli(p.pane, function(block: string): { string } return { "close", block } end, function(ok: boolean, why: string, ncx: WindowCx?)
+				if not ok and ncx then ncx:toast("error", "Could not close the stk pane", why) end
+			end)
 			return true
 		end
 	end
