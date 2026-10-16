@@ -57,6 +57,14 @@ The board has three repo scopes (Mine, Review requests, All) and, inside Tern or
 
 Large boards keep the same continuous list and search across all loaded PRs: cursor movement reuses unchanged rows rather than rebuilding every PR row. Board refreshes fetch branch rules and unresolved-thread counts concurrently; initial loading still waits for GitHub's PR list and readiness data.
 
+### Images
+
+An image standing on its own line in a PR description, comment, review or review thread (`![alt](url)`, or an `<img>` / `<picture>` optionally wrapped in `<a>` or `<p align>`) is drawn in the page, at most about 100 columns wide and 30 rows tall, never larger than its own size. Until it arrives the row reads `▣ alt · loading image`; if it cannot be shown it reads `▣ alt · 404` (or `unsupported`, `timeout`, `too large`). PNG, JPEG, WebP, GIF and SVG work; SVGs are rendered on a white background (diagrams are usually authored for GitHub's light page) with your system fonts, in a worker so the UI never stalls. Images inside `<details>` appear when the details are open, collapsed one-line rows never show them, and a drawn image counts as one line toward the description's `N lines` and the 8-line cap.
+
+Drawing uses the terminal's graphics: the kitty protocol (kitty, Ghostty, WezTerm, Tern), else sixel, else half-block cells; inside tmux it falls back to half-blocks. Badges (shields.io and similar), bot buttons (`Fix in Cursor`, `Open in Web`, Devin Review, …), `P1`-style severity pills and images inline in prose are not drawn, as before.
+
+Private images go through `gh`: `github.com/<owner>/<repo>/blob/<ref>/<path>` and `raw.githubusercontent.com` URLs (the usual way a diagram committed to a private repo is embedded) are read with `gh api repos/<owner>/<repo>/contents/<path>?ref=<ref>`, and `github.com/user-attachments/assets/...` uploads are fetched with the token from `gh auth token` (sent to GitHub only, not to the storage host GitHub redirects to; held in memory, never written or logged). Other `https` images are fetched directly. Results, failures included, are cached for the session, so a broken link is not retried on every redraw.
+
 ### Keys
 
 `?` opens the same list in the UI.

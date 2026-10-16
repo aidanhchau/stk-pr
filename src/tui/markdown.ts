@@ -5,14 +5,17 @@
  *   layoutBlocks(blocks, width, opts) -> Span[][]    wrapped lines ([] = blank line)
  *
  * Supported: headings, **bold**, `code`, [text](url) -> text, fenced code, dash, star and numbered bullets (hanging indent),
- * <details><summary> -> foldable block, tables -> aligned columns, `![P1 Badge](..)` -> P1 pill.
+ * <details><summary> -> foldable block, tables -> aligned columns, `![P1 Badge](..)` -> P1 pill, an image standing alone on its line -> image block
+ * (badges, bot buttons and images inline in prose are dropped).
  */
 
 /** `author` / `rail`: a human's name and conversation rail, coloured per person by the view. */
-export type SpanStyle = "plain" | "bold" | "subhead" | "code" | "pill" | "muted" | "add" | "del" | "warn" | "link" | "author" | "rail";
+export type SpanStyle = "plain" | "bold" | "subhead" | "code" | "pill" | "muted" | "add" | "del" | "warn" | "link" | "author" | "rail" | "image";
 export interface Span {
   text: string;
   style: SpanStyle;
+  /** `style: "image"` only: the first row of a drawn image (`rows` tall, `cols` wide). Its following rows hold fill spans without this field. */
+  image?: { src: string; cols: number; rows: number };
 }
 
 export type Block =
@@ -21,6 +24,7 @@ export type Block =
   | { t: "suggestion"; lines: string[] }
   | { t: "table"; rows: string[][] }
   | { t: "details"; summary: Span[]; body: Block[] }
+  | { t: "image"; src: string; alt: string }
   | { t: "blank" };
 
 export interface Comment {
@@ -41,6 +45,16 @@ const FENCE_CLOSE = "\uE011";
 /** Prefixes a stashed fence body that came from a ```suggestion block. */
 const SUGGEST = "\uE012";
 const DIFF = "\uE013";
+/** Wraps the index of a stashed standalone image (`IMAGES`) in the text. */
+const IMG_OPEN = "\uE020";
+const IMG_CLOSE = "\uE021";
+const IMG_RE = new RegExp(`${IMG_OPEN}(\\d+)${IMG_CLOSE}`, "g");
+
+/** An image kept by `preprocess`: an http(s) source that is content, not a badge or button. */
+interface ImageRef {
+  src: string;
+  alt: string;
+}
 
 const FENCE_RE = /^[ \t]*(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)^[ \t]*\1[ \t]*$/gm;
 const TAGS = "sub|sup|div|p|br|hr|span|picture|source|img|a|b|i|strong|em|u|ul|ol|li|blockquote|h[1-6]|table|thead|tbody|tr|td|th|details|summary|kbd|center";
@@ -80,10 +94,29 @@ export function looksLikeDiff(body: string): boolean {
   return at >= 0 && lines.slice(at + 1).some((l) => /^[+-]/.test(l));
 }
 
-/** Raw markdown/HTML -> normalized markdown lines with markers for fences, details and pills. */
-function preprocess(src: string): { text: string; fences: string[] } {
+const BADGE_HOSTS = /(?:^|\.)(?:shields\.io|badgen\.net|badge\.fury\.io|codecov\.io|coveralls\.io|static\.devin\.ai|pr-comments-assets\.blacksmith\.sh|vercel\.com|netlify\.com|snyk\.io)$/i;
+
+/** Badges and bot buttons: images that are chrome, not content. They are dropped wherever they sit. */
+function isChrome(src: string, alt: string, height: number | null): boolean {
+  if (BUTTON_TEXT.test(alt.trim()) || (height !== null && height <= 48)) return true;
+  try {
+    const u = new URL(src);
+    return BADGE_HOSTS.test(u.hostname) || (u.hostname === "cursor.com" && u.pathname.startsWith("/assets/")) || /\/badge(?:\.svg|\/|$)/i.test(u.pathname);
+  } catch {
+    return true;
+  }
+}
+
+const attr = (tag: string, name: string): string | null => {
+  const m = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? "").replace(/&amp;/g, "&") : null;
+};
+
+/** Raw markdown/HTML -> normalized markdown lines with markers for fences, details, pills and images. */
+function preprocess(src: string): { text: string; fences: string[]; images: ImageRef[] } {
   let s = src.replace(/\r/g, "").replace(/\t/g, "  ");
   const fences: string[] = [];
+  const images: ImageRef[] = [];
   const stash = (body: string, info = "") => {
     const lang = info.replace(/^[`~]+/, "").trim();
     const mark = /^suggestion\b/i.test(lang) ? SUGGEST : /^(?:diff|patch)\b/i.test(lang) || looksLikeDiff(body) ? DIFF : "";
@@ -93,19 +126,29 @@ function preprocess(src: string): { text: string; fences: string[] } {
   // unterminated fence: the rest is code
   s = s.replace(/^[ \t]*(?:`{3,}|~{3,})([^\n]*)\n([\s\S]*)$/m, (_m, info: string, body: string) => stash(body, info));
   s = s.replace(/<!--[\s\S]*?-->/g, "").replace(/<!--[\s\S]*$/, "");
-  s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m, alt: string) => {
+  /** Content images become a marker; whether it stands alone is decided per line in `parseLines`. Only http(s) sources survive. */
+  const keep = (src: string | null, alt: string, height: number | null): string => {
+    if (!src || !/^https?:\/\//i.test(src) || isChrome(src, alt, height)) return "";
+    return `${IMG_OPEN}${images.push({ src, alt: alt.trim() }) - 1}${IMG_CLOSE}`;
+  };
+  s = s.replace(/\[(!\[[^\]]*\]\([^)]*\))\]\([^)]*\)/g, "$1"); // [![alt](img)](href): the image alone
+  s = s.replace(/!\[([^\]]*)\]\(([^)]*)\)/g, (_m, alt: string, dest: string) => {
     const b = /^(P\d)\b/.exec(alt.trim());
-    return b ? `${PILL_OPEN}${b[1]}${PILL_CLOSE}` : "";
+    if (b) return `${PILL_OPEN}${b[1]}${PILL_CLOSE}`;
+    return keep(/^\s*<?([^\s>]*)/.exec(dest)?.[1] || null, alt, null);
   });
-  s = s.replace(/<a\b[^>]*>(?:\s|&nbsp;|<picture[\s\S]*?<\/picture>|<img\b[^>]*>)*<\/a>/gi, "");
-  s = s.replace(/<picture[\s\S]*?<\/picture>/gi, "").replace(/<img\b[^>]*>/gi, "");
+  // <a> wrapping only pictures/images, a bare <picture>, a bare <img>
+  s = s.replace(/<a\b[^>]*>(?:\s|&nbsp;|<picture[\s\S]*?<\/picture>|<img\b[^>]*>)*<\/a>|<picture[\s\S]*?<\/picture>|<img\b[^>]*>/gi, (m) => {
+    const tags = [...m.matchAll(/<img\b[^>]*>/gi)].map((t) => t[0]);
+    return tags.map((t) => keep(attr(t, "src"), attr(t, "alt") ?? "", Number(attr(t, "height")) || null)).join(" ");
+  });
   // innermost <details> first, repeatedly
   const det = /<details\b[^>]*>((?:(?!<details\b)[\s\S])*?)<\/details>/i;
   for (let guard = 0; guard < 50 && det.test(s); guard++) {
     s = s.replace(det, (_m, inner: string) => {
       const sm = /<summary\b[^>]*>([\s\S]*?)<\/summary>/i.exec(inner);
       const rest = sm ? inner.replace(sm[0], "") : inner;
-      const summary = stripTags(sm ? sm[1]! : "Details").replace(/\s+/g, " ").trim() || "Details";
+      const summary = stripTags(sm ? sm[1]! : "Details").replace(IMG_RE, "").replace(/\s+/g, " ").trim() || "Details";
       return `\n${SUM_OPEN}${summary}${SUM_CLOSE}\n${rest}\n${DET_END}\n`;
     });
   }
@@ -116,7 +159,7 @@ function preprocess(src: string): { text: string; fences: string[] } {
     .replace(/<li\b[^>]*>/gi, "\n- ")
     .replace(/<\/?(?:b|strong)\b[^>]*>/gi, "**")
     .replace(/<\/?code\b[^>]*>/gi, "`");
-  return { text: stripTags(s), fences };
+  return { text: stripTags(s), fences, images };
 }
 
 // ---------- inline ----------
@@ -183,7 +226,7 @@ export const plain = (spans: Span[]): string => spans.map((s) => s.text).join(""
 
 const BULLET = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 
-function parseLines(lines: string[], fences: string[]): Block[] {
+function parseLines(lines: string[], fences: string[], images: ImageRef[]): Block[] {
   const blocks: Block[] = [];
   const blank = () => {
     if (blocks.length && blocks[blocks.length - 1]!.t !== "blank") blocks.push({ t: "blank" });
@@ -233,12 +276,21 @@ function parseLines(lines: string[], fences: string[]): Block[] {
       add({ t: "blank" });
       continue;
     }
+    if (line.includes(IMG_OPEN)) {
+      const refs = [...line.matchAll(IMG_RE)].map((m) => images[Number(m[1])]!);
+      line = line.replace(IMG_RE, "");
+      // an image on a line of its own is content; in prose, a table or a heading it is dropped
+      if (!line.trim()) {
+        for (const r of refs) add({ t: "image", ...r });
+        continue;
+      }
+    }
     // table: consecutive |...| rows
     if (/^\s*\|.*\|\s*$/.test(line)) {
       const rows: string[][] = [];
       i--;
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]!.replace(/^\s*(?:>\s?)+/, ""))) {
-        const cells = lines[i]!.replace(/^\s*(?:>\s?)+/, "").trim().slice(1, -1).split("|").map((c) => plain(tidy(inline(c))));
+        const cells = lines[i]!.replace(/^\s*(?:>\s?)+/, "").replace(IMG_RE, "").trim().slice(1, -1).split("|").map((c) => plain(tidy(inline(c))));
         i++;
         if (cells.every((c) => /^:?-{2,}:?$/.test(c) || c === "")) continue;
         rows.push(cells);
@@ -304,8 +356,8 @@ export const isNoise = (c: Comment): boolean =>
   /^(Stale( Bugbot)? comment|Newer findings are available|You have reached your Codex usage limits|💡 Codex Review$)/i.test(c.title);
 
 function parseUncached(body: string): Comment {
-  const { text, fences } = preprocess(body);
-  const blocks = parseLines(text.split("\n"), fences);
+  const { text, fences, images } = preprocess(body);
+  const blocks = parseLines(text.split("\n"), fences, images);
   const idx = blocks.findIndex((b) => b.t === "p" || b.t === "details");
   let title = "";
   let badge: string | null = null;
@@ -321,6 +373,8 @@ function parseUncached(body: string): Comment {
     }
   } else if (first?.t === "details") {
     title = plain(first.summary);
+  } else if (blocks[0]?.t === "image") {
+    title = `▣ ${blocks[0].alt || "image"}`;
   }
   return { title, badge, blocks };
 }
@@ -458,6 +512,45 @@ export interface LayoutOpts {
   previews?: boolean;
   /** Max prose width; defaults to `PROSE_MEASURE`. */
   measure?: number;
+  /** Where images are drawn. Without it an image is one muted `▣ alt` line (previews, search text). */
+  images?: ImageEnv;
+}
+
+/** What the layout needs to know about an image to reserve rows for it; structurally the `ImageState` of `../images`. */
+export interface ImageEnv {
+  lookup(src: string): { status: "loading" } | { status: "error"; reason: string } | { status: "ready"; width: number; height: number };
+  /** Terminal cell size in pixels. */
+  cell: { w: number; h: number };
+}
+
+export const MAX_IMAGE_ROWS = 30;
+export const MAX_IMAGE_COLS = 100;
+
+/** Cells an image of `width`x`height` logical px occupies: at most `maxCols` wide, never upscaled past its own size, `maxRows` tall. */
+export function fitImage(width: number, height: number, maxCols: number, cell: { w: number; h: number }, maxRows = MAX_IMAGE_ROWS): { cols: number; rows: number } {
+  const heightFor = (cols: number) => Math.max(1, Math.round((cols * cell.w * height) / (width * cell.h)));
+  let cols = Math.max(1, Math.min(maxCols, MAX_IMAGE_COLS, Math.floor(width / cell.w)));
+  if (heightFor(cols) > maxRows) cols = Math.max(1, Math.floor((maxRows * cell.h * width) / (height * cell.w)));
+  return { cols, rows: Math.min(maxRows, heightFor(cols)) };
+}
+
+/** The drawn image a layout row starts, with the columns of indent before it; null for any other row. */
+export function imageStart(row: Span[]): { image: NonNullable<Span["image"]>; indent: number } | null {
+  const at = row.findIndex((s) => s.image);
+  return at < 0 ? null : { image: row[at]!.image!, indent: row.slice(0, at).reduce((n, s) => n + width(s.text), 0) };
+}
+
+/** Rows below an image's first row that the image covers. */
+export const isImageFill = (row: Span[]): boolean => row.some((s) => s.style === "image" && !s.image);
+
+/** Layout rows grouped into display lines: a drawn image and its fill rows count as one line (for caps and `N lines`). */
+export function lineUnits(rows: Span[][]): Span[][][] {
+  const out: Span[][][] = [];
+  for (const r of rows) {
+    if (isImageFill(r) && out.length) out[out.length - 1]!.push(r);
+    else out.push([r]);
+  }
+  return out;
 }
 
 function codeLines(text: string, w: number, diff = false): Span[][] {
@@ -531,6 +624,21 @@ export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span
           const text = r.map((c, ci) => c + " ".repeat(ws[ci]! - width(c))).join("  ").trimEnd();
           out.push([{ text, style: ri === 0 && b.rows.length > 1 ? "bold" : "plain" }]);
         });
+        break;
+      }
+      case "image": {
+        blank();
+        const label = b.alt || "image";
+        const meta = opts.images?.lookup(b.src);
+        if (opts.images && meta?.status === "ready") {
+          const { cols, rows } = fitImage(meta.width, meta.height, w, opts.images.cell);
+          out.push([{ text: label, style: "image", image: { src: b.src, cols, rows } }]);
+          for (let r = 1; r < rows; r++) out.push([{ text: "", style: "image" }]);
+        } else {
+          const note = meta?.status === "loading" ? " · loading image" : meta?.status === "error" ? ` · ${meta.reason}` : "";
+          out.push(...wrapSpans([{ text: `▣ ${label}${note}`, style: "muted" }], w));
+        }
+        blank();
         break;
       }
       case "details": {

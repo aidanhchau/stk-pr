@@ -25,3 +25,14 @@ export const exec: Exec = async (argv, opts = {}) => {
     return { code: 127, stdout: "", stderr: e instanceof Error ? e.message : String(e) };
   }
 };
+
+/** Like `exec`, but stdout is raw bytes (image downloads); same failure contract. */
+export async function execBytes(argv: readonly string[], timeoutMs?: number): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
+  try {
+    const proc = Bun.spawn([...argv], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: timeoutMs });
+    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).bytes(), new Response(proc.stderr).text(), proc.exited]);
+    return { code, stdout, stderr };
+  } catch (e) {
+    return { code: 127, stdout: new Uint8Array(), stderr: e instanceof Error ? e.message : String(e) };
+  }
+}

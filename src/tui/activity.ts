@@ -1,6 +1,6 @@
 /**
  * Activity: PR-level comments, reviews and review threads as one chronological list.
- * Pure model + row layout used by the TUI (rows are 1 cell tall); no React, no theme.
+ * Pure model + row layout used by the TUI (rows are 1 cell tall, except `image` rows: see `rowsHeight`); no React, no theme.
  *
  * Spacing invariant: entries are stacked with NO rows between them, collapsed or expanded. Blank rows exist only inside an expanded
  * thread (between replies, before the trail), so toggling an entry changes only that entry's own rows.
@@ -10,7 +10,7 @@
  */
 import type { ReviewThread } from "../github";
 import type { ConversationEntry } from "../types";
-import { clipSpans, findingsSpan, isNoise, layoutBlocks, parseComment, preview, shortAuthor, shortPath, suggestionTarget, threadFix, threadTrail, withoutTitle, type Span } from "./markdown";
+import { clipSpans, findingsSpan, imageStart, isNoise, layoutBlocks, lineUnits, parseComment, preview, shortAuthor, shortPath, suggestionTarget, threadFix, threadTrail, withoutTitle, type ImageEnv, type Span } from "./markdown";
 
 // ---------- levels + rows ----------
 
@@ -19,7 +19,13 @@ export type RL =
   | { t: "head"; left: Span[]; right?: string; muted?: boolean }
   | { t: "text"; spans: Span[]; muted?: boolean; rail?: boolean; indent?: number }
   | { t: "gap"; rail?: boolean; indent?: number }
+  /** A drawn image, `rows` cells tall. `indent`: columns before the image; `railIndent`: columns before the rail (see `indentRow`). */
+  | { t: "image"; src: string; cols: number; rows: number; indent: number; rail?: boolean; railIndent?: number }
   | { t: "input" };
+
+/** Cells a row occupies. */
+export const rowHeight = (r: RL): number => (r.t === "image" ? r.rows : 1);
+export const rowsHeight = (rows: RL[]): number => rows.reduce((n, r) => n + rowHeight(r), 0);
 
 /** 0 = one-line preview, 1 = capped body, 2 = full body with `<details>` open. */
 export type Level = 0 | 1 | 2;
@@ -196,13 +202,18 @@ export function activityMeta(c: ActivityCounts & { lowHidden?: boolean; botsHidd
 
 // ---------- rows ----------
 
-/** Body lines at `level`; level 1 caps at BODY_CAP with a trailing "… N more lines". */
-export function bodyRows(body: string, level: Level, w: number, cap = BODY_CAP, removed?: string[], dropTitle = false): RL[] {
+/** Body lines at `level`; level 1 caps at BODY_CAP with a trailing "… N more lines". A drawn image counts as one line however tall it is. */
+export function bodyRows(body: string, level: Level, w: number, cap = BODY_CAP, removed?: string[], dropTitle = false, images?: ImageEnv): RL[] {
   const blocks = parseComment(body).blocks;
-  const lines = layoutBlocks(dropTitle ? withoutTitle(blocks) : blocks, w, { details: level === 2, removed });
-  const shown = level === 2 ? lines : lines.slice(0, cap);
-  const rows: RL[] = shown.map((spans) => (spans.length ? { t: "text", spans } : { t: "gap" }));
-  if (shown.length < lines.length) rows.push({ t: "text", spans: [{ text: `${ELLIPSIS} ${lines.length - shown.length} more lines`, style: "muted" }] });
+  const units = lineUnits(layoutBlocks(dropTitle ? withoutTitle(blocks) : blocks, w, { details: level === 2, removed, images }));
+  const shown = level === 2 ? units : units.slice(0, cap);
+  const rows: RL[] = shown.flatMap((unit): RL[] => {
+    const img = imageStart(unit[0]!);
+    if (img) return [{ t: "image", ...img.image, indent: img.indent }];
+    const spans = unit[0]!;
+    return [spans.length ? { t: "text", spans } : { t: "gap" }];
+  });
+  if (shown.length < units.length) rows.push({ t: "text", spans: [{ text: `${ELLIPSIS} ${units.length - shown.length} more lines`, style: "muted" }] });
   return rows;
 }
 
@@ -219,12 +230,15 @@ export interface RowCtx {
   prAuthor: string;
   /** `4h` style age of an ISO time. */
   age: (iso: string) => string;
+  /** Draws images in bodies; without it they are one `▣ alt` line. */
+  images?: ImageEnv;
 }
 
 const pad = (n: number): Span[] => (n ? [{ text: " ".repeat(n), style: "plain" }] : []);
 /** Shift a row right by `n` columns. A railed row moves its rail too (`indent` pads before it), so nested rails stay under their head. */
 const indentRow = (r: RL, n: number): RL => {
   if (!n) return r;
+  if (r.t === "image") return r.rail ? { ...r, railIndent: (r.railIndent ?? 0) + n } : { ...r, indent: r.indent + n };
   if ((r.t === "text" || r.t === "gap") && r.rail) return { ...r, indent: (r.indent ?? 0) + n };
   return r.t === "head" ? { ...r, left: [...pad(n), ...r.left] } : r.t === "text" ? { ...r, spans: [...pad(n), ...r.spans] } : r;
 };
@@ -248,10 +262,10 @@ function convoHead(e: ConversationEntry, level: Level, x: RowCtx): RL {
 /** An expanded body carries a rail: the author's colour for a human, faint for a bot (the block's `who`). */
 export function convoRows(e: ConversationEntry, level: Level, x: RowCtx): RL[] {
   if (level === 0) return [convoHead(e, 0, x)];
-  return [convoHead(e, level, x), ...bodyRows(e.body, level, x.w).map(withRail)];
+  return [convoHead(e, level, x), ...bodyRows(e.body, level, x.w, undefined, undefined, false, x.images).map(withRail)];
 }
 
-const withRail = (r: RL): RL => (r.t === "text" || r.t === "gap" ? { ...r, rail: true } : r);
+const withRail = (r: RL): RL => (r.t === "text" || r.t === "gap" || r.t === "image" ? { ...r, rail: true } : r);
 
 const locOf = (th: ReviewThread): string => (th.path ? `${th.path}${th.line ? `:${th.line}` : ""}` : "");
 
@@ -296,7 +310,7 @@ export function threadRows(th: ReviewThread, level: Level, x: RowCtx, o: { neste
     if (i > 0) rows.push({ t: "gap" });
     const name: Span = c.isBot ? { text: `${shortAuthor(c.author)} bot`, style: "muted" } : { text: shortAuthor(c.author), style: "bold" };
     rows.push({ t: "text", spans: [...pad(ind), name, { text: ` ${SEP} ${x.age(c.createdAt)}`, style: "muted" }] });
-    for (const r of bodyRows(c.body, level, bw, undefined, removed, i === 0)) rows.push(indentRow(r, ind));
+    for (const r of bodyRows(c.body, level, bw, undefined, removed, i === 0, x.images)) rows.push(indentRow(r, ind));
   });
   rows.push({ t: "gap" }, trailRow(th, x, ind));
   if (o.replying) rows.push({ t: "gap" }, { t: "input" });
