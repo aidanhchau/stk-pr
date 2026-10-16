@@ -83,7 +83,7 @@ async function renderApp(screen: AppState["screen"], cursor: string | null) {
 }
 
 test("⌘⇧C on the PR page copies that PR's URL with the copy-url toast and opens no sheet", async () => {
-  const { s, store, copied } = await renderApp({ kind: "pr", repo, n: 1 }, null);
+  const { s, store, copied } = await renderApp({ kind: "pr", repo, n: 1, scope: "mine" }, null);
   s.mockInput.pressKey("c", { super: true, shift: true });
   await s.renderOnce();
   expect(copied()).toEqual(["https://github.com/o/r/pull/1"]);
@@ -99,7 +99,7 @@ test("⌘⇧C on the board copies the selected row's PR URL", async () => {
 });
 
 test("plain c / C and ⌘C do not copy", async () => {
-  const { s, copied } = await renderApp({ kind: "pr", repo, n: 1 }, null);
+  const { s, copied } = await renderApp({ kind: "pr", repo, n: 1, scope: "mine" }, null);
   s.mockInput.pressKey("c");
   s.mockInput.pressKey("c", { super: true });
   s.mockInput.pressKey("c", { shift: true });
@@ -108,7 +108,7 @@ test("plain c / C and ⌘C do not copy", async () => {
 });
 
 test("⌘⇧C does nothing special while the search input is focused", async () => {
-  const { s, copied } = await renderApp({ kind: "pr", repo, n: 1 }, null);
+  const { s, copied } = await renderApp({ kind: "pr", repo, n: 1, scope: "mine" }, null);
   s.mockInput.pressKey("/");
   await s.renderOnce();
   s.mockInput.pressKey("c", { super: true, shift: true });
