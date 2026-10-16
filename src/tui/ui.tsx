@@ -705,13 +705,14 @@ export function Sheet({ title, meta, width = 72, children }: { title: string; me
 
 /**
  * Per-screen key handler. Runs only while no sheet is open and no text input has focus, so screens
- * never need to gate themselves. (Sheets use plain `useKeyboard`; they only mount while open.)
+ * never need to gate themselves. ⌘ chords (kitty `super`) are app-level (see app.tsx) and never reach screens, which
+ * would otherwise read ⌘⇧C as `C`. (Sheets use plain `useKeyboard`; they only mount while open.)
  */
 export function useScreenKeys(handler: (key: KeyEvent) => void): void {
   const store = useStoreInstance();
   useKeyboard((key) => {
     const s = store.getState();
-    if (s.sheet || s.inputFocused) return;
+    if (s.sheet || s.inputFocused || key.super) return;
     handler(key);
   });
 }

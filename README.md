@@ -77,6 +77,7 @@ Everywhere:
 | `r` | Refresh |
 | `:`, `ctrl-k` | Go to PR / run a command. Type a title, `#123`, `owner/repo#9` or a PR URL; or a command (`merge`, `approve`, `request changes`, `comment`, `close pr`, `reopen pr`, `ready for review`, `convert to draft`, `rerun failed checks`, `copy branch`, `copy url`, …) that acts on the PR page's PR or the selected board row. Close and convert-to-draft ask first. Searches loaded PRs only; the last row searches GitHub on request. |
 | `/`, `n`, `N` | Search this page (line at the bottom), next / previous match |
+| `⌘⇧C` | Copy the PR URL (the PR page's PR, or the selected board row's); same as the `copy url` command. Needs a terminal that reports ⌘ (kitty keyboard protocol). |
 | `q` | Quit |
 | `esc` | Close sheet / back |
 | `h`, `backspace` | Back (PR screen) |

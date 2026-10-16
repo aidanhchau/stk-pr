@@ -1003,6 +1003,7 @@ const HELP: { label: string; keys: [string, string][] }[] = [
       [":  ctrl-k", "go to PR or run a command (:merge :approve :close …)"],
       ["/", "search this page"],
       ["n N", "next / previous match"],
+      ["⌘⇧C", "copy the PR URL (page or selected row)"],
       ["?", "this help"],
       ["r", "refresh"],
       ["q", "quit"],
