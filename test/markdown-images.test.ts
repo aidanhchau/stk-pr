@@ -72,7 +72,7 @@ describe("image rows", () => {
 
   test("a ready image is one row carrying its height, between blank lines", () => {
     const r = rows(env("ready"));
-    expect(r.map((x) => (x.t === "image" ? `image ${x.cols}x${x.rows}` : plain(x.spans)))).toEqual(["intro", "", "image 80x15", "", "outro"]);
+    expect(r.map((x) => (x.t === "image" ? `image ${x.cols}x${x.rows}` : x.t === "text" ? plain(x.spans) : "images"))).toEqual(["intro", "", "image 80x15", "", "outro"]);
   });
 
   test("loading and failed images are one muted line that names the image to request", () => {
@@ -108,5 +108,94 @@ describe("image rows", () => {
     requested.length = 0;
     bodyRows(`![early](https://x.test/early.png)\n\nx`, 1, 80, 4, undefined, false, env("loading"));
     expect(requested).toEqual(["https://x.test/early.png"]);
+  });
+});
+
+describe("images in tables", () => {
+  const A = "https://x.test/a.png";
+  const B = "https://x.test/b.png";
+  const table = `| Collapsed | Expanded |\n|---|---|\n| ![card-collapsed](${A}) | ![card-expanded](${B}) |`;
+  const env = (status: "ready" | "loading", requested: string[] = []): ImageEnv => ({
+    cell: { w: 10, h: 20 },
+    request: (src) => void requested.push(src),
+    lookup: () => (status === "ready" ? { status, width: 800, height: 400 } : { status }),
+  });
+  const rows = (body: string, w: number, e?: ImageEnv) => layoutRows(parseComment(body).blocks, w, { details: true, images: e });
+  const shape = (r: ReturnType<typeof rows>[number]) => (r.t === "text" ? plain(r.spans) : r.t === "image" ? `image ${r.cols}x${r.rows}` : `images ${r.items.map((i) => `${i.cols}x${i.rows}@${i.x}`).join(" ")} h${r.rows}`);
+
+  test("cell images are kept per cell, the header is the caption source, the separator row is not mistaken for an image row", () => {
+    const [t] = parseComment(table).blocks;
+    expect(t).toMatchObject({ t: "table", rows: [["Collapsed", "Expanded"], ["", ""]] });
+    expect(t?.t === "table" && t.images).toEqual([[[], []], [[{ src: A, alt: "card-collapsed" }], [{ src: B, alt: "card-expanded" }]]]);
+  });
+
+  test("a text-only table is unchanged and carries no image grid", () => {
+    const [t] = parseComment("| a | b |\n|---|---|\n| 1 | 2 |").blocks;
+    expect(t).toEqual({ t: "table", rows: [["a", "b"], ["1", "2"]] });
+  });
+
+  test("badges in table cells are still stripped", () => {
+    const [t] = parseComment(`| a | b |\n|---|---|\n| ![build](https://img.shields.io/badge/build-passing-green) | 2 |`).blocks;
+    expect(t).toEqual({ t: "table", rows: [["a", "b"], ["", "2"]] });
+  });
+
+  test("an image-only row is not dropped as a separator", () => {
+    expect(parseComment(`| ![a](${A}) | ![b](${B}) |\n|---|---|`).blocks[0]).toMatchObject({ t: "table", rows: [["", ""]] });
+  });
+
+  test("ready images with room go side by side under their header captions, in one row", () => {
+    const r = rows(table, 100, env("ready"));
+    expect(r.map(shape)).toEqual(["images 49x12@0 49x12@51 h13"]);
+    const g = r[0]!;
+    expect(g.t === "images" && g.items.map((i) => i.caption)).toEqual(["Collapsed", "Expanded"]);
+  });
+
+  test("each image needs 40 columns: 81 columns stack, 82 sit side by side", () => {
+    expect(rows(table, 81, env("ready")).map(shape)).toEqual(["Collapsed", "image 80x20", "", "Expanded", "image 80x20"]);
+    expect(rows(table, 82, env("ready")).map((x) => x.t)).toEqual(["images"]);
+  });
+
+  test("three images need 3x40 columns and two gaps", () => {
+    const three = `| a | b | c |\n|---|---|---|\n| ![1](${A}) | ![2](${B}) | ![3](https://x.test/c.png) |`;
+    expect(rows(three, 123, env("ready")).map((x) => x.t)).toEqual(["text", "image", "text", "text", "image", "text", "text", "image"]);
+    expect(rows(three, 124, env("ready")).map((x) => x.t)).toEqual(["images"]);
+  });
+
+  test("images still loading stack as `▣ alt` lines under their captions, naming what to request", () => {
+    const r = rows(table, 100, env("loading"));
+    expect(r.map(shape)).toEqual(["Collapsed", "▣ card-collapsed · loading image", "", "Expanded", "▣ card-expanded · loading image"]);
+    expect(r.filter((x) => x.t === "text" && x.image).map((x) => x.t === "text" && x.image)).toEqual([A, B]);
+  });
+
+  test("without an image environment it is text: captions and `▣ alt`", () => {
+    expect(layoutBlocks(parseComment(table).blocks, 100, { details: true }).map(plain)).toEqual(["Collapsed", "▣ card-collapsed", "", "Expanded", "▣ card-expanded"]);
+  });
+
+  test("text cells keep their text, labelled by the header, above the row's images", () => {
+    const mixed = `| Name | Shot |\n|---|---|\n| Alpha | ![a](${A}) |\n| Beta | ![b](${B}) |`;
+    expect(rows(mixed, 100, env("ready")).map(shape)).toEqual(["Name: Alpha", "Shot", "image 80x20", "", "Name: Beta", "Shot", "image 80x20"]);
+  });
+
+  test("a single image cell with a caption is stacked like a standalone image", () => {
+    expect(rows(`| Before |\n|---|\n| ![a](${A}) |`, 100, env("ready")).map(shape)).toEqual(["Before", "image 80x20"]);
+  });
+
+  test("details indent side-by-side rows", () => {
+    const r = rows(`<details><summary>s</summary>\n\n${table}\n\n</details>`, 100, env("ready"));
+    expect(r.find((x) => x.t === "images")).toMatchObject({ indent: 2 });
+  });
+
+  test("bodyRows: height counts the group once; the cap hint names hidden images; only shown loading images are requested", () => {
+    const out = bodyRows(`${table}\n\nx`, 1, 100, 6, undefined, false, env("ready"));
+    expect(rowsHeight(out)).toBe(13 + 2);
+    const body = `${Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n\n")}\n\n${table}`;
+    const hint = (e: ImageEnv) => {
+      const o = bodyRows(body, 1, 100, 4, undefined, false, e).at(-1);
+      return o?.t === "text" ? plain(o.spans) : "";
+    };
+    expect(hint(env("ready"))).toMatch(/more lines, 2 images$/);
+    const requested: string[] = [];
+    expect(hint(env("loading", requested))).toMatch(/more lines, 2 images$/);
+    expect(requested).toEqual([]);
   });
 });
