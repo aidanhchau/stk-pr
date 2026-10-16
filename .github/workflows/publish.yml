@@ -1,0 +1,73 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the v<version> tag
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Compare version with npm
+        id: version
+        run: |
+          local_version=$(node -p "require('./package.json').version")
+          published=$(npm view stk-pr version 2>/dev/null || true)
+          # publish: newer than npm; current: already on npm; older: behind npm
+          state=$(LOCAL="$local_version" PUBLISHED="${published:-0.0.0}" bun -e '
+            const o = Bun.semver.order(process.env.LOCAL, process.env.PUBLISHED);
+            console.log(o > 0 ? "publish" : o === 0 ? "current" : "older");
+          ')
+          echo "version=$local_version" >> "$GITHUB_OUTPUT"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" != publish ]; then
+            echo "::notice::stk-pr $local_version is not newer than npm's ${published:-none}; skipping publish."
+          fi
+
+      - name: Publish to npm
+        if: steps.version.outputs.state == 'publish'
+        run: |
+          # Trusted publishing needs npm >= 11.5.1.
+          npm install -g npm@^11.5.1
+          npm publish --provenance --access public
+
+      # Also runs when the version is already on npm, so a rerun finishes a
+      # release whose tag push failed.
+      - name: Tag release
+        if: steps.version.outputs.state != 'older'
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          remote=$(git ls-remote origin "refs/tags/$tag" | cut -f1)
+          if [ -z "$remote" ]; then
+            git tag "$tag"
+            git push origin "$tag"
+          elif [ "$remote" != "$(git rev-parse HEAD)" ]; then
+            echo "::warning::$tag already exists at $remote, not HEAD; leaving it."
+          fi
