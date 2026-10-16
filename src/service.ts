@@ -7,6 +7,7 @@ import type { PaletteItem } from "./fuzzy";
 import { GH_ENV, formatGhOutput, planGh, type GhResult } from "./ghproxy";
 import { listWorktrees, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
 import { behindText, preflightRestack, restackAndPush, type RestackInput } from "./restack";
+import { provenanceKey } from "./provenance";
 import { commitSubjects, currentBranch, localBranches, nearestParent, pushBranch, pushEmptyCommit, pushKind, RETRIGGER_MESSAGE, type PushKind } from "./branches";
 import {
   closePr,
@@ -742,7 +743,8 @@ export async function stackMerge(
     // A rebase can reset checks/reviews and split a formerly atomic clean group into individual bypass merges.
     const bottoms = selected.filter((p) => !firstIncludes.includes(p.number));
     try {
-      await preflightRestack(ctx.exec, requireRoot(ctx, "rebase a stack"), restackInput(first.trunk, remaining, stack.prs, knownHeads));
+      const root = requireRoot(ctx, "rebase a stack");
+      await preflightRestack(ctx.exec, root, restackInput(first.trunk, remaining, stack.prs, knownHeads, provenanceKey(ctx.slug, root)));
     } catch (e) {
       const failed: StepResult = { step: { kind: "rebase-stack", pr: bottoms[0]!.number }, ok: false, detail: e instanceof Error ? e.message : String(e) };
       // the rebase runs after the first merge lands, so that is where it sits in the plan
@@ -844,7 +846,7 @@ export interface RebaseStackResult {
 }
 
 /** What the restack needs from a stack read: the open members bottom-up, and what the bottom one sits on. */
-function restackInput(trunk: string, open: PullRequest[], all: PullRequest[], knownHeads?: Record<string, string[]>): RestackInput {
+function restackInput(trunk: string, open: PullRequest[], all: PullRequest[], knownHeads?: Record<string, string[]>, key?: string): RestackInput {
   const bottom = open[0]!;
   // a squash merge leaves the merged PR's commits in the bottom's history: its head SHA is where the bottom's own commits start
   const below = all.find((p) => p.number !== bottom.number && p.headRef === bottom.baseRef);
@@ -854,6 +856,7 @@ function restackInput(trunk: string, open: PullRequest[], all: PullRequest[], kn
     mergedBaseSha: below?.headSha ?? null,
     baseRef: bottom.baseRef,
     ...(knownHeads ? { knownHeads } : {}),
+    ...(key ? { provenanceKey: key } : {}),
   };
 }
 
@@ -869,7 +872,7 @@ export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: s
   const pr = detail?.members.find((m) => m.pr.number === n)?.pr;
   if (!detail || !pr || pr.state !== "OPEN") throw new StkError(`PR #${n} is not an open member of a GitHub stack`, "usage");
   const open = detail.members.filter((m) => m.pr.state === "OPEN").map((m) => m.pr);
-  const r = await restackAndPush(ctx.exec, root, restackInput(detail.trunk, open, detail.members.map((m) => m.pr), opts.knownHeads), opts.onStep);
+  const r = await restackAndPush(ctx.exec, root, restackInput(detail.trunk, open, detail.members.map((m) => m.pr), opts.knownHeads, provenanceKey(ctx.slug, root)), opts.onStep);
   // a run of several restacks leaves local branches at their old tips on purpose: remember those heads so the next one does not take them for unpushed work
   if (opts.knownHeads) {
     for (const p of open) {

@@ -6,10 +6,11 @@
  * it bottom-up, and the new tips are pushed atomically with `--force-with-lease` against the heads the stack was read at.
  * The user's worktrees, branches and stashes are never touched.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { git, gitOk, listWorktrees, remoteSha, resolveWorktree, worktreeForBranch } from "./git";
+import { loadProvenance, recordProvenance } from "./provenance";
 import { StkError, type Exec } from "./types";
 
 /** An open stack member as the stack was read: its remote head is what the rebase starts from and the push is leased against. */
@@ -31,6 +32,8 @@ export interface RestackInput {
   baseRef: string;
   /** Heads these branches had on origin before earlier restacks of the same run: local tips at or below them are published, not unpushed work. */
   knownHeads?: Record<string, string[]>;
+  /** Repo key (see `provenanceKey`): heads replaced by a restack are remembered under it, and later preflights trust them. */
+  provenanceKey?: string;
 }
 
 /** A local checkout of a member's branch that is now behind origin. */
@@ -79,6 +82,7 @@ async function fetchRefs(exec: Exec, root: string, branches: string[]): Promise<
 export async function preflightRestack(exec: Exec, root: string, input: RestackInput): Promise<void> {
   await fetchRefs(exec, root, [input.trunk, ...input.members.map((m) => m.branch), ...(input.mergedBaseSha ? [] : [input.baseRef])]);
   const worktrees = await listWorktrees(exec, root);
+  const provenance = input.provenanceKey ? loadProvenance(input.provenanceKey) : {};
   for (const [i, m] of input.members.entries()) {
     const remote = await revParse(exec, root, remoteRef(m.branch));
     if (remote !== m.headSha) {
@@ -95,22 +99,59 @@ export async function preflightRestack(exec: Exec, root: string, input: RestackI
     }
     const local = await revParse(exec, root, `refs/heads/${m.branch}`);
     if (local === null || local === m.headSha) continue;
-    // a local tip that is (an ancestor of) a head this branch had on origin is published history, not unpushed work
-    let published = false;
-    for (const tip of [m.headSha, ...(input.knownHeads?.[m.branch] ?? [])]) {
-      if ((await git(exec, root, ["merge-base", "--is-ancestor", local, tip])).code === 0) {
-        published = true;
-        break;
-      }
-    }
-    if (!published) {
+    // a local tip that is (an ancestor of) the origin head is published history, not unpushed work
+    if ((await git(exec, root, ["merge-base", "--is-ancestor", local, m.headSha])).code === 0) continue;
+    const unpublished = await unpublishedCommits(exec, root, input, m, local, provenance[m.branch] ?? []);
+    if (unpublished !== 0) {
       const wt = worktreeForBranch(worktrees, m.branch);
+      const count = unpublished === null ? "" : `${unpublished} unpublished, `;
       throw new StkError(
-        `${wt ? `worktree ${wt.path}` : "this repo"} has unpushed commits on ${m.branch} (local ${local.slice(0, 9)}, origin ${m.headSha.slice(0, 9)}); push or move them first, rebasing #${m.number} would orphan them`,
+        `${wt ? `worktree ${wt.path}` : "this repo"} has unpushed commits on ${m.branch} (${count}local ${local.slice(0, 9)}, origin ${m.headSha.slice(0, 9)}); push or move them first, rebasing #${m.number} would orphan them`,
         "diverged",
       );
     }
   }
+}
+
+/**
+ * Every value the remote-tracking ref has had according to its reflog. `git reflog` prints only the new value of each
+ * entry, which misses the one a first fetch overwrote, so the log file's old values are read as well.
+ */
+async function reflogHeads(exec: Exec, root: string, ref: string): Promise<string[]> {
+  const shown = await git(exec, root, ["reflog", "--format=%H", ref]);
+  const heads = shown.code === 0 ? shown.stdout.split("\n").map((s) => s.trim()) : [];
+  const path = await git(exec, root, ["rev-parse", "--path-format=absolute", "--git-path", `logs/${ref}`]);
+  if (path.code === 0 && path.stdout.trim()) {
+    try {
+      for (const line of readFileSync(path.stdout.trim(), "utf8").split("\n")) heads.push(...line.split(/\s+/, 2));
+    } catch {
+      /* no log: nothing more to learn */
+    }
+  }
+  return heads;
+}
+
+/**
+ * How many commits of the local branch are not verifiably published, or `null` when that cannot be told. Only evidence clears
+ * a commit: reachable from a head this branch had on origin (this run's `knownHeads`, the persisted provenance of earlier
+ * jobs, or the remote-tracking ref's reflog), or carrying a patch the origin branch already has (`git cherry`).
+ */
+async function unpublishedCommits(exec: Exec, root: string, input: RestackInput, m: RestackMember, local: string, persisted: string[]): Promise<number | null> {
+  const candidates = [...new Set([...(input.knownHeads?.[m.branch] ?? []), ...persisted, ...(await reflogHeads(exec, root, remoteRef(m.branch)))])];
+  const tips: string[] = [m.headSha];
+  for (const sha of candidates) {
+    if (/^[0-9a-f]{40,64}$/.test(sha) && sha !== m.headSha && (await revParse(exec, root, `${sha}^{commit}`))) tips.push(sha);
+  }
+  const rest = await git(exec, root, ["rev-list", local, "--not", ...tips]);
+  if (rest.code !== 0) return null;
+  const left = rest.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (left.length === 0) return 0;
+  // what is left may still have been published under other hashes (rebased and pushed by someone, or by another clone)
+  const merges = await git(exec, root, ["rev-list", "--merges", local, "--not", ...tips]);
+  const cherry = await git(exec, root, ["cherry", remoteRef(m.branch), local]);
+  if (merges.code !== 0 || merges.stdout.trim() || cherry.code !== 0) return left.length;
+  const matched = cherry.stdout.split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2).trim());
+  return left.filter((sha) => !matched.includes(sha)).length;
 }
 
 async function conflictedFiles(exec: Exec, cwd: string): Promise<string[]> {
@@ -187,6 +228,8 @@ export async function restackAndPush(exec: Exec, root: string, input: RestackInp
     const remote = await remoteSha(exec, root, c.member.branch);
     if (remote !== c.sha) throw new StkError(`after the push, origin/${c.member.branch} is ${remote ?? "missing"} but the rebased head is ${c.sha}`, "lease-rejected");
   }
+  // the heads just replaced are published history: remember them for later jobs (see provenance.ts)
+  if (input.provenanceKey) recordProvenance(input.provenanceKey, changed.map((c) => ({ branch: c.member.branch, sha: c.member.headSha })));
   const worktrees = await listWorktrees(exec, root);
   const behind: BehindCheckout[] = [];
   for (const c of changed) {

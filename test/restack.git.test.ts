@@ -398,8 +398,13 @@ describe("rebaseStack hardening", () => {
     await commitFile(seed, "f102.txt", "102\n", "squash b102 (#102)");
     await git(seed, "push", "-q", "origin", "main");
 
-    // without the run's memory the stale local b103 looks like unpublished work
+    // without the run's memory, persisted provenance or reflog evidence the stale local b103 looks like unpublished work
+    const savedState = process.env.STK_STATE_DIR;
+    process.env.STK_STATE_DIR = join(base, "empty-state");
+    rmSync(join(clone, ".git", "logs"), { recursive: true, force: true });
     const stale = await errorOf(rebaseStack(ctxWith(afterFirst, { open: [103] }), 103));
+    if (savedState === undefined) delete process.env.STK_STATE_DIR;
+    else process.env.STK_STATE_DIR = savedState;
     expect(stale.code).toBe("diverged");
 
     const r = await rebaseStack(ctxWith(afterFirst, { open: [103] }), 103, { knownHeads });
@@ -465,5 +470,130 @@ describe("restackAndPush / preflightRestack directly", () => {
     await preflightRestack(realExec, clone, inp);
     expect(await allHeads()).toEqual(old);
     expect(existsSync(join(clone, ".git"))).toBe(true);
+  });
+});
+
+describe("published-tip provenance across jobs", () => {
+  let savedState: string | undefined;
+  beforeEach(() => {
+    savedState = process.env.STK_STATE_DIR;
+  });
+  afterEach(() => {
+    if (savedState === undefined) delete process.env.STK_STATE_DIR;
+    else process.env.STK_STATE_DIR = savedState;
+  });
+
+  const stateFile = () => join(process.env.STK_STATE_DIR!, "restack-provenance.json");
+
+  /** Job 1: restack #102/#103 (local branches present, left at their old tips); then #102 lands on main. Returns the heads job 2 reads. */
+  async function firstJob() {
+    await build();
+    process.env.STK_STATE_DIR = join(base, "state");
+    const old = await allHeads();
+    await git(clone, "branch", "b102", old.b102);
+    await git(clone, "branch", "b103", old.b103);
+    await rebaseStack(ctxWith(old), 102);
+    const afterFirst = await allHeads();
+    expect(afterFirst.b103).not.toBe(old.b103);
+    await git(seed, "checkout", "-q", "main");
+    await git(seed, "pull", "-q", "origin", "main");
+    await commitFile(seed, "f102.txt", "102\n", "squash b102 (#102)");
+    await git(seed, "push", "-q", "origin", "main");
+    return { old, afterFirst };
+  }
+
+  test("a second job succeeds on the untouched old local tips, from persisted provenance alone (no knownHeads)", async () => {
+    const { old, afterFirst } = await firstJob();
+    const saved = JSON.parse(readFileSync(stateFile(), "utf8")) as { repos: Record<string, Record<string, { sha: string }[]>> };
+    expect(Object.values(saved.repos)[0]!.b103!.map((h) => h.sha)).toEqual([old.b103]);
+
+    const r = await rebaseStack(ctxWith(afterFirst, { open: [103] }), 103);
+
+    expect(r.prs).toEqual([103]);
+    expect(await ahead("main", "b103")).toBe(1);
+    expect(await git(clone, "rev-parse", "refs/heads/b103")).toBe(old.b103);
+    // and the second job's own replaced head is remembered too
+    const again = JSON.parse(readFileSync(stateFile(), "utf8")) as typeof saved;
+    expect(Object.values(again.repos)[0]!.b103!.map((h) => h.sha)).toEqual([old.b103, afterFirst.b103]);
+  });
+
+  test("without the persisted file, the remote-tracking reflog still shows the old head", async () => {
+    const { old, afterFirst } = await firstJob();
+    rmSync(stateFile());
+
+    const r = await rebaseStack(ctxWith(afterFirst, { open: [103] }), 103);
+
+    expect(r.prs).toEqual([103]);
+    expect(await git(clone, "rev-parse", "refs/heads/b103")).toBe(old.b103);
+  });
+
+  test("a corrupt provenance file is empty: no crash, and the reflog evidence still applies", async () => {
+    const { afterFirst } = await firstJob();
+    writeFileSync(stateFile(), '{"repos": {"x": [1,');
+
+    const r = await rebaseStack(ctxWith(afterFirst, { open: [103] }), 103);
+
+    expect(r.prs).toEqual([103]);
+    expect((JSON.parse(readFileSync(stateFile(), "utf8")) as { version: number }).version).toBe(1);
+  });
+
+  test("with neither persisted provenance nor reflog evidence an old tip is refused, naming the branch", async () => {
+    const { afterFirst } = await firstJob();
+    rmSync(stateFile());
+    // forget everything git remembers about origin/b103's earlier values
+    await git(clone, "reflog", "expire", "--expire=now", "--all");
+
+    const err = await errorOf(rebaseStack(ctxWith(afterFirst, { open: [103] }), 103));
+
+    expect(err.code).toBe("diverged");
+    expect(err.message).toContain("b103");
+    expect(err.message).toContain("unpushed commits");
+  });
+
+  test("a stack merge that stops after its first restack leaves a fresh run able to continue (preflight via provenance)", async () => {
+    const { afterFirst } = await firstJob();
+    const rest = [{ number: 103, branch: "b103", headSha: afterFirst.b103 }];
+    // knownHeads died with job 1's process; the stack merge's preflight must still pass
+    await preflightRestack(realExec, clone, { trunk: "main", members: rest, mergedBaseSha: afterFirst.b102, baseRef: "b102", provenanceKey: "o/r@" + clone });
+    // another repo's (or clone's) provenance vouches for nothing here
+    rmSync(join(clone, ".git", "logs"), { recursive: true, force: true });
+    const stranger = { trunk: "main", members: rest, mergedBaseSha: afterFirst.b102, baseRef: "b102", provenanceKey: "o/other@" + clone };
+    expect((await errorOf(preflightRestack(realExec, clone, stranger))).code).toBe("diverged");
+  });
+
+  test("real unpushed commits on top of a known old tip are refused, with the worktree and the commit count", async () => {
+    const { afterFirst } = await firstJob();
+    const wt = join(base, "wt-mine");
+    await addWorktree(wt, "b103");
+    await commitFile(wt, "mine.txt", "mine\n", "unpushed 1");
+    await commitFile(wt, "mine2.txt", "mine2\n", "unpushed 2");
+    expectedWorktrees = await worktreeList();
+
+    const err = await errorOf(rebaseStack(ctxWith(afterFirst, { open: [103] }), 103));
+
+    expect(err.code).toBe("diverged");
+    expect(err.message).toContain(wt);
+    expect(err.message).toContain("b103");
+    expect(err.message).toContain("2 unpublished");
+    expect(await allHeads()).toEqual(afterFirst);
+  });
+
+  test("a local commit whose patch origin already has (different hash) is not unpushed work", async () => {
+    await build();
+    process.env.STK_STATE_DIR = join(base, "state");
+    const old = await allHeads();
+    // someone else pushes X to b103; the clone has the same change committed locally under another hash
+    await git(seed, "checkout", "-q", "b103");
+    await commitFile(seed, "extra-x.txt", "x\n", "X");
+    await git(seed, "push", "-q", "origin", "b103");
+    await git(clone, "branch", "b103", old.b103);
+    const wt = join(base, "wt-x");
+    await addWorktree(wt, "b103");
+    await commitFile(wt, "extra-x.txt", "x\n", "X (local copy)");
+    expectedWorktrees = await worktreeList();
+
+    const r = await rebaseStack(ctxWith(await allHeads()), 102);
+
+    expect(r.prs).toEqual([102, 103]);
   });
 });
