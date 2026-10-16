@@ -25,3 +25,31 @@ export const exec: Exec = async (argv, opts = {}) => {
     return { code: 127, stdout: "", stderr: e instanceof Error ? e.message : String(e) };
   }
 };
+
+/** Like `exec`, but stdout is raw bytes (image downloads); same failure contract. Past `maxBytes` of output the process is killed and `overflow` is set. */
+export async function execBytes(
+  argv: readonly string[],
+  o: { timeoutMs?: number; maxBytes?: number } = {},
+): Promise<{ code: number; stdout: Uint8Array; stderr: string; overflow: boolean }> {
+  try {
+    const proc = Bun.spawn([...argv], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: o.timeoutMs });
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    let overflow = false;
+    const read = (async () => {
+      for await (const chunk of proc.stdout) {
+        total += chunk.length;
+        if (o.maxBytes !== undefined && total > o.maxBytes) {
+          overflow = true;
+          proc.kill();
+          return;
+        }
+        chunks.push(chunk);
+      }
+    })();
+    const [, stderr, code] = await Promise.all([read, new Response(proc.stderr).text(), proc.exited]);
+    return { code, stdout: overflow ? new Uint8Array() : Buffer.concat(chunks), stderr, overflow };
+  } catch (e) {
+    return { code: 127, stdout: new Uint8Array(), stderr: e instanceof Error ? e.message : String(e), overflow: false };
+  }
+}

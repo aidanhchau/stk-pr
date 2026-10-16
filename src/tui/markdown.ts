@@ -5,7 +5,8 @@
  *   layoutBlocks(blocks, width, opts) -> Span[][]    wrapped lines ([] = blank line)
  *
  * Supported: headings, **bold**, `code`, [text](url) -> text, fenced code, dash, star and numbered bullets (hanging indent),
- * <details><summary> -> foldable block, tables -> aligned columns, `![P1 Badge](..)` -> P1 pill.
+ * <details><summary> -> foldable block, tables -> aligned columns, `![P1 Badge](..)` -> P1 pill, an image standing alone on its line -> image block
+ * (badges, bot buttons and images inline in prose are dropped).
  */
 
 /** `author` / `rail`: a human's name and conversation rail, coloured per person by the view. */
@@ -21,6 +22,7 @@ export type Block =
   | { t: "suggestion"; lines: string[] }
   | { t: "table"; rows: string[][] }
   | { t: "details"; summary: Span[]; body: Block[] }
+  | { t: "image"; src: string; alt: string }
   | { t: "blank" };
 
 export interface Comment {
@@ -41,6 +43,16 @@ const FENCE_CLOSE = "\uE011";
 /** Prefixes a stashed fence body that came from a ```suggestion block. */
 const SUGGEST = "\uE012";
 const DIFF = "\uE013";
+/** Wraps the index of a stashed standalone image (`IMAGES`) in the text. */
+const IMG_OPEN = "\uE020";
+const IMG_CLOSE = "\uE021";
+const IMG_RE = new RegExp(`${IMG_OPEN}(\\d+)${IMG_CLOSE}`, "g");
+
+/** An image kept by `preprocess`: an http(s) source that is content, not a badge or button. */
+interface ImageRef {
+  src: string;
+  alt: string;
+}
 
 const FENCE_RE = /^[ \t]*(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)^[ \t]*\1[ \t]*$/gm;
 const TAGS = "sub|sup|div|p|br|hr|span|picture|source|img|a|b|i|strong|em|u|ul|ol|li|blockquote|h[1-6]|table|thead|tbody|tr|td|th|details|summary|kbd|center";
@@ -80,10 +92,29 @@ export function looksLikeDiff(body: string): boolean {
   return at >= 0 && lines.slice(at + 1).some((l) => /^[+-]/.test(l));
 }
 
-/** Raw markdown/HTML -> normalized markdown lines with markers for fences, details and pills. */
-function preprocess(src: string): { text: string; fences: string[] } {
+const BADGE_HOSTS = /(?:^|\.)(?:shields\.io|badgen\.net|badge\.fury\.io|codecov\.io|coveralls\.io|static\.devin\.ai|pr-comments-assets\.blacksmith\.sh|vercel\.com|netlify\.com|snyk\.io)$/i;
+
+/** Badges and bot buttons: images that are chrome, not content. They are dropped wherever they sit. */
+function isChrome(src: string, alt: string, height: number | null): boolean {
+  if (BUTTON_TEXT.test(alt.trim()) || (height !== null && height <= 48)) return true;
+  try {
+    const u = new URL(src);
+    return BADGE_HOSTS.test(u.hostname) || (u.hostname === "cursor.com" && u.pathname.startsWith("/assets/")) || /\/badge(?:\.svg|\/|$)/i.test(u.pathname);
+  } catch {
+    return true;
+  }
+}
+
+const attr = (tag: string, name: string): string | null => {
+  const m = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? "").replace(/&amp;/g, "&") : null;
+};
+
+/** Raw markdown/HTML -> normalized markdown lines with markers for fences, details, pills and images. */
+function preprocess(src: string): { text: string; fences: string[]; images: ImageRef[] } {
   let s = src.replace(/\r/g, "").replace(/\t/g, "  ");
   const fences: string[] = [];
+  const images: ImageRef[] = [];
   const stash = (body: string, info = "") => {
     const lang = info.replace(/^[`~]+/, "").trim();
     const mark = /^suggestion\b/i.test(lang) ? SUGGEST : /^(?:diff|patch)\b/i.test(lang) || looksLikeDiff(body) ? DIFF : "";
@@ -93,19 +124,29 @@ function preprocess(src: string): { text: string; fences: string[] } {
   // unterminated fence: the rest is code
   s = s.replace(/^[ \t]*(?:`{3,}|~{3,})([^\n]*)\n([\s\S]*)$/m, (_m, info: string, body: string) => stash(body, info));
   s = s.replace(/<!--[\s\S]*?-->/g, "").replace(/<!--[\s\S]*$/, "");
-  s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m, alt: string) => {
+  /** Content images become a marker; whether it stands alone is decided per line in `parseLines`. Only http(s) sources survive. */
+  const keep = (src: string | null, alt: string, height: number | null): string => {
+    if (!src || !/^https?:\/\//i.test(src) || isChrome(src, alt, height)) return "";
+    return `${IMG_OPEN}${images.push({ src, alt: alt.trim() }) - 1}${IMG_CLOSE}`;
+  };
+  s = s.replace(/\[(!\[[^\]]*\]\([^)]*\))\]\([^)]*\)/g, "$1"); // [![alt](img)](href): the image alone
+  s = s.replace(/!\[([^\]]*)\]\(([^)]*)\)/g, (_m, alt: string, dest: string) => {
     const b = /^(P\d)\b/.exec(alt.trim());
-    return b ? `${PILL_OPEN}${b[1]}${PILL_CLOSE}` : "";
+    if (b) return `${PILL_OPEN}${b[1]}${PILL_CLOSE}`;
+    return keep(/^\s*<?([^\s>]*)/.exec(dest)?.[1] || null, alt, null);
   });
-  s = s.replace(/<a\b[^>]*>(?:\s|&nbsp;|<picture[\s\S]*?<\/picture>|<img\b[^>]*>)*<\/a>/gi, "");
-  s = s.replace(/<picture[\s\S]*?<\/picture>/gi, "").replace(/<img\b[^>]*>/gi, "");
+  // <a> wrapping only pictures/images, a bare <picture>, a bare <img>
+  s = s.replace(/<a\b[^>]*>(?:\s|&nbsp;|<picture[\s\S]*?<\/picture>|<img\b[^>]*>)*<\/a>|<picture[\s\S]*?<\/picture>|<img\b[^>]*>/gi, (m) => {
+    const tags = [...m.matchAll(/<img\b[^>]*>/gi)].map((t) => t[0]);
+    return tags.map((t) => keep(attr(t, "src"), attr(t, "alt") ?? "", Number(attr(t, "height")) || null)).join(" ");
+  });
   // innermost <details> first, repeatedly
   const det = /<details\b[^>]*>((?:(?!<details\b)[\s\S])*?)<\/details>/i;
   for (let guard = 0; guard < 50 && det.test(s); guard++) {
     s = s.replace(det, (_m, inner: string) => {
       const sm = /<summary\b[^>]*>([\s\S]*?)<\/summary>/i.exec(inner);
       const rest = sm ? inner.replace(sm[0], "") : inner;
-      const summary = stripTags(sm ? sm[1]! : "Details").replace(/\s+/g, " ").trim() || "Details";
+      const summary = stripTags(sm ? sm[1]! : "Details").replace(IMG_RE, "").replace(/\s+/g, " ").trim() || "Details";
       return `\n${SUM_OPEN}${summary}${SUM_CLOSE}\n${rest}\n${DET_END}\n`;
     });
   }
@@ -116,7 +157,7 @@ function preprocess(src: string): { text: string; fences: string[] } {
     .replace(/<li\b[^>]*>/gi, "\n- ")
     .replace(/<\/?(?:b|strong)\b[^>]*>/gi, "**")
     .replace(/<\/?code\b[^>]*>/gi, "`");
-  return { text: stripTags(s), fences };
+  return { text: stripTags(s), fences, images };
 }
 
 // ---------- inline ----------
@@ -183,7 +224,7 @@ export const plain = (spans: Span[]): string => spans.map((s) => s.text).join(""
 
 const BULLET = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 
-function parseLines(lines: string[], fences: string[]): Block[] {
+function parseLines(lines: string[], fences: string[], images: ImageRef[]): Block[] {
   const blocks: Block[] = [];
   const blank = () => {
     if (blocks.length && blocks[blocks.length - 1]!.t !== "blank") blocks.push({ t: "blank" });
@@ -233,12 +274,21 @@ function parseLines(lines: string[], fences: string[]): Block[] {
       add({ t: "blank" });
       continue;
     }
+    if (line.includes(IMG_OPEN)) {
+      const refs = [...line.matchAll(IMG_RE)].map((m) => images[Number(m[1])]!);
+      line = line.replace(IMG_RE, "");
+      // an image on a line of its own is content; in prose, a table or a heading it is dropped
+      if (!line.trim()) {
+        for (const r of refs) add({ t: "image", ...r });
+        continue;
+      }
+    }
     // table: consecutive |...| rows
     if (/^\s*\|.*\|\s*$/.test(line)) {
       const rows: string[][] = [];
       i--;
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]!.replace(/^\s*(?:>\s?)+/, ""))) {
-        const cells = lines[i]!.replace(/^\s*(?:>\s?)+/, "").trim().slice(1, -1).split("|").map((c) => plain(tidy(inline(c))));
+        const cells = lines[i]!.replace(/^\s*(?:>\s?)+/, "").replace(IMG_RE, "").trim().slice(1, -1).split("|").map((c) => plain(tidy(inline(c))));
         i++;
         if (cells.every((c) => /^:?-{2,}:?$/.test(c) || c === "")) continue;
         rows.push(cells);
@@ -304,8 +354,8 @@ export const isNoise = (c: Comment): boolean =>
   /^(Stale( Bugbot)? comment|Newer findings are available|You have reached your Codex usage limits|💡 Codex Review$)/i.test(c.title);
 
 function parseUncached(body: string): Comment {
-  const { text, fences } = preprocess(body);
-  const blocks = parseLines(text.split("\n"), fences);
+  const { text, fences, images } = preprocess(body);
+  const blocks = parseLines(text.split("\n"), fences, images);
   const idx = blocks.findIndex((b) => b.t === "p" || b.t === "details");
   let title = "";
   let badge: string | null = null;
@@ -321,6 +371,8 @@ function parseUncached(body: string): Comment {
     }
   } else if (first?.t === "details") {
     title = plain(first.summary);
+  } else if (blocks[0]?.t === "image") {
+    title = `▣ ${blocks[0].alt || "image"}`;
   }
   return { title, badge, blocks };
 }
@@ -458,6 +510,43 @@ export interface LayoutOpts {
   previews?: boolean;
   /** Max prose width; defaults to `PROSE_MEASURE`. */
   measure?: number;
+  /** Where images are drawn. Without it an image is one muted `▣ alt` line (previews, search text). */
+  images?: ImageEnv;
+}
+
+/** What the layout needs to know about an image to reserve rows for it; structurally the `ImageState` of `../images`. */
+export interface ImageEnv {
+  /** What is known of an image; measuring a layout must never start a download. */
+  lookup(src: string): { status: "loading" } | { status: "error"; reason: string } | { status: "ready"; width: number; height: number };
+  /** Starts loading an image the view is about to show (idempotent). Layout itself never calls this. */
+  request(src: string): void;
+  /** Terminal cell size in pixels. */
+  cell: { w: number; h: number };
+}
+
+export const MAX_IMAGE_ROWS = 30;
+export const MAX_IMAGE_COLS = 100;
+
+/** Cells an image of `width`x`height` logical px occupies: at most `maxCols` wide, never upscaled past its own size, `maxRows` tall. */
+export function fitImage(width: number, height: number, maxCols: number, cell: { w: number; h: number }, maxRows = MAX_IMAGE_ROWS): { cols: number; rows: number } {
+  const heightFor = (cols: number) => Math.max(1, Math.round((cols * cell.w * height) / (width * cell.h)));
+  let cols = Math.max(1, Math.min(maxCols, MAX_IMAGE_COLS, Math.floor(width / cell.w)));
+  if (heightFor(cols) > maxRows) cols = Math.max(1, Math.floor((maxRows * cell.h * width) / (height * cell.w)));
+  return { cols, rows: Math.min(maxRows, heightFor(cols)) };
+}
+
+/**
+ * A laid-out row: a line of styled spans, or a drawn image `rows` cells tall. `image` on a text row names the image it stands in for
+ * (loading / failed): the view starts that download only if the row is actually shown.
+ */
+export type Row = { t: "text"; spans: Span[]; image?: string } | { t: "image"; src: string; alt: string; cols: number; rows: number; indent: number };
+
+const textRows = (rows: Span[][]): Row[] => rows.map((spans) => ({ t: "text", spans }));
+const isBlank = (r: Row): boolean => r.t === "text" && !r.spans.length;
+
+/** `layoutRows` as plain text lines (search text, previews, tests): a drawn image is its `▣ alt` line. */
+export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span[][] {
+  return layoutRows(blocks, w, opts).map((r) => (r.t === "text" ? r.spans : [{ text: `▣ ${r.alt}`, style: "muted" as const }]));
 }
 
 function codeLines(text: string, w: number, diff = false): Span[][] {
@@ -470,11 +559,13 @@ function codeLines(text: string, w: number, diff = false): Span[][] {
   return out;
 }
 
-export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span[][] {
-  const out: Span[][] = [];
+export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] {
+  const out: Row[] = [];
   const blank = () => {
-    if (out.length && out[out.length - 1]!.length) out.push([]);
+    if (out.length && !isBlank(out[out.length - 1]!)) out.push({ t: "text", spans: [] });
   };
+  /** Appends text lines. */
+  const emit = (rows: Span[][]) => out.push(...textRows(rows));
   w = Math.max(8, w);
   const pw = Math.max(8, Math.min(w, opts.measure ?? PROSE_MEASURE));
   /** "list" | "para" | "head" for the previous prose block; drives the blank lines between kinds. */
@@ -495,19 +586,19 @@ export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span
         const pad = " ".repeat(b.indent);
         const first: Span[] = [...(pad ? [{ text: pad, style: "plain" as const }] : []), ...(b.bullet ? [{ text: `${b.bullet} `, style: "muted" as const }] : [])];
         const hang = b.bullet ? `${pad}${" ".repeat(width(b.bullet) + 1)}` : pad;
-        out.push(...wrapSpans(b.spans, pw, first, hang));
+        emit(wrapSpans(b.spans, pw, first, hang));
         if (b.heading && (b.level ?? 1) <= 2) afterTopHead = true;
         break;
       }
       case "code":
-        out.push(...codeLines(b.text.replace(/^/, "  "), w, b.diff));
+        emit(codeLines(b.text.replace(/^/, "  "), w, b.diff));
         break;
       case "suggestion": {
-        out.push([{ text: "suggested change", style: "muted" }]);
-        const rows = (sign: string, lines: string[], style: "del" | "add") => {
-          for (const l of lines) {
+        emit([[{ text: "suggested change", style: "muted" }]]);
+        const rows = (sign: string, items: string[], style: "del" | "add") => {
+          for (const l of items) {
             const room = Math.max(1, w - 2);
-            for (let at = 0, first = true; first || at < l.length; at += room, first = false) out.push([{ text: `${first ? sign : " "} ${l.slice(at, at + room)}`, style }]);
+            for (let at = 0, first = true; first || at < l.length; at += room, first = false) emit([[{ text: `${first ? sign : " "} ${l.slice(at, at + room)}`, style }]]);
           }
         };
         rows("-", opts.removed ?? [], "del");
@@ -523,29 +614,44 @@ export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span
           for (const r of b.rows.slice(b.rows.length > 1 ? 1 : 0)) {
             const spans: Span[] = [{ text: r[0] ?? "", style: "bold" }];
             if (r.length > 1) spans.push({ text: ` ${r.slice(1).join(" · ")}`, style: "plain" });
-            out.push(...wrapSpans(spans, w, "", "  "));
+            emit(wrapSpans(spans, w, "", "  "));
           }
           break;
         }
         b.rows.forEach((r, ri) => {
           const text = r.map((c, ci) => c + " ".repeat(ws[ci]! - width(c))).join("  ").trimEnd();
-          out.push([{ text, style: ri === 0 && b.rows.length > 1 ? "bold" : "plain" }]);
+          emit([[{ text, style: ri === 0 && b.rows.length > 1 ? "bold" : "plain" }]]);
         });
+        break;
+      }
+      case "image": {
+        blank();
+        const alt = b.alt || "image";
+        const meta = opts.images?.lookup(b.src);
+        if (opts.images && meta?.status === "ready") {
+          out.push({ t: "image", src: b.src, alt, indent: 0, ...fitImage(meta.width, meta.height, w, opts.images.cell) });
+        } else {
+          const note = !opts.images ? "" : meta?.status === "error" ? ` · ${meta.reason}` : " · loading image";
+          out.push(...wrapSpans([{ text: `▣ ${alt}${note}`, style: "muted" }], w).map((spans): Row => ({ t: "text", spans, image: opts.images ? b.src : undefined })));
+        }
+        blank();
         break;
       }
       case "details": {
         const preview = /^Preview\b/i.test(plain(b.summary)) && b.body.some((x) => x.t === "code" && x.diff);
         if (!opts.details || (preview && !opts.previews)) {
-          out.push(...wrapSpans([{ text: `▸ ${plain(b.summary)}`, style: "muted" }], w));
+          emit(wrapSpans([{ text: `▸ ${plain(b.summary)}`, style: "muted" }], w));
         } else {
-          out.push(...wrapSpans([{ text: `▾ ${plain(b.summary)}`, style: "muted" }], w));
-          for (const l of layoutBlocks(b.body, w - 2, opts)) out.push(l.length ? [{ text: "  ", style: "plain" }, ...l] : l);
+          emit(wrapSpans([{ text: `▾ ${plain(b.summary)}`, style: "muted" }], w));
+          for (const r of layoutRows(b.body, w - 2, opts)) {
+            out.push(r.t === "image" ? { ...r, indent: r.indent + 2 } : r.spans.length ? { ...r, spans: [{ text: "  ", style: "plain" }, ...r.spans] } : r);
+          }
         }
         break;
       }
     }
   }
-  while (out.length && !out[out.length - 1]!.length) out.pop();
+  while (out.length && isBlank(out[out.length - 1]!)) out.pop();
   return out;
 }
 

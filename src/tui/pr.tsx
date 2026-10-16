@@ -13,8 +13,9 @@ import type { ReviewThread } from "../github";
 import type { PrDetail } from "../service";
 import { isWaitable } from "../watch";
 import { nativeUpTo, type Blocker, type CheckState, type ConversationEntry, type MergeMethod } from "../types";
-import { activityId, activityLayout, activityMeta, bodyRows, defaultLevel, foldBots, groupActivity, lowSignalTag, type ActivityItem, type BotFold, type Level, type RL } from "./activity";
-import { layoutBlocks, parseComment, preview, threadFix, type Span } from "./markdown";
+import { activityId, activityLayout, activityMeta, bodyRows, defaultLevel, foldBots, groupActivity, lowSignalTag, rowsHeight, type ActivityItem, type BotFold, type Level, type RL } from "./activity";
+import { imagesVersion, imageState, requestImage, setPrHost, subscribeImages } from "../images";
+import { layoutBlocks, parseComment, preview, threadFix, type ImageEnv, type Span } from "./markdown";
 import { jobDockText, type Job } from "../jobs";
 import { diffKey, mergeMethodOf, runningJobOf, useStore, useStoreInstance, type Store } from "./store";
 import { checkSummary, currentChecks, type CurrentCheck } from "./pr-checks";
@@ -618,7 +619,7 @@ function RowsView({
   const rail = accent ? lerpHex(accent, p.ground, 0.4) : p.faint;
   const headClick = useClick(selected, onSelect, onOpen, { stop: true });
   return (
-    <Sel selected={bodySel} current={selected} h={rows.length} onSelect={onSelect} onOpen={onOpen} body>
+    <Sel selected={bodySel} current={selected} h={rowsHeight(rows)} onSelect={onSelect} onOpen={onOpen} body>
       {rows.map((r, i) => {
         switch (r.t) {
           case "head": {
@@ -649,6 +650,19 @@ function RowsView({
                 <SpanText spans={r.spans} tone={muted ? "muted" : "ink"} sel={bodySel} accent={accent} rail={rail} />
               </box>
             );
+          case "image": {
+            const img = imageState(r.src);
+            return (
+              <box key={i} height={r.rows} flexShrink={0} flexDirection="row" paddingLeft={r.rail ? (r.railIndent ?? 0) : 2}>
+                {r.rail && (
+                  <text fg={rail} selectable={false} wrapMode="none">
+                    {Array.from({ length: r.rows }, () => "│ ").join("\n")}
+                  </text>
+                )}
+                {img?.status === "ready" && <image source={img.data} fit="fill" protocol="auto" width={r.cols} height={r.rows} marginLeft={r.indent} flexShrink={0} />}
+              </box>
+            );
+          }
           case "gap":
             return r.rail ? (
               <box key={i} height={1} flexShrink={0} paddingLeft={r.indent ?? 0}>
@@ -725,6 +739,17 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   const diffRef = useRef<DiffRenderable>(null);
   const { pr } = d;
   const history = useCommitHistory(n, d.repo);
+  const renderer = useRenderer();
+  // images arrive after layout: rows are re-derived (and heights re-accounted) whenever one finishes loading
+  useSyncExternalStore(subscribeImages, imagesVersion);
+  const res = renderer.resolution;
+  // credentials for images go only to github.com and this PR's own GitHub host
+  setPrHost(URL.canParse(pr.url) ? new URL(pr.url).hostname : null);
+  const images: ImageEnv = {
+    lookup: (src) => imageState(src) ?? { status: "loading" },
+    request: requestImage,
+    cell: res && renderer.terminalWidth > 0 ? { w: res.width / renderer.terminalWidth, h: res.height / renderer.terminalHeight } : { w: 8, h: 16 },
+  };
 
   const focus = useStore((s) => (s.screen.kind === "pr" ? s.screen.focus : undefined));
   const [curId, setCurId] = useState<string | null>(focus?.key ?? null);
@@ -1005,8 +1030,8 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     gap("ds-gap");
     if (!hasDesc) push("ds-none", 1, <T tone="muted">No description</T>);
     else {
-      const rows = bodyRows(pr.body, descLevel, bodyW, DESC_CAP);
-      push("desc", rows.length, <RowsView rows={rows} selected={selected} headOnly onSelect={select} onOpen={openCur} />, { item: "desc", lead: 2 });
+      const rows = bodyRows(pr.body, descLevel, bodyW, DESC_CAP, undefined, false, images);
+      push("desc", rowsHeight(rows), <RowsView rows={rows} selected={selected} headOnly onSelect={select} onOpen={openCur} />, { item: "desc", lead: 2 });
     }
     gap("ds-end", 2);
   }
@@ -1106,14 +1131,14 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     push("act", 1, <Label label="Activity" meta={meta} />);
     gap("act-gap");
     if (!activity.length) push("act-none", 1, <T tone="muted">No activity</T>);
-    const blocksOf = activityLayout(actRows, { levelOf, isOpen: foldOpen, replyId: reply?.id ?? null, w: bodyW, prAuthor: pr.author, age });
+    const blocksOf = activityLayout(actRows, { levelOf, isOpen: foldOpen, replyId: reply?.id ?? null, w: bodyW, prAuthor: pr.author, age, images });
     blocksOf.forEach(({ id, item, rows, who }, i) => {
       const selected = hlKey === id;
       const level = item.kind === "bots" ? 0 : levelOf(item);
       const replying = item.kind === "thread" && reply?.id === item.th.id;
       push(
         id,
-        rows.length,
+        rowsHeight(rows),
         <RowsView
           rows={rows}
           selected={selected}
