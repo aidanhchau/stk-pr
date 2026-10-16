@@ -6,7 +6,7 @@ stk talks to GitHub only through the [`gh` CLI](https://cli.github.com), so it u
 
 ## Install
 
-Requires [Bun](https://bun.sh) 1.3 or newer and `git`, plus the GitHub CLI signed in with `gh auth login`.
+Requires [Bun](https://bun.sh) 1.3.14 or newer (`bun upgrade`) and `git`, plus the GitHub CLI signed in with `gh auth login`.
 
 ```
 bun add -g stk-pr
