@@ -68,25 +68,32 @@ local function cli_failure(result: ProcessResult): string
 	return if why ~= "" then why else "tern exited " .. tostring(result.status)
 end
 
--- Runs `tern <build(block)>` against `pane`; `done(ok, why, cx)` gets the verdict.
--- tern.process.run raises when the binary can't be spawned; that is reported through `done` too (with `cx`).
-local function tern_cli(cx: WindowCx, pane: number, build: (string) -> { string }, done: (boolean, string, WindowCx?) -> ())
+-- Finds the id the `tern` CLI knows `pane` by (the pane id or that id plus the host bit); `done(block, why, cx)`
+-- gets nil and the reason when there is none. tern.process.run raises when the binary can't be spawned; that is
+-- reported through `done` too (with `cx`).
+local function cli_block(cx: WindowCx, pane: number, done: (number?, string, WindowCx?) -> ())
 	local started, err = pcall(tern.process.run, { TERN_BIN, "inspect", "--json" }, { timeout_ms = 10000 }, function(found: ProcessResult, fcx: WindowCx?)
 		local ok, parsed = pcall(tern.json.decode, found.stdout)
-		if found.status ~= 0 or not ok then return done(false, cli_failure(found), fcx) end
-		local block: number? = nil
+		if found.status ~= 0 or not ok then return done(nil, cli_failure(found), fcx) end
 		for _, info in parsed.panes or {} do
-			if info.pane == pane or info.pane == pane + HOST_BIT then block = info.pane end
+			if info.pane == pane or info.pane == pane + HOST_BIT then return done(info.pane, "", fcx) end
 		end
-		if block == nil then return done(false, "no such pane in tern inspect", fcx) end
+		done(nil, "no such pane in tern inspect", fcx)
+	end)
+	if not started then done(nil, tostring(err), cx) end
+end
+
+-- Runs `tern <build(block)>` against `pane`; `done(ok, why, cx)` gets the verdict.
+local function tern_cli(cx: WindowCx, pane: number, build: (string) -> { string }, done: (boolean, string, WindowCx?) -> ())
+	cli_block(cx, pane, function(block: number?, why: string, fcx: WindowCx?)
+		if block == nil then return done(false, why, fcx) end
 		local argv = { TERN_BIN }
 		for _, arg in build(string.format("%d", block)) do table.insert(argv, arg) end
-		local ran, why = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(result: ProcessResult, ncx: WindowCx?)
+		local ran, err = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(result: ProcessResult, ncx: WindowCx?)
 			done(result.status == 0, if result.status == 0 then "" else cli_failure(result), ncx)
 		end)
-		if not ran then done(false, tostring(why), fcx) end
+		if not ran then done(false, tostring(err), fcx) end
 	end)
-	if not started then done(false, tostring(err), cx) end
 end
 
 -- Opens `launch` in a split to the right of `pane`. The window API first; the CLI for panes it doesn't know.
@@ -133,6 +140,17 @@ local function pane_cwd(cx: WindowCx, id: number): string?
 	return nil
 end
 
+-- Launch the TUI beside `pane` with `--session-pane` naming `pane` as the CLI knows it: stk reads the session
+-- with `tern capture`, which doesn't know the window API's id for panes opened after the daemon's handover.
+-- Without a CLI id (no tern binary, pane gone) the window id is passed as before.
+local function launch_session(cx: WindowCx, pane: number, args: string)
+	local cwd = pane_cwd(cx, pane)
+	cli_block(cx, pane, function(block: number?, _why: string, fcx: WindowCx?)
+		local id = string.format("%d", block or pane)
+		launch_line(fcx or cx, pane, cwd, args .. (if args == "" then "" else " ") .. "--session-pane " .. id)
+	end)
+end
+
 -- stk panes (TUI launched by this plugin) close without Tern's "Close this block?" prompt, see the
 -- close_pane override below.
 local function is_stk_pane(p: PaneInfo): boolean
@@ -150,12 +168,7 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx)
 	local pane: number? = link.pane
 	if pane == nil then pane = cx.session:focused() end
 	if pane == nil then return nil end
-	launch_line(
-		cx,
-		pane,
-		pane_cwd(cx, pane),
-		"--gh " .. sh_quote(owner .. "/" .. name) .. " --pr " .. num .. " --session-pane " .. tostring(pane)
-	)
+	launch_session(cx, pane, "--gh " .. sh_quote(owner .. "/" .. name) .. " --pr " .. num)
 	return { handled = true }
 end)
 
@@ -209,7 +222,7 @@ tern.command({
 			cx:toast("error", "No focused pane")
 			return
 		end
-		launch_line(cx, pane, pane_cwd(cx, pane), "--session-pane " .. tostring(pane))
+		launch_session(cx, pane, "")
 	end,
 })
 
