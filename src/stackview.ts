@@ -2,7 +2,6 @@
  * Pure view model of the stack-merge sheet: what each PR's status honestly is, the plain-English summary of what will
  * happen, and the plan steps with the reason each one is there. The sheet only draws what this returns.
  */
-import type { RebaseWorktree } from "./service";
 import type { Blocker, MergeMethod, PlanStep, PullRequest } from "./types";
 
 export type PrStateKind = "approved" | "ready" | "needs-review" | "changes" | "failing" | "pending" | "conflict" | "draft" | "other" | "merged";
@@ -147,8 +146,6 @@ export interface PlanItem {
   text: string;
   /** Why the step is there, shown under it. */
   why?: string;
-  /** PR whose branch the step works on in a worktree. */
-  worktreePr?: number;
 }
 
 /**
@@ -184,8 +181,7 @@ export function planItems(plan: PlanStep[], trunk: string, method: MergeMethod):
         items.push({
           steps: [i],
           text: `Rebase #${s.pr} onto ${trunk}${lastLanded === null ? "" : " and everything above it"}`,
-          why: lastLanded === null ? "GitHub left it on a merged branch (gh stack)" : `after #${lastLanded} lands; GitHub leaves it on the merged branch (gh stack)`,
-          worktreePr: s.pr,
+          why: `${lastLanded === null ? "GitHub left it on a merged branch" : `after #${lastLanded} lands; GitHub leaves it on the merged branch`}; runs in a temporary checkout`,
         });
         break;
       case "merge": {
@@ -217,12 +213,4 @@ export function withExpectedRebases(plan: PlanStep[], native: boolean): PlanStep
     out.push(s);
   }
   return out;
-}
-
-/** A worktree note for the rebase of `pr`: where it runs, or what to do about having none. */
-export function worktreeNote(w: RebaseWorktree | undefined): { text: string; ok: boolean } | null {
-  if (!w) return null;
-  if (w.kind === "branch") return { text: `runs in ${w.path}`, ok: true };
-  if (w.kind === "detached") return { text: `runs in ${w.path} (detached at the branch tip; stk switches it to ${w.branch})`, ok: true };
-  return { text: `no worktree has ${w.branch} checked out; c creates one`, ok: false };
 }

@@ -313,8 +313,8 @@ export interface GhOps {
   retarget(pr: number, base: string): Promise<void>;
   /** Resolves when checks pass; rejects if they fail or time out. */
   waitChecks(pr: number): Promise<void>;
-  /** Native stack: rebase every open PR from `pr` up onto the trunk and push (`gh stack rebase` + `push`). */
-  rebaseStack(pr: number): Promise<void>;
+  /** Native stack: rebase every open PR from `pr` up onto the trunk in a temporary checkout and push with leases. Resolves to a note for the step output (local checkouts left behind), if any. */
+  rebaseStack(pr: number): Promise<string | void>;
 }
 
 export interface ExecuteDeps {
@@ -366,9 +366,10 @@ async function runStep(step: PlanStep, deps: ExecuteDeps, git: GitOps): Promise<
     case "wait-checks":
       await gh.waitChecks(step.pr);
       return { ok: true, detail: `checks passed on #${step.pr}` };
-    case "rebase-stack":
-      await gh.rebaseStack(step.pr);
-      return { ok: true, detail: `rebased the stack from #${step.pr} onto the trunk (gh stack rebase, push)` };
+    case "rebase-stack": {
+      const note = await gh.rebaseStack(step.pr);
+      return { ok: true, detail: `rebased the stack from #${step.pr} onto the trunk in a temporary checkout and pushed with leases${note ? `; ${note}` : ""}` };
+    }
   }
 }
 

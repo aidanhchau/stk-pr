@@ -14,31 +14,34 @@ interface Put {
 }
 
 /**
- * Stateful fake GitHub for a native stack [A, B] on main, with B's branch in the worktree /wt-B. Squash-merging A leaves
- * B on A's (merged) branch with A's original commits, like GitHub; `gh stack push` moves B's head to `shaB1` and its
- * base to main. With `githubRestacks`, GitHub itself moves B onto main and to `shaB1` when A lands, and for that many
- * reads still shows the old head with mergeability "checking": `mergeStateStatus` UNKNOWN, or with `checkingAs:
- * "mergeable"` `mergeable` UNKNOWN beside a BLOCKED state. merge-async enforces what GitHub does: bypass only on the
- * bottom-most unmerged PR, and a pinned `sha` must still be the PR's head.
+ * Stateful fake GitHub for a native stack [A, B] on main. Squash-merging A leaves B on A's (merged) branch with A's
+ * original commits, like GitHub; the restack (rebase in a temporary worktree, then an atomic leased push) moves B's head
+ * to `shaB1` and its base to main. With `githubRestacks`, GitHub itself moves B onto main and to `shaB1` when A lands,
+ * and for that many reads still shows the old head with mergeability "checking": `mergeStateStatus` UNKNOWN, or with
+ * `checkingAs: "mergeable"` `mergeable` UNKNOWN beside a BLOCKED state. merge-async enforces what GitHub does: bypass
+ * only on the bottom-most unmerged PR, and a pinned `sha` must still be the PR's head. `divergedLocal` gives b202 a
+ * local commit that is not on origin; `originMoved` makes origin/b202 differ from the head the stack was read at.
  */
-function fakeGithub(o: { review: "required" | "approved"; dirty?: boolean; checkingReads?: number; githubRestacks?: number; checkingAs?: "mergeState" | "mergeable"; unexpectedDownstack?: boolean; staleMerged?: boolean; oldHeadReads?: number; missingWorktree?: number; detachedWorktree?: boolean; divergedLocal?: boolean; extensionMissing?: boolean; cleanGroup?: boolean }): { ctx: Ctx; puts: Put[]; ghStack: string[]; git: string[] } {
+function fakeGithub(o: { review: "required" | "approved"; checkingReads?: number; githubRestacks?: number; checkingAs?: "mergeState" | "mergeable"; unexpectedDownstack?: boolean; staleMerged?: boolean; oldHeadReads?: number; divergedLocal?: boolean; originMoved?: boolean; cleanGroup?: boolean }): { ctx: Ctx; puts: Put[]; pushes: string[]; git: string[] } {
   const puts: Put[] = [];
-  const ghStack: string[] = [];
+  const pushes: string[] = [];
   const git: string[] = [];
   const originalChain = o.cleanGroup ? [A, B, 203] : CHAIN;
   const merged = new Set<number>();
   let rebased = false;
   let checkingLeft = 0;
   let oldHeadLeft = 0;
-  const head = (n: number) => (n === B && rebased ? "shaB1" : n === B ? "shaB0" : "shaA");
+  let checkedOut = 0;
+  const head = (n: number) => (n === B ? (rebased ? "shaB1" : "shaB0") : n === 203 ? (rebased ? "new203" : "sha203") : "shaA");
   const member = (n: number) => ({
     number: n, title: `PR ${n}`, url: "", author: { login: "me" }, state: merged.has(n) && !o.staleMerged ? "MERGED" : "OPEN", isDraft: false,
-    headRefName: `b${n}`, baseRefName: n === A || rebased ? "main" : `b${A}`, headRefOid: n === B && oldHeadLeft > 0 ? "shaB0" : head(n),
+    headRefName: `b${n}`, baseRefName: n === A || rebased ? "main" : `b${originalChain[originalChain.indexOf(n) - 1]}`, headRefOid: n === B && oldHeadLeft > 0 ? "shaB0" : head(n),
     mergeable: n === B && checkingLeft > 0 && o.checkingAs === "mergeable" ? "UNKNOWN" : "MERGEABLE",
     mergeStateStatus: n === B && checkingLeft > 0 ? (o.checkingAs === "mergeable" ? "BLOCKED" : "UNKNOWN") : "CLEAN",
     reviewDecision: o.review === "required" && (!o.cleanGroup || n === A) ? "REVIEW_REQUIRED" : "APPROVED", statusCheckRollup: null, createdAt: "", updatedAt: "", reviewThreads: { nodes: [] },
   });
   const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
+  const no = () => ({ code: 1, stdout: "", stderr: "" });
   const exec: Exec = async (argv, opts) => {
     const a = argv.join(" ");
     const query = argv.find((x) => x.startsWith("query=")) ?? "";
@@ -67,34 +70,39 @@ function fakeGithub(o: { review: "required" | "approved"; dirty?: boolean; check
       return ok(`HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ status: "merged", details: {} })}`);
     }
     if (a.startsWith("gh repo view")) return ok(JSON.stringify({ owner: { login: "o" }, name: "r", defaultBranchRef: { name: "main" } }));
-    if (a.startsWith("gh stack ")) {
-      ghStack.push(argv.slice(2).join(" "));
-      if (a === "gh stack --version" && o.extensionMissing) return { code: 1, stdout: "", stderr: "unknown command" };
-      if (a === "gh stack push") {
-        rebased = true;
-        checkingLeft = o.checkingReads ?? 0;
-        oldHeadLeft = o.oldHeadReads ?? 0;
-      }
+    if (argv[0] !== "git") return { code: 1, stdout: "", stderr: `unexpected: ${a}` };
+    const g = argv.filter((x, i) => !(x === "-c" || argv[i - 1] === "-c")).slice(1).join(" ");
+    git.push(g);
+    if (g.startsWith("fetch ")) return ok("");
+    if (g === "worktree list --porcelain") return ok(`worktree /repo\nHEAD h0\nbranch refs/heads/main\n\nworktree /wt-B\nHEAD shaB0\nbranch refs/heads/b${B}\n\n`);
+    if (g === "rev-parse --verify --quiet refs/remotes/origin/main") return ok("trunk0\n");
+    const remote = /^rev-parse --verify --quiet refs\/remotes\/origin\/b(\d+)$/.exec(g);
+    if (remote) return ok(`${o.originMoved && Number(remote[1]) === B ? "otherB" : head(Number(remote[1]))}\n`);
+    if (g === `rev-parse --verify --quiet refs/heads/b${B}`) return o.divergedLocal ? ok("localonly\n") : no();
+    if (g.startsWith("rev-parse --verify --quiet refs/heads/")) return no();
+    if (g.startsWith("merge-base --is-ancestor")) return no();
+    if (g.startsWith("worktree add --detach") || g.startsWith("worktree remove") || g === "worktree prune") return ok("");
+    const co = /^checkout --detach (\S+)$/.exec(g);
+    if (co) {
+      checkedOut = co[1] === "shaB0" ? B : 203;
       return ok("");
     }
-    if (a === "git worktree list --porcelain") {
-      const wt = (n: number) => (o.detachedWorktree && n === B ? `worktree /wt-${n}\nHEAD ${head(n)}\ndetached\n\n` : `worktree /wt-${n}\nHEAD sha${n}\nbranch refs/heads/b${n}\n\n`);
-      return ok(`worktree /repo\nHEAD h0\nbranch refs/heads/main\n\n${originalChain.filter((n) => n !== A && n !== o.missingWorktree).map(wt).join("")}`);
-    }
-    // attaching a detached worktree to its branch: no local branch yet, so it is created where HEAD is
-    if (a === `git rev-parse --verify --quiet refs/heads/b${B}`) return o.divergedLocal ? ok("localonly\n") : { code: 1, stdout: "", stderr: "" };
-    if (a.startsWith("git merge-base --is-ancestor")) return { code: 1, stdout: "", stderr: "" };
-    if (a.startsWith("git switch") || a.startsWith("git branch --set-upstream-to")) {
-      git.push(`${a}@${opts?.cwd}`);
+    if (g.startsWith("rebase --no-autostash")) return ok("");
+    // the rebased tip of the member that is checked out
+    if (g === "rev-parse HEAD") return ok(`${checkedOut === B ? "shaB1" : "new203"}\n`);
+    if (g.startsWith("push ")) {
+      pushes.push(g);
+      rebased = true;
+      checkingLeft = o.checkingReads ?? 0;
+      oldHeadLeft = o.oldHeadReads ?? 0;
       return ok("");
     }
-    if (a === "git status --porcelain") return ok(o.dirty ? " M bun.lock\n" : "");
-    if (a.startsWith("git rev-parse --verify refs/heads/")) return ok(head(Number(argv[3]!.replace("refs/heads/b", ""))));
-    if (a.startsWith("git ls-remote origin refs/heads/")) return ok(`${head(Number(argv[3]!.replace("refs/heads/b", "")))}\t${argv[3]}\n`);
+    const ls = /^ls-remote origin refs\/heads\/b(\d+)$/.exec(g);
+    if (ls) return ok(`${head(Number(ls[1]))}\trefs/heads/b${ls[1]}\n`);
     return { code: 1, stdout: "", stderr: `unexpected: ${a}` };
   };
   const ctx: Ctx = { exec, root: "/repo", slug: { owner: "o", name: "r" }, worktrees: [{ path: "/wt-B", branch: `b${B}`, head: "shaB0", bare: false }] };
-  return { ctx, puts, ghStack, git };
+  return { ctx, puts, pushes, git };
 }
 
 const noSleep = { attempts: 3, delayMs: 0, sleep: async () => {} };
@@ -102,7 +110,7 @@ const noSleep = { attempts: 3, delayMs: 0, sleep: async () => {} };
 describe("stackMerge on a native stack", () => {
   test("forced squash with a review bypass on both PRs: A lands, B is rebased, then B merges at its NEW head sha", async () => {
     clearRulesCache();
-    const { ctx, puts, ghStack } = fakeGithub({ review: "required" });
+    const { ctx, puts, pushes, git } = fakeGithub({ review: "required" });
     const seen: StepResult[] = [];
     const plans: PlanStep[][] = [];
     const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, onStep: (s) => seen.push(s), onPlan: (p) => plans.push(p), replan: noSleep });
@@ -110,7 +118,13 @@ describe("stackMerge on a native stack", () => {
       { pr: A, sha: "shaA", bypass: true, method: "squash" },
       { pr: B, sha: "shaB1", bypass: true, method: "squash" },
     ]);
-    expect(ghStack).toEqual(["--version", "--version", "checkout 202", "rebase", "push"]);
+    // A's head (what a squash leaves in B's history) is where B's own commits start; B lands on the trunk tip
+    expect(git).toContain("checkout --detach shaB0");
+    expect(git).toContain("rebase --no-autostash --onto trunk0 shaA");
+    expect(pushes).toEqual(["push --atomic --force-with-lease=refs/heads/b202:shaB0 origin shaB1:refs/heads/b202"]);
+    expect(git).toContain("ls-remote origin refs/heads/b202");
+    expect(git.some((c) => c.includes("stack"))).toBe(false);
+    expect(r.results[1]!.detail).toContain("temporary checkout");
     expect(r.results.map((x) => `${x.step.kind}:${"pr" in x.step ? x.step.pr : ""}`)).toEqual([`merge:${A}`, `rebase-stack:${B}`, `merge:${B}`]);
     expect(seen).toEqual(r.results);
     expect(r.merged).toEqual([A, B]);
@@ -122,76 +136,49 @@ describe("stackMerge on a native stack", () => {
 
   test("a non-forced clean native stack is one merge call landing both PRs, with no rebase", async () => {
     clearRulesCache();
-    const { ctx, puts, ghStack } = fakeGithub({ review: "approved" });
+    const { ctx, puts, git } = fakeGithub({ review: "approved" });
     const plans: PlanStep[][] = [];
     const r = await stackMerge(ctx, A, { method: "squash", force: false, upTo: B, onPlan: (p) => plans.push(p), replan: noSleep });
     expect(puts).toEqual([{ pr: B, sha: "shaB0", bypass: false, method: "squash" }]);
     expect(r.results[0]!.step).toMatchObject({ kind: "merge", pr: B, includes: [A, B] });
-    expect(ghStack).toEqual([]);
+    expect(git).toEqual([]);
     expect(plans).toEqual([]);
     expect(r.merged).toEqual([A, B]);
   });
 
-  test("a dirty child worktree stops the forced run before any merge", async () => {
+  test("unpushed local commits on a member branch stop the forced run before any merge, naming the branch", async () => {
     clearRulesCache();
-    const { ctx, puts, ghStack } = fakeGithub({ review: "required", dirty: true });
-    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e) => e)) as Error & { data?: { results: StepResult[] } };
-    expect(err.message).toContain("stack merge stopped at #202: Rebase stack didn't start");
-    expect(err.message).toContain("uncommitted changes (bun.lock)");
+    const { ctx, puts, pushes, git } = fakeGithub({ review: "required", divergedLocal: true });
+    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e: Error) => e)) as Error & { data?: { results: StepResult[] } };
+    expect(err.message).toContain("stack merge stopped at #202");
+    expect(err.message).toContain("unpushed commits on b202");
+    expect(err.message).toContain("/wt-B");
     expect(puts).toEqual([]);
-    expect(ghStack).toEqual(["--version"]);
+    expect(pushes).toEqual([]);
+    expect(git.some((c) => c.startsWith("worktree add"))).toBe(false);
+    expect(git).toContain("merge-base --is-ancestor localonly shaB0");
     expect(err.data!.results.map((x) => x.ok)).toEqual([false]);
   });
 
-  test("a missing child worktree stops before the first forced merge, names how to open it, and says which branch needs one", async () => {
+  test("an origin head that differs from the planned one is a lease-rejected stop before any merge", async () => {
     clearRulesCache();
-    const { ctx, puts, ghStack } = fakeGithub({ review: "required", missingWorktree: B });
-    const plans: PlanStep[][] = [];
-    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, onPlan: (p) => plans.push(p), replan: noSleep }).catch((e: Error) => e)) as StkError;
-    expect(err.message).toBe("stack merge stopped at #202: no worktree has #202's branch (b202) checked out; open one with: stk worktree 202");
-    expect(err.data).toMatchObject({ worktrees: [{ pr: 202, branch: "b202" }] });
-    // the rebase is shown where it runs: after the first merge lands, not before anything merged
-    expect(plans[0]!.map((s) => `${s.kind}:${"pr" in s ? s.pr : ""}`)).toEqual(["merge:201", "rebase-stack:202", "merge:202"]);
-    expect(puts).toEqual([]);
-    expect(ghStack).toEqual(["--version"]);
-  });
-
-  test("a detached worktree whose local branch has unpushed commits stops before the first merge, not after it", async () => {
-    clearRulesCache();
-    const { ctx, puts, git } = fakeGithub({ review: "required", detachedWorktree: true, divergedLocal: true });
+    const { ctx, puts, pushes } = fakeGithub({ review: "required", originMoved: true });
     const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e: Error) => e)) as Error;
-    expect(err.message).toContain("has commits that are not on origin");
+    expect(err.message).toContain("origin/b202 is otherB but the stack was read at shaB0");
     expect(puts).toEqual([]);
-    expect(git).toEqual([]);
+    expect(pushes).toEqual([]);
   });
 
-  test("a worktree detached at the branch tip counts: it is switched to the branch and the stack merges", async () => {
+  test("every remaining member is rebased in the temporary checkout, including those of a clean atomic group", async () => {
     clearRulesCache();
-    const { ctx, puts, ghStack, git } = fakeGithub({ review: "required", detachedWorktree: true });
-    const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep });
-    expect(r.merged).toEqual([A, B]);
-    expect(git).toEqual([`git switch -c b${B}@/wt-${B}`, `git branch --set-upstream-to origin/b${B}@/wt-${B}`]);
-    expect(ghStack).toContain("checkout 202");
-    expect(puts.map((p) => p.pr)).toEqual([A, B]);
-  });
-
-  test("a missing extension stops before any forced merge or rebase mutation", async () => {
-    clearRulesCache();
-    const { ctx, puts, ghStack } = fakeGithub({ review: "required", extensionMissing: true });
-    const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e: Error) => e);
-    expect((err as Error).message).toContain("gh extension install github/gh-stack");
-    expect(puts).toEqual([]);
-    expect(ghStack).toEqual(["--version"]);
-  });
-
-  test("every remaining selected branch needs a worktree even if it initially lands in a clean atomic group", async () => {
-    clearRulesCache();
-    // Initial plan: A bypass alone, then merge #203 includes=[B,203]. Rebase may reset reviews/checks and split that group.
-    const { ctx, puts, ghStack } = fakeGithub({ review: "required", cleanGroup: true, missingWorktree: 203 });
-    const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: 203, replan: noSleep }).catch((e: Error) => e);
-    expect((err as Error).message).toContain("stk worktree 203");
-    expect(puts).toEqual([]);
-    expect(ghStack).toEqual(["--version"]);
+    // Initial plan: A bypass alone, then merge #203 includes=[B,203]; the rebase may reset reviews/checks and split that group.
+    const { ctx, puts, pushes, git } = fakeGithub({ review: "required", cleanGroup: true });
+    const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: 203, replan: noSleep });
+    expect(r.merged).toEqual([A, B, 203]);
+    expect(puts.map((p) => p.sha)).toEqual(["shaA", "new203"]);
+    expect(pushes).toEqual(["push --atomic --force-with-lease=refs/heads/b202:shaB0 --force-with-lease=refs/heads/b203:sha203 origin shaB1:refs/heads/b202 new203:refs/heads/b203"]);
+    expect(git).toContain("rebase --no-autostash --onto trunk0 shaA");
+    expect(git).toContain("rebase --no-autostash --onto shaB1 shaB0");
   });
 
   test("right after the push GitHub still computes mergeability: the re-plan waits instead of stopping", async () => {
@@ -207,13 +194,13 @@ describe("stackMerge on a native stack", () => {
   for (const checkingAs of ["mergeState", "mergeable"] as const) {
     test(`when GitHub restacks B itself after A lands, B merges at the new head once its mergeability settles (${checkingAs} UNKNOWN)`, async () => {
       clearRulesCache();
-      const { ctx, puts, ghStack } = fakeGithub({ review: "required", githubRestacks: 2, checkingAs });
+      const { ctx, puts, pushes } = fakeGithub({ review: "required", githubRestacks: 2, checkingAs });
       const sleeps: number[] = [];
       const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: { attempts: 5, delayMs: 7, sleep: async (ms) => void sleeps.push(ms) } });
       expect(sleeps).toEqual([7, 7]);
       expect(puts.map((p) => p.sha)).toEqual(["shaA", "shaB1"]);
       expect(r.merged).toEqual([A, B]);
-      expect(ghStack).toEqual(["--version"]);
+      expect(pushes).toEqual([]);
     });
 
     test(`mergeability still computing after polling runs out stops with that reason instead of force-merging (${checkingAs} UNKNOWN)`, async () => {
@@ -227,24 +214,24 @@ describe("stackMerge on a native stack", () => {
 
   test("an unexpected downstack PR after A lands stops before any rebase or merge of the changed stack", async () => {
     clearRulesCache();
-    const { ctx, puts, ghStack } = fakeGithub({ review: "required", unexpectedDownstack: true });
+    const { ctx, puts, pushes } = fakeGithub({ review: "required", unexpectedDownstack: true });
     const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain("native stack membership or order changed");
     expect(puts.map((p) => p.pr)).toEqual([A]);
-    expect(ghStack).toEqual(["--version"]);
+    expect(pushes).toEqual([]);
   });
 
   test("exhausted stale-state polling stops before any rebase mutation", async () => {
     clearRulesCache();
-    const { ctx, puts, ghStack } = fakeGithub({ review: "required", staleMerged: true });
+    const { ctx, puts, pushes } = fakeGithub({ review: "required", staleMerged: true });
     const sleeps: number[] = [];
     const err = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: { attempts: 2, delayMs: 7, sleep: async (ms) => void sleeps.push(ms) } }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain("GitHub still lists #201 as open after it merged");
     expect(sleeps).toEqual([7, 7]);
     expect(puts.map((p) => p.pr)).toEqual([A]);
-    expect(ghStack).toEqual(["--version"]);
+    expect(pushes).toEqual([]);
   });
 
   test("CLEAN snapshots with the old head after push are polled until the actual pushed SHA appears", async () => {

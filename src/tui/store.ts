@@ -1200,7 +1200,7 @@ export class Store {
    * then merges without bypassing anything. `stack`: land the stack up to `n`.
    */
   startMergeWhenReady(n: number, method: MergeMethod, stack: boolean, repo?: RepoSlug): Promise<Outcome<{ jobId: string }>> {
-    return this.startMergeJob("merge-when-ready", n, method, false, repo, undefined, stack);
+    return this.startMergeJob("merge-when-ready", n, method, false, repo, stack);
   }
 
   /** The waiting merge-when-ready job covering PR `n`, if any. */
@@ -1286,19 +1286,19 @@ export class Store {
     await Promise.all([...prs.map((p) => this.loadPr(p, { force: true, repo })), this.loadScope(this.state.screen.scope, { force: true })]);
   }
 
-  /** Start a detached stack rebase job (`gh stack rebase` + `push` in the worktree of #n's branch). */
-  startRebaseStack(n: number, opts: { stash?: boolean; repo?: RepoSlug } = {}): Promise<Outcome<{ jobId: string }>> {
-    return this.startMergeJob("rebase-stack", n, "squash", false, opts.repo, opts.stash);
+  /** Start a detached stack rebase job (rebases in a temporary checkout and pushes with leases). */
+  startRebaseStack(n: number, opts: { repo?: RepoSlug } = {}): Promise<Outcome<{ jobId: string }>> {
+    return this.startMergeJob("rebase-stack", n, "squash", false, opts.repo);
   }
 
-  private async startMergeJob(kind: Job["kind"], n: number, method: MergeMethod, force: boolean, repo?: RepoSlug, stash?: boolean, stack?: boolean): Promise<Outcome<{ jobId: string }>> {
+  private async startMergeJob(kind: Job["kind"], n: number, method: MergeMethod, force: boolean, repo?: RepoSlug, stack?: boolean): Promise<Outcome<{ jobId: string }>> {
     const r = repo ?? this.activeRepo();
     if (!r) return { ok: false, error: new Error("repository not open") };
     try {
       const ctx = await this.ctxFor(r);
       // a stack job must not overlap a running job on any PR of its stack
       const stackPrs = kind === "merge" ? [] : this.stackPreview(n, r).map((e) => e.number);
-      const { id } = await startJob({ kind, repo: r, pr: n, method, force, ...(stash ? { stash } : {}), ...(stack ? { stack } : {}), ...(ctx.root ? { repoDir: ctx.root } : {}) }, { stackPrs });
+      const { id } = await startJob({ kind, repo: r, pr: n, method, force, ...(stack ? { stack } : {}), ...(ctx.root ? { repoDir: ctx.root } : {}) }, { stackPrs });
       this.trackJob(id);
       return { ok: true, value: { jobId: id } };
     } catch (e) {

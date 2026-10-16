@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { planItems, prStatus, stackSummary, withExpectedRebases, worktreeNote } from "../src/stackview";
+import { planItems, prStatus, stackSummary, withExpectedRebases } from "../src/stackview";
 import type { Blocker, PlanStep } from "../src/types";
 
 const review: Blocker = { kind: "review", decision: "REVIEW_REQUIRED" };
@@ -62,7 +62,7 @@ describe("plan lines", () => {
     expect(shown.map((s) => `${s.kind}:${"pr" in s ? s.pr : ""}`)).toEqual(["merge:2462", "rebase-stack:2463", "merge:2463"]);
     expect(planItems(shown, "main", "squash")).toEqual([
       { steps: [0], text: "Merge #2462 into main (squash)", why: "bypasses review" },
-      { steps: [1], text: "Rebase #2463 onto main and everything above it", why: "after #2462 lands; GitHub leaves it on the merged branch (gh stack)", worktreePr: 2463 },
+      { steps: [1], text: "Rebase #2463 onto main and everything above it", why: "after #2462 lands; GitHub leaves it on the merged branch; runs in a temporary checkout" },
       { steps: [2], text: "Merge #2463 into main (squash)", why: "bypasses review" },
     ]);
   });
@@ -94,14 +94,5 @@ describe("plan lines", () => {
       "Wait for #2 checks to pass",
       "Merge #2 into main (squash)",
     ]);
-  });
-});
-
-describe("worktreeNote", () => {
-  test("says where the rebase runs, or what is missing", () => {
-    expect(worktreeNote({ pr: 2, branch: "b2", kind: "branch", path: "/w" })).toEqual({ text: "runs in /w", ok: true });
-    expect(worktreeNote({ pr: 2, branch: "b2", kind: "detached", path: "/w" })).toEqual({ text: "runs in /w (detached at the branch tip; stk switches it to b2)", ok: true });
-    expect(worktreeNote({ pr: 2, branch: "b2", kind: "none" })).toEqual({ text: "no worktree has b2 checked out; c creates one", ok: false });
-    expect(worktreeNote(undefined)).toBeNull();
   });
 });

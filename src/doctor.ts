@@ -78,13 +78,6 @@ async function checkAuth(exec: Exec): Promise<DoctorCheck> {
   return check("gh-auth", "ok", `logged in as ${user} (scopes: ${scopes.join(", ")})`);
 }
 
-async function checkStackExt(exec: Exec): Promise<DoctorCheck> {
-  const r = await exec(["gh", "extension", "list"]);
-  const row = r.code === 0 ? r.stdout.split("\n").map((l) => l.split("\t")).find((c) => c[1]?.trim() === "github/gh-stack") : undefined;
-  if (!row) return check("gh-stack", "warn", "gh-stack extension is not installed (stack rebase and submit need it)", "run: gh extension install github/gh-stack");
-  return check("gh-stack", "ok", `gh-stack ${row[2]?.trim() || "(version unknown)"}`);
-}
-
 async function checkTern(exec: Exec, env: Record<string, string | undefined>): Promise<DoctorCheck> {
   const r = await exec(["tern", "--version"]);
   const v = r.code === 0 ? firstLine(r.stdout) : "";
@@ -200,7 +193,6 @@ export async function runDoctor(o: DoctorOpts): Promise<DoctorCheck[]> {
   return Promise.all([
     checkGh(o.exec),
     checkAuth(o.exec),
-    checkStackExt(o.exec),
     checkTern(o.exec, env),
     checkTranscripts(o.sessionsDir ?? join(home, ".omp/agent/sessions")),
     graphqlRate(o.exec).then((r) => rateCheck("rate-graphql", "GraphQL", r, now)),

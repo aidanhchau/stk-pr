@@ -25,7 +25,7 @@ const B = pr(2463, "Queue chief-of-staff Slack answers and DMs for cosd to pull"
 const C = pr(2464, "Show the queue depth in the cosd status line", "aidan/cos-slack-answers", "aidan/cos-queue-depth");
 
 /** The plan the service makes for a native stack of `prs` landed up to `target`. */
-function infoFor(prs: PullRequest[], target: number, wt: "none" | "detached"): StackInfo {
+function infoFor(prs: PullRequest[], target: number): StackInfo {
   return {
     stack: { trunk: "main", prs, native: true },
     forks: [],
@@ -34,22 +34,18 @@ function infoFor(prs: PullRequest[], target: number, wt: "none" | "detached"): S
     target,
     stop: null,
     notes: [],
-    rebaseWorktrees: [{ pr: 2463, branch: "aidan/cos-slack-answers", kind: wt, ...(wt === "none" ? {} : { path: "/wt/cos" }) }],
   };
 }
 
 class Stub extends Store {
   /** The `upTo` of every plan the sheet asked for. */
   readonly asked: (number | "top")[] = [];
-  constructor(
-    private readonly prs: PullRequest[],
-    private readonly wt: "none" | "detached",
-  ) {
+  constructor(private readonly prs: PullRequest[]) {
     super("/nonexistent", { gh: { owner: "maple", name: "maple-gtm" } });
   }
   override async stackInfo(_n: number, _method: unknown, _force: boolean, upTo: number | "top" = "top"): Promise<Outcome<StackInfo>> {
     this.asked.push(upTo);
-    return { ok: true, value: infoFor(this.prs, upTo === "top" ? this.prs[this.prs.length - 1]!.number : upTo, this.wt) };
+    return { ok: true, value: infoFor(this.prs, upTo === "top" ? this.prs[this.prs.length - 1]!.number : upTo) };
   }
 }
 
@@ -65,8 +61,8 @@ async function settle(): Promise<string> {
   return frame();
 }
 
-async function mount(prs: PullRequest[], props: { n: number; upTo?: number | "top" }, wt: "none" | "detached" = "detached", jobs: Job[] = []) {
-  const store = new Stub(prs, wt);
+async function mount(prs: PullRequest[], props: { n: number; upTo?: number | "top" }, jobs: Job[] = []) {
+  const store = new Stub(prs);
   const seeded = Object.fromEntries(jobs.map((j) => [`${repoKey(j.repo)}#${j.pr}`, j]));
   (store as unknown as { set: (p: object) => void }).set({ jobs: seeded });
   setup = await testRender(
@@ -82,7 +78,7 @@ async function mount(prs: PullRequest[], props: { n: number; upTo?: number | "to
 }
 
 test("the stack is drawn top PR first with the base branch at the bottom, merge order numbered, and the plan says why", async () => {
-  const { text } = await mount([A, B], { n: 2463 }, "none");
+  const { text } = await mount([A, B], { n: 2463 });
   if (process.env.STK_PRINT) console.log(text);
   const rows = text.split("\n");
   const at = (s: string) => rows.findIndex((l) => l.includes(s));
@@ -97,14 +93,12 @@ test("the stack is drawn top PR first with the base branch at the bottom, merge 
   // the rebase sits between the two merges
   expect(at("1. Merge #2462")).toBeLessThan(at("2. Rebase #2463"));
   expect(at("2. Rebase #2463")).toBeLessThan(at("3. Merge #2463"));
-  expect(text).toContain("no worktree has aidan/cos-slack-answers checked out; c creates one");
-  expect(text).toContain("c create worktree");
 });
 
-test("a detached worktree at the tip is reported as usable", async () => {
+test("the rebase step says it runs in a temporary checkout and never offers a worktree", async () => {
   const { text } = await mount([A, B], { n: 2463 });
-  expect(text).toContain("detached at the branch tip");
-  expect(text).not.toContain("c create worktree");
+  expect(flat(text)).toContain("runs in a temporary checkout");
+  expect(text).not.toContain("worktree");
 });
 
 test("opened on the bottom PR, only that PR is planned and the PRs above it stay open", async () => {
@@ -185,7 +179,7 @@ test("reopened from a lower member, the sheet shows the running whole-stack job 
     startedAt: 1,
     updatedAt: 1,
   };
-  const { text } = await mount([A, B, C], { n: 2462 }, "detached", [job]);
+  const { text } = await mount([A, B, C], { n: 2462 }, [job]);
   expect(text).toContain("runs in background");
   expect(text).not.toContain("merge up to here ·");
 });

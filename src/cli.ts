@@ -46,7 +46,7 @@ usage: stk [--repo DIR] [--json] <command>
   stack <n> [--merge] [--force] [--method M]   show the plan, or execute it with --merge
   jobs [--gh OWNER/NAME] [--json]      recent merge jobs (merges run detached and survive closing the TUI)
   session [--pane ID]                  PRs mentioned in a Tern pane's agent session (default: the agent pane next to $TERN_PANE)
-  doctor                               check gh, auth, gh-stack, Tern, rate limits, cache and repo detection (--json; exit 1 on a failure)
+  doctor                               check gh, auth, Tern, rate limits, cache and repo detection (--json; exit 1 on a failure)
   tui [--pr N] [--gh OWNER/NAME] [--session-pane ID]   terminal UI (also the default with no command)
 
 Outside a GitHub repo, tui opens a workspace board over the repos found below the directory (3 levels deep;
