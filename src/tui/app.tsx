@@ -2,6 +2,7 @@
 import { useKeyboard, useRenderer } from "@opentui/react";
 import { createElement, useEffect } from "react";
 import { Board, boardChrome } from "./board";
+import { runCommand } from "./commands";
 import { Pr, prCapturesBack, prChrome } from "./pr";
 import { Sheets } from "./sheets";
 import { useStore, useStoreInstance } from "./store";
@@ -40,6 +41,8 @@ export function App() {
       return;
     }
     if (s.sheet) return;
+    // ⌘⇧C copies the PR URL (kitty `super`; shift may arrive as name "C" or as the flag). Plain c / C stay with the screens.
+    if (key.super && key.shift && !key.ctrl && !key.meta && key.name?.toLowerCase() === "c") return void runCommand(store, "copy-url");
     if (key.name === "q" && !key.ctrl && !key.meta) renderer.destroy();
     else if ((key.name === "backspace" || key.name === "h") && s.screen.kind === "pr" && !prCapturesBack()) store.back();
     else if (key.sequence === "?") store.openSheet({ kind: "help" });
