@@ -62,22 +62,28 @@ export function resolveWorktree(worktrees: Worktree[], branch: string, tip: stri
 }
 
 /**
- * Check `branch` out in a worktree that is detached at `tip`. Creates the local branch there when it does not exist; an
- * existing local branch is moved to `tip` only when it is behind it (no commit can be lost).
+ * What checking `branch` out in a worktree detached at `tip` takes, decided without changing anything: create the local
+ * branch there, switch to it (already at the tip), or move it forward (only behind the tip, so no commit can be lost).
+ * Throws `diverged` when the local branch has commits that are not on origin.
  */
-export async function attachBranch(exec: Exec, dir: string, branch: string, tip: string): Promise<void> {
+export async function planAttach(exec: Exec, dir: string, branch: string, tip: string): Promise<"create" | "switch" | "forward"> {
   const local = await git(exec, dir, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
-  if (local.code !== 0) {
-    await gitOk(exec, dir, ["switch", "-c", branch]);
-    await git(exec, dir, ["branch", "--set-upstream-to", `origin/${branch}`]);
-    return;
-  }
+  if (local.code !== 0) return "create";
   const at = local.stdout.trim();
-  if (at === tip) return void (await gitOk(exec, dir, ["switch", branch]));
+  if (at === tip) return "switch";
   if ((await git(exec, dir, ["merge-base", "--is-ancestor", at, tip])).code !== 0) {
     throw new StkError(`local ${branch} (${at.slice(0, 9)}) has commits that are not on origin; ${dir} is detached at origin's ${tip.slice(0, 9)}. Push or move ${branch} first`, "diverged");
   }
-  await gitOk(exec, dir, ["switch", "-C", branch]);
+  return "forward";
+}
+
+/** Check `branch` out in a worktree that is detached at `tip` (see `planAttach`). */
+export async function attachBranch(exec: Exec, dir: string, branch: string, tip: string): Promise<void> {
+  const how = await planAttach(exec, dir, branch, tip);
+  if (how === "create") {
+    await gitOk(exec, dir, ["switch", "-c", branch]);
+    await git(exec, dir, ["branch", "--set-upstream-to", `origin/${branch}`]);
+  } else await gitOk(exec, dir, how === "switch" ? ["switch", branch] : ["switch", "-C", branch]);
 }
 
 export async function repoRoot(exec: Exec, cwd: string): Promise<string> {

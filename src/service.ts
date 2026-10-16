@@ -5,7 +5,7 @@
 import { join } from "node:path";
 import type { PaletteItem } from "./fuzzy";
 import { GH_ENV, formatGhOutput, planGh, type GhResult } from "./ghproxy";
-import { attachBranch, isClean, listWorktrees, remoteSha, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
+import { attachBranch, isClean, planAttach, listWorktrees, remoteSha, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
 import { commitSubjects, currentBranch, localBranches, nearestParent, pushBranch, pushEmptyCommit, pushKind, RETRIGGER_MESSAGE, type PushKind } from "./branches";
 import {
   closePr,
@@ -622,9 +622,12 @@ export async function stackInfo(
 ): Promise<StackInfo> {
   const { trunk, stack, forks, plan, target, notes, rules } = await planFor(ctx, n, opts);
   const perPr = blockersByPr(stack, trunk, rules);
-  const rebasing = notes.some((x) => x.action === "rebase-stack") ? [stack.prs[0]!] : nativeRebaseBottoms(stack, plan, target);
+  // the sheet's own rebase (stale base) runs from the PR it was opened on
+  const rebasing = notes.some((x) => x.action === "rebase-stack") ? [stack.prs.find((p) => p.number === n) ?? stack.prs[0]!] : nativeRebaseBottoms(stack, plan, target);
+  // read fresh: a worktree made since this ctx was opened (here or in another shell) must count
+  const worktrees = ctx.root ? await listWorktrees(ctx.exec, ctx.root).catch(() => ctx.worktrees) : ctx.worktrees;
   const rebaseWorktrees = rebasing.map((p): RebaseWorktree => {
-    const found = resolveWorktree(ctx.worktrees, p.headRef, p.headSha);
+    const found = resolveWorktree(worktrees, p.headRef, p.headSha);
     return { pr: p.number, branch: p.headRef, kind: found.kind, ...(found.kind === "none" ? {} : { path: found.worktree.path }) };
   });
   return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes, rebaseWorktrees };
@@ -894,10 +897,15 @@ async function preflightNativeRebase(ctx: Ctx, open: PullRequest[], bottoms: Pul
   for (const pr of bottoms) {
     const found = resolveWorktree(worktrees, pr.headRef, pr.headSha);
     if (found.kind === "none") missing.push({ pr: pr.number, branch: pr.headRef });
-    else {
-      cwds[pr.number] = found.worktree.path;
-      if (found.kind === "detached") attach.push({ path: found.worktree.path, branch: pr.headRef, tip: pr.headSha });
-    }
+    else cwds[pr.number] = found.worktree.path;
+  }
+  // Every open member sitting in a detached worktree gets its branch back before gh stack rewrites anything, so each
+  // later rebase finds its worktree; whether that can be done is checked now (nothing is merged yet), changing nothing.
+  for (const pr of open) {
+    const found = resolveWorktree(worktrees, pr.headRef, pr.headSha);
+    if (found.kind !== "detached") continue;
+    await planAttach(ctx.exec, found.worktree.path, pr.headRef, pr.headSha);
+    attach.push({ path: found.worktree.path, branch: pr.headRef, tip: pr.headSha });
   }
   if (missing.length > 0) {
     const what = missing.map((m) => `#${m.pr}'s branch (${m.branch})`).join(" or ");

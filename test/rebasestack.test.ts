@@ -6,7 +6,7 @@ import { rebaseStack, stackInfo, type Ctx } from "../src/service";
 const CHAIN = [101, 102, 103];
 
 /** Fake gh/git for a native stack whose #101 already merged (so #102's base is the merged branch b101). */
-function fake(o: { ext?: boolean; rebase?: "ok" | "conflict" | "refuse"; dirty?: boolean; popFails?: boolean; wt?: "branch" | "detached" | "stale" | "none" } = {}): { ctx: Ctx; calls: { argv: string[]; cwd?: string }[] } {
+function fake(o: { ext?: boolean; rebase?: "ok" | "conflict" | "refuse"; dirty?: boolean; popFails?: boolean; wt?: "branch" | "detached" | "stale" | "none"; also103Detached?: boolean } = {}): { ctx: Ctx; calls: { argv: string[]; cwd?: string }[] } {
   const calls: { argv: string[]; cwd?: string }[] = [];
   const member = (n: number) => ({
     number: n, title: `PR ${n}`, url: "", author: { login: "me" }, state: n === 101 ? "MERGED" : "OPEN", isDraft: false,
@@ -15,6 +15,7 @@ function fake(o: { ext?: boolean; rebase?: "ok" | "conflict" | "refuse"; dirty?:
   });
   const kind = o.wt ?? "branch";
   const wtBlock = kind === "none" ? "" : kind === "branch" ? "worktree /wt-102\nHEAD sha102\nbranch refs/heads/b102\n\n" : `worktree /wt-102\nHEAD ${kind === "stale" ? "old000" : "sha102"}\ndetached\n\n`;
+  const wtList = wtBlock + (o.also103Detached ? "worktree /wt-103\nHEAD sha103\ndetached\n\n" : "");
   const exec: Exec = async (argv, opts) => {
     calls.push({ argv: [...argv], ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
     const a = argv.join(" ");
@@ -26,8 +27,8 @@ function fake(o: { ext?: boolean; rebase?: "ok" | "conflict" | "refuse"; dirty?:
     }
     if (a.startsWith("gh repo view")) return { code: 0, stdout: JSON.stringify({ owner: { login: "o" }, name: "r", defaultBranchRef: { name: "main" } }), stderr: "" };
     if (a === "gh stack --version") return o.ext === false ? { code: 1, stdout: "", stderr: "unknown command" } : { code: 0, stdout: "gh stack 0.2.1", stderr: "" };
-    if (a === "git worktree list --porcelain") return { code: 0, stdout: `worktree /repo\nHEAD h0\nbranch refs/heads/main\n\n${wtBlock}`, stderr: "" };
-    if (a === "git rev-parse --verify --quiet refs/heads/b102") return { code: 1, stdout: "", stderr: "" };
+    if (a === "git worktree list --porcelain") return { code: 0, stdout: `worktree /repo\nHEAD h0\nbranch refs/heads/main\n\n${wtList}`, stderr: "" };
+    if (a === "git rev-parse --verify --quiet refs/heads/b102" || a === "git rev-parse --verify --quiet refs/heads/b103") return { code: 1, stdout: "", stderr: "" };
     if (a.startsWith("git switch") || a.startsWith("git branch --set-upstream-to")) return { code: 0, stdout: "", stderr: "" };
     if (a === "git status --porcelain") return { code: 0, stdout: o.dirty ? " M bun.lock\n?? notes.txt\n" : "", stderr: "" };
     if (a.startsWith("git stash push")) return { code: 0, stdout: "", stderr: "" };
@@ -111,6 +112,13 @@ describe("rebaseStack", () => {
     expect(order.indexOf("git switch -c")).toBeLessThan(order.indexOf("gh stack checkout"));
   });
 
+  test("every stack branch sitting in a detached worktree gets its branch back before gh stack rewrites any tip", async () => {
+    const f = fake({ wt: "detached", also103Detached: true });
+    await rebaseStack(f.ctx, 102);
+    const order = f.calls.filter((c) => c.argv[1] === "switch" || (c.argv[1] === "stack" && c.argv[2] === "checkout")).map((c) => `${c.argv.slice(1).join(" ")}@${c.cwd}`);
+    expect(order).toEqual(["switch -c b102@/wt-102", "switch -c b103@/wt-103", "stack checkout 102@/wt-102"]);
+  });
+
   test("a worktree detached at some other commit is not the branch", async () => {
     const f = fake({ wt: "stale" });
     const e = (await rebaseStack(f.ctx, 102).catch((x: unknown) => x)) as StkError;
@@ -119,10 +127,12 @@ describe("rebaseStack", () => {
   });
 
   test("stackInfo says where the rebase would run: the branch's worktree, a detached one, or none", async () => {
-    const where = async (wt: "branch" | "detached" | "none") => (await stackInfo(fake({ wt }).ctx, 103, { method: "squash", force: false })).rebaseWorktrees;
+    const where = async (wt: "branch" | "detached" | "none", from = 102) => (await stackInfo(fake({ wt }).ctx, from, { method: "squash", force: false })).rebaseWorktrees;
     expect(await where("branch")).toEqual([{ pr: 102, branch: "b102", kind: "branch", path: "/wt-102" }]);
     expect(await where("detached")).toEqual([{ pr: 102, branch: "b102", kind: "detached", path: "/wt-102" }]);
     expect(await where("none")).toEqual([{ pr: 102, branch: "b102", kind: "none" }]);
+    // the rebase runs from the PR the sheet was opened on, so that is the branch that needs the worktree
+    expect(await where("branch", 103)).toEqual([{ pr: 103, branch: "b103", kind: "none" }]);
   });
 
   test("stash: dirty worktrees are stashed first, then rebased and pushed, then restored", async () => {

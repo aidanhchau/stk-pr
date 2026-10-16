@@ -21,7 +21,7 @@ interface Put {
  * "mergeable"` `mergeable` UNKNOWN beside a BLOCKED state. merge-async enforces what GitHub does: bypass only on the
  * bottom-most unmerged PR, and a pinned `sha` must still be the PR's head.
  */
-function fakeGithub(o: { review: "required" | "approved"; dirty?: boolean; checkingReads?: number; githubRestacks?: number; checkingAs?: "mergeState" | "mergeable"; unexpectedDownstack?: boolean; staleMerged?: boolean; oldHeadReads?: number; missingWorktree?: number; detachedWorktree?: boolean; extensionMissing?: boolean; cleanGroup?: boolean }): { ctx: Ctx; puts: Put[]; ghStack: string[]; git: string[] } {
+function fakeGithub(o: { review: "required" | "approved"; dirty?: boolean; checkingReads?: number; githubRestacks?: number; checkingAs?: "mergeState" | "mergeable"; unexpectedDownstack?: boolean; staleMerged?: boolean; oldHeadReads?: number; missingWorktree?: number; detachedWorktree?: boolean; divergedLocal?: boolean; extensionMissing?: boolean; cleanGroup?: boolean }): { ctx: Ctx; puts: Put[]; ghStack: string[]; git: string[] } {
   const puts: Put[] = [];
   const ghStack: string[] = [];
   const git: string[] = [];
@@ -82,7 +82,8 @@ function fakeGithub(o: { review: "required" | "approved"; dirty?: boolean; check
       return ok(`worktree /repo\nHEAD h0\nbranch refs/heads/main\n\n${originalChain.filter((n) => n !== A && n !== o.missingWorktree).map(wt).join("")}`);
     }
     // attaching a detached worktree to its branch: no local branch yet, so it is created where HEAD is
-    if (a === `git rev-parse --verify --quiet refs/heads/b${B}`) return { code: 1, stdout: "", stderr: "" };
+    if (a === `git rev-parse --verify --quiet refs/heads/b${B}`) return o.divergedLocal ? ok("localonly\n") : { code: 1, stdout: "", stderr: "" };
+    if (a.startsWith("git merge-base --is-ancestor")) return { code: 1, stdout: "", stderr: "" };
     if (a.startsWith("git switch") || a.startsWith("git branch --set-upstream-to")) {
       git.push(`${a}@${opts?.cwd}`);
       return ok("");
@@ -153,6 +154,15 @@ describe("stackMerge on a native stack", () => {
     expect(plans[0]!.map((s) => `${s.kind}:${"pr" in s ? s.pr : ""}`)).toEqual(["merge:201", "rebase-stack:202", "merge:202"]);
     expect(puts).toEqual([]);
     expect(ghStack).toEqual(["--version"]);
+  });
+
+  test("a detached worktree whose local branch has unpushed commits stops before the first merge, not after it", async () => {
+    clearRulesCache();
+    const { ctx, puts, git } = fakeGithub({ review: "required", detachedWorktree: true, divergedLocal: true });
+    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e: Error) => e)) as Error;
+    expect(err.message).toContain("has commits that are not on origin");
+    expect(puts).toEqual([]);
+    expect(git).toEqual([]);
   });
 
   test("a worktree detached at the branch tip counts: it is switched to the branch and the stack merges", async () => {
