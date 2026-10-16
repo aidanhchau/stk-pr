@@ -69,8 +69,9 @@ local function cli_failure(result: ProcessResult): string
 end
 
 -- Runs `tern <build(block)>` against `pane`; `done(ok, why, cx)` gets the verdict.
-local function tern_cli(pane: number, build: (string) -> { string }, done: (boolean, string, WindowCx?) -> ())
-	tern.process.run({ TERN_BIN, "inspect", "--json" }, { timeout_ms = 10000 }, function(found: ProcessResult, fcx: WindowCx?)
+-- tern.process.run raises when the binary can't be spawned; that is reported through `done` too (with `cx`).
+local function tern_cli(cx: WindowCx, pane: number, build: (string) -> { string }, done: (boolean, string, WindowCx?) -> ())
+	local started, err = pcall(tern.process.run, { TERN_BIN, "inspect", "--json" }, { timeout_ms = 10000 }, function(found: ProcessResult, fcx: WindowCx?)
 		local ok, parsed = pcall(tern.json.decode, found.stdout)
 		if found.status ~= 0 or not ok then return done(false, cli_failure(found), fcx) end
 		local block: number? = nil
@@ -80,10 +81,12 @@ local function tern_cli(pane: number, build: (string) -> { string }, done: (bool
 		if block == nil then return done(false, "no such pane in tern inspect", fcx) end
 		local argv = { TERN_BIN }
 		for _, arg in build(string.format("%d", block)) do table.insert(argv, arg) end
-		tern.process.run(argv, { timeout_ms = 10000 }, function(result: ProcessResult, ncx: WindowCx?)
+		local ran, why = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(result: ProcessResult, ncx: WindowCx?)
 			done(result.status == 0, if result.status == 0 then "" else cli_failure(result), ncx)
 		end)
+		if not ran then done(false, tostring(why), fcx) end
 	end)
+	if not started then done(false, tostring(err), cx) end
 end
 
 -- Opens `launch` in a split to the right of `pane`. The window API first; the CLI for panes it doesn't know.
@@ -91,7 +94,7 @@ end
 local function split_right(cx: WindowCx, pane: number, launch: Launch)
 	if cx.layout:split(pane, "right", launch) ~= nil then return end
 	local line = launch.command or STK
-	tern_cli(pane, function(block: string): { string }
+	tern_cli(cx, pane, function(block: string): { string }
 		local args = { "split", block, "right" }
 		if launch.cwd then
 			table.insert(args, "--cwd")
@@ -163,7 +166,7 @@ tern.override("close_pane", function(cx: WindowCx)
 	local id = cx.session:focused()
 	for _, p in cx.session:panes() do
 		if p.pane == id and p.kind ~= "browser" and is_stk_pane(p) then
-			tern_cli(p.pane, function(block: string): { string } return { "close", block } end, function(ok: boolean, why: string, ncx: WindowCx?)
+			tern_cli(cx, p.pane, function(block: string): { string } return { "close", block } end, function(ok: boolean, why: string, ncx: WindowCx?)
 				if not ok and ncx then ncx:toast("error", "Could not close the stk pane", why) end
 			end)
 			return true
