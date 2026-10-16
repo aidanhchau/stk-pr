@@ -21,7 +21,7 @@ afterEach(() => {
 
 describe("restack provenance store", () => {
   test("missing file or directory is empty", () => {
-    expect(loadProvenance("r")).toEqual({});
+    expect(loadProvenance("r").size).toBe(0);
   });
 
   test("records are keyed by repo and branch, appended without duplicates", () => {
@@ -29,8 +29,8 @@ describe("restack provenance store", () => {
     recordProvenance("r1", [{ branch: "a", sha: sha(2) }, { branch: "b", sha: sha(3) }]);
     recordProvenance("r1", [{ branch: "a", sha: sha(1) }]);
     recordProvenance("r2", [{ branch: "a", sha: sha(9) }]);
-    expect(loadProvenance("r1")).toEqual({ a: [sha(2), sha(1)], b: [sha(3)] });
-    expect(loadProvenance("r2")).toEqual({ a: [sha(9)] });
+    expect(loadProvenance("r1")).toEqual(new Map([["a", [sha(2), sha(1)]], ["b", [sha(3)]]]));
+    expect(loadProvenance("r2")).toEqual(new Map([["a", [sha(9)]]]));
     expect(provenanceKey({ owner: "o", name: "n" }, "/x")).toBe("o/n@/x");
   });
 
@@ -39,19 +39,19 @@ describe("restack provenance store", () => {
     recordProvenance("r", [{ branch: "old", sha: sha(1) }], now - KEEP_MS - 1000);
     for (let i = 0; i < MAX_HEADS_PER_BRANCH + 5; i++) recordProvenance("r", [{ branch: "a", sha: sha(100 + i) }], now);
     const got = loadProvenance("r");
-    expect(got.old).toBeUndefined();
-    expect(got.a).toHaveLength(MAX_HEADS_PER_BRANCH);
-    expect(got.a![MAX_HEADS_PER_BRANCH - 1]).toBe(sha(100 + MAX_HEADS_PER_BRANCH + 4));
+    expect(got.has("old")).toBe(false);
+    expect(got.get("a")).toHaveLength(MAX_HEADS_PER_BRANCH);
+    expect(got.get("a")![MAX_HEADS_PER_BRANCH - 1]).toBe(sha(100 + MAX_HEADS_PER_BRANCH + 4));
   });
 
   test("a corrupt or wrongly shaped file is treated as empty and replaced on the next write", () => {
     mkdirSync(process.env.STK_STATE_DIR!, { recursive: true });
     for (const junk of ["{nope", "null", '{"repos":[]}', '{"repos":{"r":{"a":[{"sha":"zz","at":1},5,{"sha":"' + sha(1) + '","at":"x"}]}}}']) {
       writeFileSync(provenanceFile(), junk);
-      expect(loadProvenance("r")).toEqual({});
+      expect(loadProvenance("r").size).toBe(0);
     }
     recordProvenance("r", [{ branch: "a", sha: sha(1) }]);
-    expect(loadProvenance("r")).toEqual({ a: [sha(1)] });
+    expect(loadProvenance("r")).toEqual(new Map([["a", [sha(1)]]]));
     expect(JSON.parse(readFileSync(provenanceFile(), "utf8")).version).toBe(1);
   });
 
@@ -65,6 +65,28 @@ describe("restack provenance store", () => {
     await Promise.all(procs.map((p) => p.exited));
     const got = loadProvenance("r");
     // the file parses, and with the lock every writer's last head survived
-    for (let i = 0; i < 4; i++) expect(got[`p${i}`]!.at(-1)).toBe((i * 100 + 9).toString(16).padStart(40, "0"));
+    for (let i = 0; i < 4; i++) expect(got.get(`p${i}`)!.at(-1)).toBe((i * 100 + 9).toString(16).padStart(40, "0"));
+  });
+
+  test("branch names that collide with Object.prototype members are ordinary keys", () => {
+    recordProvenance("constructor", [{ branch: "constructor", sha: sha(1) }, { branch: "__proto__", sha: sha(2) }, { branch: "toString", sha: sha(3) }]);
+    const got = loadProvenance("constructor");
+    expect(got.get("constructor")).toEqual([sha(1)]);
+    expect(got.get("__proto__")).toEqual([sha(2)]);
+    expect(got.get("toString")).toEqual([sha(3)]);
+    expect(loadProvenance("__proto__").size).toBe(0);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  test("when the lock cannot be taken nothing is written, and a fresh lock of a live owner is not broken", () => {
+    mkdirSync(process.env.STK_STATE_DIR!, { recursive: true });
+    const lock = `${provenanceFile()}.lock`;
+    mkdirSync(lock);
+    writeFileSync(join(lock, "pid"), String(process.pid));
+    recordProvenance("r", [{ branch: "a", sha: sha(1) }]);
+    expect(loadProvenance("r").size).toBe(0);
+    rmSync(lock, { recursive: true });
+    recordProvenance("r", [{ branch: "a", sha: sha(1) }]);
+    expect(loadProvenance("r").get("a")).toEqual([sha(1)]);
   });
 });

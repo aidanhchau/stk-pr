@@ -82,7 +82,7 @@ async function fetchRefs(exec: Exec, root: string, branches: string[]): Promise<
 export async function preflightRestack(exec: Exec, root: string, input: RestackInput): Promise<void> {
   await fetchRefs(exec, root, [input.trunk, ...input.members.map((m) => m.branch), ...(input.mergedBaseSha ? [] : [input.baseRef])]);
   const worktrees = await listWorktrees(exec, root);
-  const provenance = input.provenanceKey ? loadProvenance(input.provenanceKey) : {};
+  const provenance = input.provenanceKey ? loadProvenance(input.provenanceKey) : new Map<string, string[]>();
   for (const [i, m] of input.members.entries()) {
     const remote = await revParse(exec, root, remoteRef(m.branch));
     if (remote !== m.headSha) {
@@ -101,7 +101,7 @@ export async function preflightRestack(exec: Exec, root: string, input: RestackI
     if (local === null || local === m.headSha) continue;
     // a local tip that is (an ancestor of) the origin head is published history, not unpushed work
     if ((await git(exec, root, ["merge-base", "--is-ancestor", local, m.headSha])).code === 0) continue;
-    const unpublished = await unpublishedCommits(exec, root, input, m, local, provenance[m.branch] ?? []);
+    const unpublished = await unpublishedCommits(exec, root, input, m, local, provenance.get(m.branch) ?? []);
     if (unpublished !== 0) {
       const wt = worktreeForBranch(worktrees, m.branch);
       const count = unpublished === null ? "" : `${unpublished} unpublished, `;
@@ -131,27 +131,35 @@ async function reflogHeads(exec: Exec, root: string, ref: string): Promise<strin
   return heads;
 }
 
+/** The candidates that exist as commits here: one `git cat-file --batch-check` for all of them. */
+async function existingCommits(exec: Exec, root: string, candidates: string[]): Promise<string[]> {
+  const shas = [...new Set(candidates.filter((s) => /^[0-9a-f]{40,64}$/.test(s)))];
+  if (shas.length === 0) return [];
+  const r = await exec(["git", "cat-file", "--batch-check"], { cwd: root, stdin: `${shas.join("\n")}\n` });
+  if (r.code !== 0) return [];
+  return r.stdout.split("\n").map((l) => l.split(" ")).filter((p) => p[1] === "commit" && p[0] !== undefined).map((p) => p[0]!);
+}
+
+/** Local commits not reachable from any of `tips`, or `null` when git cannot say. */
+async function commitsOutside(exec: Exec, root: string, local: string, tips: string[]): Promise<string[] | null> {
+  const r = await git(exec, root, ["rev-list", local, "--not", ...tips]);
+  return r.code === 0 ? r.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : null;
+}
+
 /**
- * How many commits of the local branch are not verifiably published, or `null` when that cannot be told. Only evidence clears
- * a commit: reachable from a head this branch had on origin (this run's `knownHeads`, the persisted provenance of earlier
- * jobs, or the remote-tracking ref's reflog), or carrying a patch the origin branch already has (`git cherry`).
+ * How many commits of the local branch are not verifiably published, or `null` when that cannot be told. Only reachability
+ * clears a commit: it must be in the history of a head this branch had on origin (this run's `knownHeads`, the persisted
+ * provenance of earlier jobs, or, only when those are not enough, the remote-tracking ref's reflog). Patch equivalence
+ * is deliberately not evidence: it can match unpublished work.
  */
 async function unpublishedCommits(exec: Exec, root: string, input: RestackInput, m: RestackMember, local: string, persisted: string[]): Promise<number | null> {
-  const candidates = [...new Set([...(input.knownHeads?.[m.branch] ?? []), ...persisted, ...(await reflogHeads(exec, root, remoteRef(m.branch)))])];
-  const tips: string[] = [m.headSha];
-  for (const sha of candidates) {
-    if (/^[0-9a-f]{40,64}$/.test(sha) && sha !== m.headSha && (await revParse(exec, root, `${sha}^{commit}`))) tips.push(sha);
-  }
-  const rest = await git(exec, root, ["rev-list", local, "--not", ...tips]);
-  if (rest.code !== 0) return null;
-  const left = rest.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-  if (left.length === 0) return 0;
-  // what is left may still have been published under other hashes (rebased and pushed by someone, or by another clone)
-  const merges = await git(exec, root, ["rev-list", "--merges", local, "--not", ...tips]);
-  const cherry = await git(exec, root, ["cherry", remoteRef(m.branch), local]);
-  if (merges.code !== 0 || merges.stdout.trim() || cherry.code !== 0) return left.length;
-  const matched = cherry.stdout.split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2).trim());
-  return left.filter((sha) => !matched.includes(sha)).length;
+  const known = Object.hasOwn(input.knownHeads ?? {}, m.branch) ? input.knownHeads![m.branch]! : [];
+  const tips = [m.headSha, ...(await existingCommits(exec, root, [...known, ...persisted]))];
+  const left = await commitsOutside(exec, root, local, tips);
+  if (left === null || left.length === 0) return left === null ? null : 0;
+  const fromReflog = (await existingCommits(exec, root, await reflogHeads(exec, root, remoteRef(m.branch)))).filter((s) => !tips.includes(s));
+  if (fromReflog.length === 0) return left.length;
+  return (await commitsOutside(exec, root, local, [...tips, ...fromReflog]))?.length ?? left.length;
 }
 
 async function conflictedFiles(exec: Exec, cwd: string): Promise<string[]> {

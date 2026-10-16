@@ -20,7 +20,7 @@ interface Head {
   sha: string;
   at: number;
 }
-type Store = Record<string, Record<string, Head[]>>;
+type Store = Map<string, Map<string, Head[]>>;
 
 export const stateDir = (): string => process.env.STK_STATE_DIR || join(homedir(), ".cache", "stk");
 export const provenanceFile = () => join(stateDir(), "restack-provenance.json");
@@ -30,15 +30,15 @@ export const provenanceKey = (slug: { owner: string; name: string } | undefined,
 
 const isSha = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{40,64}$/.test(v);
 
-/** Everything well-formed in the file; anything else (missing, truncated, wrong shape) is dropped. */
+/** Everything well-formed in the file; anything else (missing, truncated, wrong shape) is dropped. Maps, so names like `constructor` or `__proto__` are plain keys. */
 function readStore(): Store {
+  const out: Store = new Map();
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(provenanceFile(), "utf8"));
   } catch {
-    return {};
+    return out;
   }
-  const out: Store = {};
   const repos = (raw as { repos?: unknown } | null)?.repos;
   if (!repos || typeof repos !== "object") return out;
   for (const [repo, branches] of Object.entries(repos as Record<string, unknown>)) {
@@ -46,50 +46,75 @@ function readStore(): Store {
     for (const [branch, heads] of Object.entries(branches as Record<string, unknown>)) {
       if (!Array.isArray(heads)) continue;
       const good = heads.filter((h): h is Head => !!h && isSha((h as Head).sha) && Number.isFinite((h as Head).at));
-      if (good.length) (out[repo] ??= {})[branch] = good.map((h) => ({ sha: h.sha, at: h.at }));
+      if (good.length === 0) continue;
+      const mine = out.get(repo) ?? new Map<string, Head[]>();
+      out.set(repo, mine);
+      mine.set(branch, good.map((h) => ({ sha: h.sha, at: h.at })));
     }
   }
   return out;
 }
 
 /** The heads recorded for each branch of `repo`; empty when there is nothing usable. */
-export function loadProvenance(repo: string): Record<string, string[]> {
-  const mine = readStore()[repo] ?? {};
-  return Object.fromEntries(Object.entries(mine).map(([branch, heads]) => [branch, heads.map((h) => h.sha)]));
+export function loadProvenance(repo: string): Map<string, string[]> {
+  return new Map([...(readStore().get(repo) ?? [])].map(([branch, heads]) => [branch, heads.map((h) => h.sha)]));
 }
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** Cross-process mutex (mkdir is atomic). A stale or stuck lock is broken, and after a while we write anyway: the rename keeps the file whole either way. */
-function withLock<T>(fn: () => T): T {
-  const lock = `${provenanceFile()}.lock`;
-  let held = false;
-  for (let i = 0; i < 100 && !held; i++) {
-    try {
-      mkdirSync(lock);
-      held = true;
-    } catch {
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > 10_000) rmSync(lock, { recursive: true, force: true });
-      } catch {
-        /* released meanwhile */
-      }
-      sleepSync(20);
-    }
-  }
+const STALE_LOCK_MS = 60_000;
+
+function pidAlive(pid: number): boolean {
   try {
-    return fn();
-  } finally {
-    if (held) rmSync(lock, { recursive: true, force: true });
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** A lock is only broken when it is old and its owner is gone; an unreadable owner counts as alive. */
+function breakStaleLock(lock: string): void {
+  try {
+    if (Date.now() - statSync(lock).mtimeMs <= STALE_LOCK_MS) return;
+    const pid = Number(readFileSync(join(lock, "pid"), "utf8"));
+    if (Number.isInteger(pid) && pid > 0 && !pidAlive(pid)) rmSync(lock, { recursive: true, force: true });
+  } catch {
+    /* released meanwhile, or owner unknown: leave it */
   }
 }
 
 /**
+ * Cross-process mutex (mkdir is atomic). Runs `fn` only while holding the lock; if it cannot be taken within about two
+ * seconds, `fn` is skipped and false is returned, so there is never an unlocked read-merge-write.
+ */
+function withLock(fn: () => void): boolean {
+  const lock = `${provenanceFile()}.lock`;
+  for (let i = 0; i < 100; i++) {
+    try {
+      mkdirSync(lock);
+    } catch {
+      breakStaleLock(lock);
+      sleepSync(20);
+      continue;
+    }
+    try {
+      writeFileSync(join(lock, "pid"), String(process.pid));
+      fn();
+      return true;
+    } finally {
+      rmSync(lock, { recursive: true, force: true });
+    }
+  }
+  return false;
+}
+
+/**
  * Remember that `heads` (a branch and a head it had on origin before being replaced) were published. Read-merge-write under a
- * lock, written to a temp file and renamed, so concurrent stk processes never see or leave half a file. Best effort: a
- * failure to persist must not fail a restack that already pushed.
+ * lock, written to a temp file and renamed, so concurrent stk processes never see or leave half a file. Best effort: if the
+ * lock cannot be taken or the write fails, nothing is recorded, and that must not fail a restack that already pushed.
  */
 export function recordProvenance(repo: string, heads: { branch: string; sha: string }[], now = Date.now()): void {
   if (heads.length === 0) return;
@@ -98,20 +123,21 @@ export function recordProvenance(repo: string, heads: { branch: string; sha: str
     withLock(() => {
       const store = readStore();
       for (const { branch, sha } of heads) {
-        const list = ((store[repo] ??= {})[branch] ??= []).filter((h) => h.sha !== sha);
-        list.push({ sha, at: now });
-        store[repo]![branch] = list;
+        const branches = store.get(repo) ?? new Map<string, Head[]>();
+        store.set(repo, branches);
+        branches.set(branch, [...(branches.get(branch) ?? []).filter((h) => h.sha !== sha), { sha, at: now }]);
       }
-      for (const [r, branches] of Object.entries(store)) {
-        for (const [branch, list] of Object.entries(branches)) {
-          const kept = list.filter((h) => now - h.at <= KEEP_MS).slice(-MAX_HEADS_PER_BRANCH);
-          if (kept.length) branches[branch] = kept;
-          else delete branches[branch];
+      const out: Record<string, Record<string, Head[]>> = Object.create(null);
+      for (const [r, branches] of store) {
+        const kept: Record<string, Head[]> = Object.create(null);
+        for (const [branch, list] of branches) {
+          const fresh = list.filter((h) => now - h.at <= KEEP_MS).slice(-MAX_HEADS_PER_BRANCH);
+          if (fresh.length) kept[branch] = fresh;
         }
-        if (Object.keys(branches).length === 0) delete store[r];
+        if (Object.keys(kept).length) out[r] = kept;
       }
       const tmp = `${provenanceFile()}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ version: 1, repos: store }));
+      writeFileSync(tmp, JSON.stringify({ version: 1, repos: out }));
       renameSync(tmp, provenanceFile());
     });
   } catch {

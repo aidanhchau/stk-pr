@@ -671,7 +671,7 @@ export async function stackMerge(
   const { stack } = first;
   let expectedHeads: Record<number, string> = {};
   // heads member branches had on origin before this run's restacks (see `rebaseStack`)
-  const knownHeads: Record<string, string[]> = {};
+  const knownHeads: Record<string, string[]> = Object.create(null);
   const deps: ExecuteDeps = {
     exec: ctx.exec,
     // a native stack merge is API calls only; its rebase runs in a temporary checkout
@@ -876,7 +876,10 @@ export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: s
   // a run of several restacks leaves local branches at their old tips on purpose: remember those heads so the next one does not take them for unpushed work
   if (opts.knownHeads) {
     for (const p of open) {
-      if (r.heads[p.number] !== p.headSha) (opts.knownHeads[p.headRef] ??= []).push(p.headSha);
+      if (r.heads[p.number] === p.headSha) continue;
+      const known = opts.knownHeads;
+      if (Object.hasOwn(known, p.headRef)) known[p.headRef]!.push(p.headSha);
+      else Object.defineProperty(known, p.headRef, { value: [p.headSha], enumerable: true, writable: true, configurable: true });
     }
   }
   const note = behindText(r.behind);

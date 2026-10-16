@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exec as realExec } from "../src/exec";
+import { recordProvenance } from "../src/provenance";
 import { preflightRestack, restackAndPush } from "../src/restack";
 import { rebaseStack, type Ctx } from "../src/service";
 import type { Exec, StkError } from "../src/types";
@@ -578,11 +579,11 @@ describe("published-tip provenance across jobs", () => {
     expect(await allHeads()).toEqual(afterFirst);
   });
 
-  test("a local commit whose patch origin already has (different hash) is not unpushed work", async () => {
+  test("a patch-equivalent local commit is NOT evidence of publication: it is refused", async () => {
     await build();
     process.env.STK_STATE_DIR = join(base, "state");
     const old = await allHeads();
-    // someone else pushes X to b103; the clone has the same change committed locally under another hash
+    // someone else pushes X to b103; the clone has the same change committed locally under another hash, never pushed
     await git(seed, "checkout", "-q", "b103");
     await commitFile(seed, "extra-x.txt", "x\n", "X");
     await git(seed, "push", "-q", "origin", "b103");
@@ -592,8 +593,39 @@ describe("published-tip provenance across jobs", () => {
     await commitFile(wt, "extra-x.txt", "x\n", "X (local copy)");
     expectedWorktrees = await worktreeList();
 
-    const r = await rebaseStack(ctxWith(await allHeads()), 102);
+    const err = await errorOf(rebaseStack(ctxWith(await allHeads()), 102));
 
-    expect(r.prs).toEqual([102, 103]);
+    expect(err.code).toBe("diverged");
+    expect(err.message).toContain(wt);
+    expect(err.message).toContain("1 unpublished");
+  });
+
+  test("a branch named `constructor` is looked up as a plain key in provenance and knownHeads", async () => {
+    await build();
+    process.env.STK_STATE_DIR = join(base, "state");
+    const old = await allHeads();
+    // origin/constructor was rewritten after the clone's local `constructor` was made at its previous tip
+    await git(seed, "checkout", "-qb", "constructor", "b102");
+    await commitFile(seed, "c1.txt", "1\n", "c first");
+    await git(seed, "push", "-q", "origin", "constructor");
+    const prev = await git(seed, "rev-parse", "HEAD");
+    // brought in without a remote-tracking ref, so the reflog never saw `prev`
+    await git(clone, "fetch", "-q", origin, "constructor:refs/stk-tmp/prev");
+    await git(clone, "branch", "constructor", prev);
+    await git(clone, "update-ref", "-d", "refs/stk-tmp/prev");
+    await git(seed, "reset", "-q", "--hard", "b102");
+    await commitFile(seed, "c2.txt", "2\n", "c rewritten");
+    await git(seed, "push", "-qf", "origin", "constructor");
+    const head = await git(seed, "rev-parse", "HEAD");
+    const input = { trunk: "main", members: [{ number: 9, branch: "constructor", headSha: head }], mergedBaseSha: null, baseRef: "main", provenanceKey: "o/r@" + clone };
+
+    expect((await errorOf(preflightRestack(realExec, clone, input))).code).toBe("diverged");
+
+    recordProvenance(input.provenanceKey, [{ branch: "constructor", sha: prev }]);
+    await preflightRestack(realExec, clone, input);
+
+    rmSync(join(process.env.STK_STATE_DIR, "restack-provenance.json"));
+    await preflightRestack(realExec, clone, { ...input, knownHeads: Object.assign(Object.create(null), { constructor: [prev] }) });
+    expect(old.b102).toBeDefined();
   });
 });
