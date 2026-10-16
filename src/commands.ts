@@ -60,7 +60,7 @@ const def = (id: CommandId, name: string, hint: string, scope: CommandDef["scope
 
 export const COMMANDS: readonly CommandDef[] = [
   def("merge", "merge", "merge this PR", "pr"),
-  def("merge-stack", "merge stack", "merge the whole stack", "pr", { aliases: ["stack"] }),
+  def("merge-stack", "merge stack", "merge the stack up to this PR", "pr", { aliases: ["stack"] }),
   def("merge-when-ready", "merge when ready", "wait for checks and reviews, then merge", "pr", { aliases: ["merge-when-ready", "auto-merge", "automerge"] }),
   def("cancel-merge", "cancel merge", "stop waiting to merge this PR", "pr", { aliases: ["cancel-merge", "cancel auto-merge", "cancel-auto-merge"] }),
   def("approve", "approve", "approve this PR", "pr", { aliases: ["lgtm"] }),

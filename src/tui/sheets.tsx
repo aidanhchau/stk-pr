@@ -7,7 +7,7 @@ import { StkError, mergeOutcomeOk, mergeOutcomeText, type Blocker, type MergeMet
 import { jobStatusText } from "../jobs";
 import { isWaitable } from "../watch";
 import { waitLabel } from "../waiting";
-import { planItems, prStatus, stackSummary, withExpectedRebases, worktreeNote, type PrStateKind, type PrStatus } from "../stackview";
+import { list as prList, planItems, prStatus, stackSummary, withExpectedRebases, worktreeNote, type PrStateKind, type PrStatus } from "../stackview";
 import { mergedPrs, stepStatuses } from "../jobview";
 import { ConfirmSheet, OutputSheet } from "./confirm";
 import { ImageSheet } from "./image-sheet";
@@ -514,7 +514,7 @@ function missingFrom(code: string | undefined, data: unknown): { pr: number; bra
   return Array.isArray(w) && w.every((x) => typeof x?.pr === "number" && typeof x.branch === "string") ? w : [];
 }
 
-export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
+export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const store = useStoreInstance();
   const { height: H } = useTermSize();
   const meta = useRepoMeta();
@@ -533,22 +533,22 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   const [preview] = useState(() => store.stackPreview(n));
   /** Row cursor: starts on the PR the sheet was opened from. */
   const [selPr, setSelPr] = useState(n);
-  /** Merge up to this PR; "top" = the whole stack (the default whatever PR the sheet was opened on). */
-  const [target, setTarget] = useState<number | "top">(upTo ?? "top");
+  /** Merge up to this PR; "top" = the whole stack. Defaults to the PR the sheet was opened on. */
+  const [target, setTarget] = useState<number | "top">(upTo ?? n);
 
   const members: { number: number; title: string; isDraft: boolean }[] =
     info?.ok ? info.value.stack.prs.map((p) => ({ number: p.number, title: p.title, isDraft: p.isDraft })) : preview.map((e) => ({ number: e.number, title: e.title, isDraft: e.isDraft }));
   const topNum = members[members.length - 1]?.number ?? n;
   const targetNum = target === "top" ? topNum : target;
-  // The job file is the source of truth: a running job shows even when this sheet was opened after it started.
+  // The job file is the source of truth: a running job shows even when this sheet was opened after it started, and
+  // even from a lower member than the job's target (its key is the target PR, any member of this stack).
   const job = useStore((s) => {
     const key = activeRepoKey(s);
     if (!key) return undefined;
-    for (const pr of [targetNum, n]) {
-      const j = s.jobs[`${key}#${pr}`];
-      if (j?.kind === "stack-merge" || (j?.kind === "merge-when-ready" && j.stack)) return j;
-    }
-    return undefined;
+    const found = [targetNum, n, ...members.map((m) => m.number)]
+      .map((pr) => s.jobs[`${key}#${pr}`])
+      .filter((j) => j?.kind === "stack-merge" || (j?.kind === "merge-when-ready" && j.stack));
+    return found.find((j) => j?.status === "running") ?? found[0];
   });
   // A rebase job of this stack: while it runs the sheet shows it, and when it ends the plan is made again.
   const rebaseJob = useStore((s) => {
@@ -708,6 +708,18 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   /** One stack member: status glyph, merge order, number, title, honest status; a detail line below. */
   const memberRow = (m: (typeof members)[number], i: number) => {
     const bs = ok?.blockers[m.number] ?? [];
+    // the rule between the PRs that stay open (above) and the ones that merge (this row and below)
+    if (i === tidx && tidx < members.length - 1) {
+      push(
+        <>
+          <box width={3} flexShrink={0}>
+            <Txt bold>{G.closed}</Txt>
+          </box>
+          <Txt bold>{`${G.hline}${G.hline} merge up to here `}</Txt>
+          <Txt tone="faint">{G.hline.repeat(44)}</Txt>
+        </>,
+      );
+    }
     const included = i <= tidx;
     const landed = landedPrs.has(m.number);
     const full = ok?.stack.prs.find((p) => p.number === m.number);
@@ -738,13 +750,13 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
           </Txt>
         </box>
         <box flexShrink={0} paddingLeft={1}>
-          <Txt tone={dim ? "faint" : (view?.tone ?? "faint")}>{dim ? "not included" : st ? `${st.label}${st.bypass && !landed ? " · will bypass" : ""}` : ""}</Txt>
+          <Txt tone={dim ? "faint" : (view?.tone ?? "faint")}>{dim ? "stays open" : st ? `${st.label}${st.bypass && !landed ? " · will bypass" : ""}` : ""}</Txt>
         </box>
       </Line>,
     );
     // the connector down to the PR below carries what else is worth knowing about this one
     const detail = [
-      ...(m.number === n ? ["opened here"] : []),
+      ...(m.number === n && upTo !== "top" ? ["opened here"] : []),
       ...(included && !landed && bs.filter((b) => b.kind !== "base-not-trunk").length > 1 ? [blockerWords(bs.filter((b) => b.kind !== "base-not-trunk"))] : []),
       ...(included && !landed ? (ok?.notes.filter((x) => x.pr === m.number).map((x) => x.text) ?? []) : []),
     ];
@@ -781,7 +793,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
       wrapped(summary, planning ? "faint" : "ink");
     }
     push(<Gap />);
-    push(<SectionLabel label="Stack" meta={trunk ? "top first · numbers are the merge order · ⏎ sets how far to merge" : "working out the plan…"} />);
+    push(<SectionLabel label="Stack" meta={trunk ? "top first · numbers are the merge order · ↑↓ picks how far to merge" : "working out the plan…"} />);
     // drawn bottom-to-top: the top PR first, the base branch at the bottom
     for (let i = members.length - 1; i >= 0; i--) memberRow(members[i]!, i);
     if (trunk) {
@@ -825,6 +837,9 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
         const wt = phase === "plan" && it.worktreePr !== undefined ? worktreeNote(wtOf(it.worktreePr)) : null;
         if (wt) wrapped(wt.text, wt.ok ? "faint" : "error", 5);
       });
+      if (items.length > 0 && tidx < members.length - 1) {
+        text(`${prList(members.slice(tidx + 1).map((m) => m.number))} will need a stack rebase before ${tidx === members.length - 2 ? "it merges" : "they merge"}.`, "muted");
+      }
       if (!ok.stack.native && members.length > 1) {
         push(<Gap />);
         text("Tip: make this a GitHub stack to merge it in one request (:create-stack)", "faint");
@@ -866,7 +881,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number }) {
   const title = phase === "done" ? `Stack #${job?.pr ?? topNum} finished` : `${force || forced ? "Force merge stack" : "Merge stack"} #${topNum}`;
   const keys =
     phase === "plan"
-      ? `↑↓ ⏎ target · f force · t ${method}${canWait ? " · w when ready" : ""}${needWt.length > 0 ? " · c create worktree" : ""}`
+      ? `↑↓ pick · ⏎ merge up to here · f force · t ${method}${canWait ? " · w when ready" : ""}${needWt.length > 0 ? " · c create worktree" : ""}`
       : phase === "failed"
         ? `r plan again${needWt.length > 0 ? " · c create worktree" : ""}`
         : "";
