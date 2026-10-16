@@ -186,6 +186,8 @@ stk [--repo DIR] [--json] <command>
 
 `stk stack <n>` prints the plan. `stk stack <n> --merge` runs it, stopping at the first failing step. The plan merges the stack bottom-up and ends before the first PR that is blocked (or has a conflict or draft, even with `--force`). The bottom PR is merged directly. Before any step runs, every restack is preflighted: origin must still be at the PR head recorded when the plan was made, and the local branch tip must equal it or be an ancestor of it. A stale clean local branch is fast-forwarded; a branch that is ahead or diverged is refused (`diverged`), so a bad branch cannot leave a half-merged stack.
 
+The stack sheet draws the stack top PR first with the base branch at the bottom (`main ← #2462 ← #2463`), numbers the merge order, marks the PR it was opened from, and gives each PR one status: approved, ready, needs review, failing checks, conflicts or draft (`will bypass` once force covers it). One sentence says what will happen (`Merges #2462 into main, then #2463, squashing each; bypasses review on both.`), and each plan step says why it is there. On a native stack, every merge after the first is preceded by a rebase of the PRs above it (`gh stack`), because GitHub leaves them on the merged branch and will not let their base be changed. That rebase runs in a worktree of the branch: a worktree on a detached HEAD at the branch's current tip (what agents leave behind) counts, and is switched to the branch first. When no worktree has it, `c` in the sheet creates one. An error is shown once, in full, and `r` plans again.
+
 For each PR above it:
 
 1. Retarget the PR from its parent branch to the trunk.

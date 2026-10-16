@@ -221,6 +221,9 @@ const unicode = {
   sep: "·",
   ellipsis: "…",
   mark: "▎",
+  half: "◐",
+  warn: "▲",
+  swap: "⇄",
 } as const;
 
 const ascii: Record<keyof typeof unicode, string> = {
@@ -244,6 +247,9 @@ const ascii: Record<keyof typeof unicode, string> = {
   sep: "-",
   ellipsis: "...",
   mark: ">",
+  half: "~",
+  warn: "!",
+  swap: "<>",
 };
 
 export type GlyphName = keyof typeof unicode;
