@@ -932,11 +932,13 @@ async function relinkStack(ctx: Ctx, trunk: string, open: PullRequest[], policy:
       throw new StkError(`#${bottom.number} now targets ${trunk} but the stack could not be re-created (${why})`, "gh-failed");
     }
   }
-  // right after a base change GitHub reports the mergeability as unknown for a few seconds
+  // right after a base change or a re-created stack GitHub reports mergeability as unknown for a few seconds: let it settle for every PR, bottom first
   const sleep = policy.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  for (let i = 0; i < (policy.attempts ?? 6); i++) {
-    if ((await pullState(ctx.exec, at(ctx), bottom.number)).mergeableState !== "unknown") break;
-    await sleep(policy.delayMs ?? 2000);
+  for (const p of open) {
+    for (let i = 0; i < (policy.attempts ?? 6); i++) {
+      if ((await pullState(ctx.exec, at(ctx), p.number)).mergeableState !== "unknown") break;
+      await sleep(policy.delayMs ?? 2000);
+    }
   }
   return `unstacked, pointed #${bottom.number} at ${trunk}${recreated}`;
 }
