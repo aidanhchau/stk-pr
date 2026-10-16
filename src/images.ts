@@ -160,7 +160,6 @@ function svgWorker(): Worker {
     for (const p of pending.values()) p.fail(new Failure("unsupported"));
     pending.clear();
   };
-  w.unref();
   worker = w;
   return w;
 }
