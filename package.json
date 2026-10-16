@@ -1,6 +1,6 @@
 {
   "name": "stk-pr",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Terminal UI for GitHub pull requests and stacks: blockers, review threads, diffs, and bottom-up stack merges.",
   "type": "module",
   "license": "MIT",

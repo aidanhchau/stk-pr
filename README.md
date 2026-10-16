@@ -224,6 +224,13 @@ bun run typecheck
 
 After editing `plugin/`, run `tern plugin reload`.
 
+## Release
+
+Bump `version` in `package.json` in a PR and merge it. The `Publish` workflow then publishes to npm (trusted publishing, no token) and tags `v<version>`; a push to `main` without a version bump skips publishing.
+
+- From npm: `bun update -g stk-pr`.
+- From GitHub: `bun add -g github:aidanhchau/stk-pr` installs the current `main`. If `stk-pr` was installed from npm, run `bun remove -g stk-pr` first: with both a registry package and a GitHub install of the same name, bun fails with a DependencyLoop error.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
