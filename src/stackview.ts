@@ -94,7 +94,7 @@ export function bypassWords(bs: Blocker[]): string {
   return [...new Set(parts)].join(" and ");
 }
 
-const list = (nums: number[]): string => {
+export const list = (nums: number[]): string => {
   const t = nums.map((n) => `#${n}`);
   return t.length <= 2 ? t.join(" and ") : `${t.slice(0, -1).join(", ")} and ${t.at(-1)}`;
 };

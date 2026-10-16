@@ -646,7 +646,7 @@ export function Board({ scope }: { scope: TuiScope }) {
     else if ((k.name === "s" && k.shift) || k.sequence === "S") {
       if (!sel || sel.fold) return;
       const stacked = sel.parent !== null || sel.stackSize > 0;
-      if (stacked) store.openSheet({ kind: "stack", n: sel.root, repo: sel.repo ?? undefined });
+      if (stacked) store.openSheet({ kind: "stack", n: sel.root, upTo: "top", repo: sel.repo ?? undefined });
       else store.toast("Not part of a stack", "info");
     } else if (k.name === "d" && !k.shift) setCompact((c) => !c);
     else if (k.sequence === "T") toggleGroupMode();

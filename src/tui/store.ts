@@ -118,7 +118,7 @@ export type Sheet =
   /** The plain merge sheet: shown for a PR blocked by something that can clear by itself, offering to merge when ready. */
   | { kind: "merge"; n: number; repo?: RepoSlug }
   | { kind: "review"; n: number; event: ReviewEvent; repo?: RepoSlug }
-  | { kind: "stack"; n: number; repo?: RepoSlug; /** merge up to this PR instead of the whole stack */ upTo?: number }
+  | { kind: "stack"; n: number; repo?: RepoSlug; /** merge up to this PR (default: `n`, the PR the sheet was opened on); "top" = the whole stack */ upTo?: number | "top" }
   | { kind: "worktree"; n: number; repo?: RepoSlug }
   | { kind: "help" }
   | { kind: "palette"; /** initial command-line text */ query?: string }

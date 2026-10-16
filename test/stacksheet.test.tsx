@@ -19,46 +19,67 @@ const pr = (number: number, title: string, baseRef: string, headRef: string): Pu
 const review = { kind: "review", decision: "REVIEW_REQUIRED" } as const;
 const merge = (n: number): PlanStep => ({ kind: "merge", pr: n, method: "squash", admin: true, bypass: [review], sha: `sha${n}`, includes: [n] });
 
-function info(o: { wt: "none" | "detached" }): StackInfo {
-  const a = pr(2462, "CI: run the Atlas lane one direction at a time (fixes OOM / exit 137 in step 7)", "main", "aidan/ci-atlas-lane");
-  const b = pr(2463, "Queue chief-of-staff Slack answers and DMs for cosd to pull", "aidan/ci-atlas-lane", "aidan/cos-slack-answers");
+const A = pr(2462, "CI: run the Atlas lane one direction at a time (fixes OOM / exit 137 in step 7)", "main", "aidan/ci-atlas-lane");
+const B = pr(2463, "Queue chief-of-staff Slack answers and DMs for cosd to pull", "aidan/ci-atlas-lane", "aidan/cos-slack-answers");
+const C = pr(2464, "Show the queue depth in the cosd status line", "aidan/cos-slack-answers", "aidan/cos-queue-depth");
+
+/** The plan the service makes for a native stack of `prs` landed up to `target`. */
+function infoFor(prs: PullRequest[], target: number, wt: "none" | "detached"): StackInfo {
   return {
-    stack: { trunk: "main", prs: [a, b], native: true },
+    stack: { trunk: "main", prs, native: true },
     forks: [],
-    plan: [merge(2462), merge(2463)],
-    blockers: { 2462: [review], 2463: [review] },
-    target: 2463,
+    plan: prs.filter((p) => p.number <= target).map((p) => merge(p.number)),
+    blockers: Object.fromEntries(prs.map((p) => [p.number, [review]])),
+    target,
     stop: null,
     notes: [],
-    rebaseWorktrees: [{ pr: 2463, branch: "aidan/cos-slack-answers", kind: o.wt, ...(o.wt === "none" ? {} : { path: "/wt/cos" }) }],
+    rebaseWorktrees: [{ pr: 2463, branch: "aidan/cos-slack-answers", kind: wt, ...(wt === "none" ? {} : { path: "/wt/cos" }) }],
   };
 }
 
 class Stub extends Store {
-  constructor(private readonly out: StackInfo) {
+  /** The `upTo` of every plan the sheet asked for. */
+  readonly asked: (number | "top")[] = [];
+  constructor(
+    private readonly prs: PullRequest[],
+    private readonly wt: "none" | "detached",
+  ) {
     super("/nonexistent", { gh: { owner: "maple", name: "maple-gtm" } });
   }
-  override async stackInfo(): Promise<Outcome<StackInfo>> {
-    return { ok: true, value: this.out };
+  override async stackInfo(_n: number, _method: unknown, _force: boolean, upTo: number | "top" = "top"): Promise<Outcome<StackInfo>> {
+    this.asked.push(upTo);
+    return { ok: true, value: infoFor(this.prs, upTo === "top" ? this.prs[this.prs.length - 1]!.number : upTo, this.wt) };
   }
 }
 
-async function render(i: StackInfo): Promise<string> {
+/** The frame's text without the sheet border, with wrapped lines joined. */
+const flat = (t: string) => t.split("\n").map((l) => l.replace(/^\s*│|│\s*$/g, "").trim()).filter(Boolean).join(" ");
+
+const frame = () => setup!.captureCharFrame().split("\n").map((l) => l.trimEnd()).join("\n");
+
+async function settle(): Promise<string> {
+  await setup!.renderOnce();
+  await Bun.sleep(20);
+  await setup!.renderOnce();
+  return frame();
+}
+
+async function mount(prs: PullRequest[], props: { n: number; upTo?: number | "top" }, wt: "none" | "detached" = "detached") {
+  const store = new Stub(prs, wt);
   setup = await testRender(
     <ThemeContext.Provider value={{ name: "dark", p: dark }}>
-      <StoreContext.Provider value={new Stub(i)}>
-        <StackSheet n={2462} />
+      <StoreContext.Provider value={store}>
+        <StackSheet {...props} />
       </StoreContext.Provider>
     </ThemeContext.Provider>,
-    { width: 96, height: 42 },
+    { width: 96, height: 46 },
   );
   await setup.renderOnce();
-  await setup.renderOnce();
-  return setup.captureCharFrame().split("\n").map((l) => l.trimEnd()).join("\n");
+  return { store, text: await settle() };
 }
 
 test("the stack is drawn top PR first with the base branch at the bottom, merge order numbered, and the plan says why", async () => {
-  const text = await render(info({ wt: "none" }));
+  const { text } = await mount([A, B], { n: 2463 }, "none");
   if (process.env.STK_PRINT) console.log(text);
   const rows = text.split("\n");
   const at = (s: string) => rows.findIndex((l) => l.includes(s));
@@ -78,7 +99,67 @@ test("the stack is drawn top PR first with the base branch at the bottom, merge 
 });
 
 test("a detached worktree at the tip is reported as usable", async () => {
-  const text = await render(info({ wt: "detached" }));
+  const { text } = await mount([A, B], { n: 2463 });
   expect(text).toContain("detached at the branch tip");
   expect(text).not.toContain("c create worktree");
+});
+
+test("opened on the bottom PR, only that PR is planned and the PRs above it stay open", async () => {
+  const { store, text } = await mount([A, B, C], { n: 2462 });
+  if (process.env.STK_PRINT) console.log(text);
+  expect(store.asked.at(-1)).toBe(2462);
+  expect(flat(text)).toContain("Merges #2462 into main, squashing it; bypasses review on #2462. #2463 and #2464 stay open.");
+  expect(text.match(/stays open/g)).toHaveLength(2);
+  expect(text).toMatch(/▸\s+── merge up to here/);
+  expect(text).toContain("opened here");
+  expect(text).toContain("1. Merge #2462");
+  expect(text).not.toContain("Merge #2463");
+  expect(text).not.toContain("Rebase #2463");
+  expect(flat(text)).toContain("#2463 and #2464 will need a stack rebase before they merge.");
+  expect(text).toContain("↑↓ pick · ⏎ merge up to here");
+  // the rule sits between the PRs that stay open and the one that merges
+  const rows = text.split("\n");
+  const at = (s: string) => rows.findIndex((l) => l.includes(s));
+  expect(at("#2463  Queue")).toBeLessThan(at("merge up to here ─"));
+  expect(at("merge up to here ─")).toBeLessThan(at("#2462  CI: run"));
+});
+
+test("opened on the top PR, the whole stack is planned", async () => {
+  const { store, text } = await mount([A, B, C], { n: 2464 });
+  expect(store.asked.at(-1)).toBe(2464);
+  expect(flat(text)).toContain("Merges #2462 into main, then #2463, then #2464, squashing each; bypasses review on all 3.");
+  expect(text).not.toContain("stays open");
+  expect(text).not.toContain("stack rebase before");
+  expect(text).not.toContain("merge up to here ─");
+});
+
+test("⏎ on another row makes it the merge target", async () => {
+  const { store } = await mount([A, B, C], { n: 2462 });
+  setup!.mockInput.pressArrow("up");
+  await settle();
+  setup!.mockInput.pressEnter();
+  const text = await settle();
+  expect(store.asked.at(-1)).toBe(2463);
+  expect(flat(text)).toContain("Merges #2462 into main, then #2463, squashing each; bypasses review on both. #2464 stays open.");
+  expect(text.match(/stays open/g)).toHaveLength(2);
+  expect(text).toContain("#2464 will need a stack rebase before it merges.");
+  // up to the top again: the whole stack, nothing left open
+  setup!.mockInput.pressArrow("up");
+  await settle();
+  setup!.mockInput.pressEnter();
+  const whole = await settle();
+  expect(store.asked.at(-1)).toBe("top");
+  expect(whole).not.toContain("stays open");
+});
+
+test("an explicit upTo wins over the PR the sheet was opened on", async () => {
+  const { store, text } = await mount([A, B, C], { n: 2462, upTo: 2463 });
+  expect(store.asked.at(-1)).toBe(2463);
+  expect(text).toContain("#2464 stays open");
+  setup!.renderer.destroy();
+  const whole = await mount([A, B, C], { n: 2462, upTo: "top" });
+  expect(whole.store.asked.at(-1)).toBe("top");
+  expect(whole.text).not.toContain("stays open");
+  // opened on the whole stack from elsewhere (the board), so no PR is "opened here"
+  expect(whole.text).not.toContain("opened here");
 });

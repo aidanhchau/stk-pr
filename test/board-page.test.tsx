@@ -237,5 +237,5 @@ test("a stack member stays under its root and opens the root's stack sheet after
   expect(store.getState().boardCursor).toBe(keyOf(child));
   s.mockInput.pressKey("S");
   await frame();
-  expect(store.getState().sheet).toEqual({ kind: "stack", n: root.number, repo: root.repo });
+  expect(store.getState().sheet).toEqual({ kind: "stack", n: root.number, upTo: "top", repo: root.repo });
 });
