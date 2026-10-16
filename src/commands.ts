@@ -79,7 +79,7 @@ export const COMMANDS: readonly CommandDef[] = [
   def("draft", "convert to draft", "back to draft", "pr", { aliases: ["draft"], destructive: true }),
   def("update-branch", "update branch", "merge the base branch into the PR branch", "pr", { aliases: ["update", "sync", "rebase"] }),
   def("base", "base", "change the base branch", "pr", { aliases: ["retarget", "change base"] }),
-  def("rebase-stack", "rebase stack", "rebase the native stack onto its trunk in the worktree", "pr", { aliases: ["rebase-stack", "restack", "base", "retarget", "change base"] }),
+  def("rebase-stack", "rebase stack", "rebase the native stack onto its trunk in a temporary checkout", "pr", { aliases: ["rebase-stack", "restack", "base", "retarget", "change base"] }),
   def("create-stack", "create GitHub stack", "make this chain of PRs a GitHub stack", "pr", { aliases: ["create-stack", "stack create", "make stack"] }),
   def("fix", "fix", "fix the selected thread or failing check with an omp agent (new tab)", "page", { aliases: ["agent", "omp", "fix with agent"] }),
   def("rerun", "rerun failed checks", "re-run the failing workflow runs", "pr", { aliases: ["rerun", "retry", "rerun checks"] }),

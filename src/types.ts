@@ -129,7 +129,7 @@ export type PlanStep =
     }
   | { kind: "push"; branch: string; expectedRemoteSha: string; cwd: string }
   | { kind: "wait-checks"; pr: number }
-  /** Native stack: rebase the open PRs onto the trunk with `gh stack` after a lower PR landed; `pr` is the bottom open PR. */
+  /** Native stack: rebase the open PRs onto the trunk in a temporary checkout after a lower PR landed; `pr` is the bottom open PR. */
   | { kind: "rebase-stack"; pr: number };
 
 export interface StepResult {
@@ -158,8 +158,8 @@ export interface MergeProgress {
 export type MergeOutcome = "merged" | "enqueued" | "partial" | "none";
 
 /** Short toast/summary line for a finished merge job: `Stack merged · #10, #11`, `Merged #12`, `Queued · #12 (not merged yet)`, `Merged #10 · #12 still open`, `Nothing merged · #10 is blocked`. */
-export function mergeOutcomeText(job: { kind: "merge" | "stack-merge" | "rebase-stack" | "merge-when-ready"; stack?: boolean; pr: number; outcome?: MergeOutcome; merged?: number[]; prs?: number[] }): string {
-  if (job.kind === "rebase-stack") return `Stack rebased · ${(job.prs ?? [job.pr]).map((n) => `#${n}`).join(", ")}`;
+export function mergeOutcomeText(job: { kind: "merge" | "stack-merge" | "rebase-stack" | "merge-when-ready"; stack?: boolean; pr: number; outcome?: MergeOutcome; merged?: number[]; prs?: number[]; note?: string }): string {
+  if (job.kind === "rebase-stack") return `Stack rebased · ${(job.prs ?? [job.pr]).map((n) => `#${n}`).join(", ")}${job.note ? ` · ${job.note}` : ""}`;
   const merged = (job.merged ?? []).map((n) => `#${n}`).join(", ");
   switch (job.outcome) {
     case "enqueued":
@@ -199,8 +199,6 @@ export class StkError extends Error {
     message: string,
     readonly code:
       | "not-a-repo"
-      /** A stack rebase needs a worktree for a branch that none has; `data.worktrees` lists them. */
-      | "no-worktree"
       | "gh-failed"
       | "git-failed"
       | "dirty-worktree"

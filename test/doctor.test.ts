@@ -19,7 +19,6 @@ function fake(overrides: [string[], Reply][] = []): { exec: Exec; calls: string[
     ...overrides,
     [["gh", "--version"], { stdout: "gh version 2.81.0 (2026-01-01)\n" }],
     [["gh", "auth", "status"], { stdout: GOOD_AUTH }],
-    [["gh", "extension", "list"], { stdout: "gh stack\tgithub/gh-stack\tv0.2.1\n" }],
     [["tern", "--version"], { stdout: "tern 0.8.3 (e2b8656)\n" }],
     [["gh", "api", "-i", "graphql"], { stdout: gqlHeaders(4900) }],
     [["gh", "api", "rate_limit"], { stdout: restBody(4000) }],
@@ -55,7 +54,6 @@ describe("stk doctor", () => {
     expect(checks.map((x) => x.status)).toEqual(checks.map(() => "ok"));
     expect(c.gh!.message).toBe("gh 2.81.0");
     expect(c["gh-auth"]!.message).toContain("octo");
-    expect(c["gh-stack"]!.message).toBe("gh-stack v0.2.1");
     expect(c.tern!.message).toContain("tern 0.8.3");
     expect(c.tern!.message).toContain("pane 7");
     expect(c["rate-graphql"]!.message).toContain("4900/5000");
@@ -71,7 +69,6 @@ describe("stk doctor", () => {
     const { exec } = fake([
       [["gh", "--version"], { code: 127, stderr: "not found" }],
       [["gh", "auth", "status"], { code: 1, stderr: "You are not logged into any GitHub hosts." }],
-      [["gh", "extension", "list"], { stdout: "" }],
       [["tern", "--version"], { code: 127 }],
       [["gh", "api", "-i", "graphql"], { code: 1 }],
       [["gh", "api", "rate_limit"], { code: 1 }],
@@ -82,8 +79,6 @@ describe("stk doctor", () => {
     expect(c.gh!.fix).toContain("brew install gh");
     expect(c["gh-auth"]!.status).toBe("fail");
     expect(c["gh-auth"]!.fix).toContain("gh auth login");
-    expect(c["gh-stack"]!.status).toBe("warn");
-    expect(c["gh-stack"]!.fix).toContain("gh extension install github/gh-stack");
     expect(c.tern!.status).toBe("warn");
     expect(c["omp-transcripts"]!.status).toBe("warn");
     expect(c["rate-graphql"]!.status).toBe("warn");
@@ -196,7 +191,7 @@ describe("stk --version", () => {
     const j = JSON.parse(out);
     expect(j.ok).toBe(true);
     expect(j.data.checks.map((c: { id: string }) => c.id)).toEqual([
-      "gh", "gh-auth", "gh-stack", "tern", "omp-transcripts", "rate-graphql", "rate-rest", "cache", "keyboard", "repo",
+      "gh", "gh-auth", "tern", "omp-transcripts", "rate-graphql", "rate-rest", "cache", "keyboard", "repo",
     ]);
     expect(code).toBe(j.data.healthy ? 0 : 1);
   });

@@ -5,7 +5,8 @@
 import { join } from "node:path";
 import type { PaletteItem } from "./fuzzy";
 import { GH_ENV, formatGhOutput, planGh, type GhResult } from "./ghproxy";
-import { attachBranch, isClean, planAttach, listWorktrees, remoteSha, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
+import { listWorktrees, repoRoot, resolveWorktree, worktreeForBranch } from "./git";
+import { behindText, preflightRestack, restackAndPush, type RestackInput } from "./restack";
 import { commitSubjects, currentBranch, localBranches, nearestParent, pushBranch, pushEmptyCommit, pushKind, RETRIGGER_MESSAGE, type PushKind } from "./branches";
 import {
   closePr,
@@ -162,22 +163,8 @@ export interface StackInfo {
   /** Set when a PR at or below `target` is not in the plan: which one, and why, in words. */
   stop: { pr: number; reason: string } | null;
   notes: StackNote[];
-  /** PRs the merge rebases in a worktree: where each would run (`detached` = a detached HEAD at the tip, switched to the branch first). */
-  rebaseWorktrees: RebaseWorktree[];
 }
 
-/** A PR the rebase step runs for, and the worktree it would use. */
-export interface RebaseWorktree {
-  pr: number;
-  branch: string;
-  kind: "branch" | "detached" | "none";
-  path?: string;
-}
-
-/** `StkError` data of a `no-worktree` failure. */
-export interface MissingWorktrees {
-  worktrees: { pr: number; branch: string }[];
-}
 export interface StackMergeResult {
   results: StepResult[];
   /** PR numbers in the stack. */
@@ -577,7 +564,7 @@ async function planFor(ctx: Ctx, n: number, opts: PlanOpts): Promise<PlanForResu
       notes.push({
         pr: bottom.number,
         text: `#${bottom.number}'s base is a merged branch (${bottom.baseRef})`,
-        fix: `GitHub does not allow changing the base of a stacked PR; the stack needs a rebase (GitHub's "Rebase stack", or \`gh stack rebase\` then \`gh stack push\`).`,
+        fix: `GitHub does not allow changing the base of a stacked PR; the stack needs a rebase (GitHub's "Rebase stack", or stk's rebase-stack).`,
         action: "rebase-stack",
       });
     }
@@ -622,23 +609,8 @@ export async function stackInfo(
 ): Promise<StackInfo> {
   const { trunk, stack, forks, plan, target, notes, rules } = await planFor(ctx, n, opts);
   const perPr = blockersByPr(stack, trunk, rules);
-  // the sheet's own rebase (stale base) runs from the PR it was opened on
-  const rebasing = notes.some((x) => x.action === "rebase-stack") ? [stack.prs.find((p) => p.number === n) ?? stack.prs[0]!] : nativeRebaseBottoms(stack, plan, target);
-  // read fresh: a worktree made since this ctx was opened (here or in another shell) must count
-  const worktrees = ctx.root ? await listWorktrees(ctx.exec, ctx.root).catch(() => ctx.worktrees) : ctx.worktrees;
-  const rebaseWorktrees = rebasing.map((p): RebaseWorktree => {
-    const found = resolveWorktree(worktrees, p.headRef, p.headSha);
-    return { pr: p.number, branch: p.headRef, kind: found.kind, ...(found.kind === "none" ? {} : { path: found.worktree.path }) };
-  });
-  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes, rebaseWorktrees };
-}
-
-/** The PRs a native plan with several merge steps rebases (each bottom after the first merge lands): the ones that need a worktree. */
-function nativeRebaseBottoms(stack: Stack, plan: PlanStep[], target: number): PullRequest[] {
-  const merges = plan.filter((s) => s.kind === "merge");
-  if (!stack.native || merges.length <= 1) return [];
-  const first = merges[0]!.includes ?? [merges[0]!.pr];
-  return stack.prs.slice(0, stack.prs.findIndex((p) => p.number === target) + 1).filter((p) => !first.includes(p.number));
+  // the sheet's own rebase (stale base) is the bottom PR; nothing there needs a checkout
+  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes };
 }
 
 /** Per-member blockers of a stack: a native stack lands on the trunk, so no member is judged by its own base. */
@@ -685,7 +657,7 @@ async function replanNative(ctx: Ctx, target: number, opts: PlanOpts, landed: Se
  * Execute the stack merge plan. Throws StkError("step-failed", data: {results}) if a step fails.
  *
  * A native plan with several merge steps (each bypass lands alone, GitHub only allows it on the bottom-most unmerged PR)
- * runs one merge at a time: after each, the stack is re-read, the remaining PRs are rebased with `gh stack` when GitHub
+ * runs one merge at a time: after each, the stack is re-read, the remaining PRs are rebased in a temporary checkout when GitHub
  * left them on the merged branch, and the plan is made again so the next merge pins the head SHA the rebase produced.
  * `onPlan` receives the steps that ran plus the current plan whenever it changes.
  */
@@ -697,9 +669,11 @@ export async function stackMerge(
   const first = await planFor(ctx, n, opts);
   const { stack } = first;
   let expectedHeads: Record<number, string> = {};
+  // heads member branches had on origin before this run's restacks (see `rebaseStack`)
+  const knownHeads: Record<string, string[]> = {};
   const deps: ExecuteDeps = {
     exec: ctx.exec,
-    // a native stack is one API call and never touches a checkout
+    // a native stack merge is API calls only; its rebase runs in a temporary checkout
     repoDir: stack.native ? (ctx.root ?? "") : requireRoot(ctx, "restack/merge a stack"),
     gh: {
       merge: (pr, m, admin, extra) =>
@@ -716,21 +690,12 @@ export async function stackMerge(
         if (failing.length) throw new StkError(`checks failed on #${pr}: ${failing.join(", ")}`, "gh-failed");
       },
       rebaseStack: async (pr) => {
-        const rebased = await rebaseStack(ctx, pr);
-        const cwd = requireRoot(ctx, "verify the rebased stack");
-        const heads: Record<number, string> = {};
-        // gh stack push succeeded; verify exactly what landed on origin before trusting eventual GraphQL updates.
+        const rebased = await rebaseStack(ctx, pr, { knownHeads });
         for (const n of rebased.prs) {
-          const member = stack.prs.find((p) => p.number === n);
-          if (!member) throw new StkError(`native stack gained unexpected PR #${n}; review the stack`, "gh-failed");
-          const local = await ctx.exec(["git", "rev-parse", "--verify", `refs/heads/${member.headRef}`], { cwd });
-          const sha = local.stdout.trim();
-          if (local.code !== 0 || !sha) throw new StkError(`could not read the rebased head of #${n}: ${local.stderr.trim()}`, "git-failed");
-          const remote = await remoteSha(ctx.exec, cwd, member.headRef);
-          if (remote !== sha) throw new StkError(`after gh stack push, origin/${member.headRef} is ${remote ?? "missing"} but local is ${sha}`, "lease-rejected");
-          heads[n] = sha;
+          if (!stack.prs.some((p) => p.number === n)) throw new StkError(`native stack gained unexpected PR #${n}; review the stack`, "gh-failed");
         }
-        expectedHeads = heads;
+        expectedHeads = rebased.heads;
+        return rebased.note;
       },
     },
     onStep: (r) => {
@@ -777,14 +742,14 @@ export async function stackMerge(
     // A rebase can reset checks/reviews and split a formerly atomic clean group into individual bypass merges.
     const bottoms = selected.filter((p) => !firstIncludes.includes(p.number));
     try {
-      await preflightNativeRebase(ctx, remaining, bottoms);
+      await preflightRestack(ctx.exec, requireRoot(ctx, "rebase a stack"), restackInput(first.trunk, remaining, stack.prs, knownHeads));
     } catch (e) {
       const failed: StepResult = { step: { kind: "rebase-stack", pr: bottoms[0]!.number }, ok: false, detail: e instanceof Error ? e.message : String(e) };
       // the rebase runs after the first merge lands, so that is where it sits in the plan
       opts.onPlan?.([first.plan[0]!, failed.step, ...first.plan.slice(1)]);
       results.push(failed);
       opts.onStep?.(failed);
-      stopped(failed.detail, bottoms[0]!.number, e instanceof StkError && e.code === "no-worktree" ? { worktrees: (e.data as MissingWorktrees).worktrees } : {});
+      stopped(failed.detail, bottoms[0]!.number);
     }
   }
 
@@ -870,144 +835,49 @@ export async function createStack(ctx: Ctx, prs: number[]): Promise<CreateStackR
 }
 
 export interface RebaseStackResult {
-  /** Open PRs of the stack whose branches were rebased and force-pushed. */
+  /** Open PRs of the stack (bottom to top) whose branches were rebased onto the trunk. */
   prs: number[];
+  /** Every open member's head on origin after the rebase (unchanged for a member that needed nothing). */
+  heads: Record<number, string>;
+  /** Local checkouts of rebased branches that now differ from origin (they are never touched), when there are any. */
+  note?: string;
 }
 
-/** A worktree holding a stack branch that has uncommitted changes (`StkError` data of a `dirty-worktree` rebase refusal). */
-export interface DirtyWorktree {
-  path: string;
-  files: string[];
-}
-
-const cleanGhText = (r: { stderr: string; stdout: string }) => (r.stderr || r.stdout).trim().replace(/^[✗×x]\s+/, "");
-
-/** Shared read-only prerequisites for native rebases; callers still check again immediately before actual mutation. */
-async function preflightNativeRebase(ctx: Ctx, open: PullRequest[], bottoms: PullRequest[], stash = false) {
-  const root = requireRoot(ctx, "rebase a stack");
-  const ext = await ctx.exec(["gh", "stack", "--version"], { cwd: root });
-  if (ext.code !== 0) {
-    throw new StkError("the gh-stack extension is not installed; install it with: gh extension install github/gh-stack", "gh-failed");
-  }
-  const worktrees = await listWorktrees(ctx.exec, root);
-  const cwds: Record<number, string> = {};
-  const attach: { path: string; branch: string; tip: string }[] = [];
-  const missing: MissingWorktrees["worktrees"] = [];
-  // Every segment's bottom must already have its branch checked out (or be detached at its tip); gh stack may not switch an unrelated worktree.
-  for (const pr of bottoms) {
-    const found = resolveWorktree(worktrees, pr.headRef, pr.headSha);
-    if (found.kind === "none") missing.push({ pr: pr.number, branch: pr.headRef });
-    else cwds[pr.number] = found.worktree.path;
-  }
-  // Every open member sitting in a detached worktree gets its branch back before gh stack rewrites anything, so each
-  // later rebase finds its worktree; whether that can be done is checked now (nothing is merged yet), changing nothing.
-  for (const pr of open) {
-    const found = resolveWorktree(worktrees, pr.headRef, pr.headSha);
-    if (found.kind !== "detached") continue;
-    await planAttach(ctx.exec, found.worktree.path, pr.headRef, pr.headSha);
-    attach.push({ path: found.worktree.path, branch: pr.headRef, tip: pr.headSha });
-  }
-  if (missing.length > 0) {
-    const what = missing.map((m) => `#${m.pr}'s branch (${m.branch})`).join(" or ");
-    throw new StkError(`no worktree has ${what} checked out; open one with: stk worktree ${missing[0]!.pr}`, "no-worktree", { worktrees: missing });
-  }
-  const dirty: DirtyWorktree[] = [];
-  for (const pr of open) {
-    const found = resolveWorktree(worktrees, pr.headRef, pr.headSha);
-    const path = found.kind === "none" ? undefined : found.worktree.path;
-    if (!path || dirty.some((d) => d.path === path)) continue;
-    const st = await ctx.exec(["git", "status", "--porcelain"], { cwd: path });
-    if (st.code !== 0) throw new StkError(`git status failed in ${path}: ${st.stderr.trim()}`, "git-failed");
-    const files = st.stdout.split("\n").filter(Boolean).map((l) => l.slice(3));
-    if (files.length > 0) dirty.push({ path, files });
-  }
-  if (dirty.length > 0 && !stash) {
-    throw new StkError(
-      `Rebase stack didn't start: ${dirty.map((d) => `${d.path} has uncommitted changes (${d.files.join(", ")})`).join("; ")}`,
-      "dirty-worktree",
-      { worktrees: dirty },
-    );
-  }
-  return { cwds, dirty, attach };
+/** What the restack needs from a stack read: the open members bottom-up, and what the bottom one sits on. */
+function restackInput(trunk: string, open: PullRequest[], all: PullRequest[], knownHeads?: Record<string, string[]>): RestackInput {
+  const bottom = open[0]!;
+  // a squash merge leaves the merged PR's commits in the bottom's history: its head SHA is where the bottom's own commits start
+  const below = all.find((p) => p.number !== bottom.number && p.headRef === bottom.baseRef);
+  return {
+    trunk,
+    members: open.map((p) => ({ number: p.number, branch: p.headRef, headSha: p.headSha })),
+    mergedBaseSha: below?.headSha ?? null,
+    baseRef: bottom.baseRef,
+    ...(knownHeads ? { knownHeads } : {}),
+  };
 }
 
 /**
- * Rebase a native stack the way GitHub's "Rebase stack" button does, locally. GitHub exposes no API for it (the REST
- * stacks endpoints only list/create/extend/dissolve), so this drives the `gh stack` extension inside the worktree that
- * has PR `n`'s branch checked out: `gh stack checkout n`, `gh stack rebase`, `gh stack push`.
- *
- * Before any `gh stack` call every worktree holding a stack branch is checked for uncommitted changes (gh stack refuses to
- * start otherwise): refused with `dirty-worktree` (data `{worktrees: DirtyWorktree[]}`), or with `stash` each dirty
- * worktree is stashed first and restored afterwards, also when the rebase fails. A real conflict aborts the rebase.
+ * Rebase a native stack the way GitHub's "Rebase stack" button does. GitHub exposes no API for it (the REST stacks
+ * endpoints only list/create/extend/dissolve), so every open member is rebased bottom-up onto the trunk in a throwaway
+ * detached checkout (see `restack.ts`) and pushed with leases; nothing in the user's worktrees is touched. A conflict
+ * aborts with nothing pushed; unpushed local commits on a member branch are refused up front.
  */
-export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: string) => void; stash?: boolean; label?: string } = {}): Promise<RebaseStackResult> {
-  requireRoot(ctx, "rebase a stack");
+export async function rebaseStack(ctx: Ctx, n: number, opts: { onStep?: (what: string) => void; knownHeads?: Record<string, string[]> } = {}): Promise<RebaseStackResult> {
+  const root = requireRoot(ctx, "rebase a stack");
   const detail = await nativeStackDetail(ctx.exec, at(ctx), n);
   const pr = detail?.members.find((m) => m.pr.number === n)?.pr;
   if (!detail || !pr || pr.state !== "OPEN") throw new StkError(`PR #${n} is not an open member of a GitHub stack`, "usage");
   const open = detail.members.filter((m) => m.pr.state === "OPEN").map((m) => m.pr);
-  const prs = open.map((m) => m.number);
-  const gh = async (args: string[], cwd: string) => ctx.exec(["gh", "stack", ...args], { cwd });
-  const { cwds, dirty, attach } = await preflightNativeRebase(ctx, open, [pr], opts.stash);
-  const cwd = cwds[n]!;
-  // an agent's worktree sits on a detached HEAD at the branch tip: `gh stack` needs the branch itself checked out
-  for (const a of attach) {
-    opts.onStep?.(`checking out ${a.branch} in ${a.path}`);
-    await attachBranch(ctx.exec, a.path, a.branch, a.tip);
-  }
-
-  const label = `stk rebase-stack ${opts.label ?? n}`;
-  const stashed: { path: string; sha: string }[] = [];
-  let failure: unknown;
-  try {
-    for (const d of dirty) {
-      opts.onStep?.(`stashing ${d.path}`);
-      const r = await ctx.exec(["git", "stash", "push", "-u", "-m", `${label} ${d.path}`], { cwd: d.path });
-      if (r.code !== 0) throw new StkError(`git stash failed in ${d.path}: ${cleanGhText(r)}`, "git-failed");
-      const head = await ctx.exec(["git", "rev-parse", "stash@{0}"], { cwd: d.path });
-      if (head.code !== 0) throw new StkError(`could not identify the stash made in ${d.path}: ${cleanGhText(head)}`, "git-failed");
-      stashed.push({ path: d.path, sha: head.stdout.trim() });
+  const r = await restackAndPush(ctx.exec, root, restackInput(detail.trunk, open, detail.members.map((m) => m.pr), opts.knownHeads), opts.onStep);
+  // a run of several restacks leaves local branches at their old tips on purpose: remember those heads so the next one does not take them for unpushed work
+  if (opts.knownHeads) {
+    for (const p of open) {
+      if (r.heads[p.number] !== p.headSha) (opts.knownHeads[p.headRef] ??= []).push(p.headSha);
     }
-    const step = async (what: string, args: string[]) => {
-      opts.onStep?.(what);
-      const r = await gh(args, cwd);
-      if (r.code !== 0) throw new StkError(`Rebase stack failed at gh stack ${args.join(" ")}: ${cleanGhText(r)}`, "gh-failed");
-    };
-    await step("tracking the stack", ["checkout", String(n)]);
-    opts.onStep?.("rebasing");
-    const rebased = await gh(["rebase"], cwd);
-    if (rebased.code !== 0) {
-      const text = cleanGhText(rebased);
-      if (!/conflict/i.test(text)) throw new StkError(`Rebase stack failed: ${text}`, "gh-failed");
-      await gh(["rebase", "--abort"], cwd);
-      throw new StkError(`rebase of the stack conflicted and was aborted: ${text}`, "rebase-conflict");
-    }
-    await step("pushing", ["push"]);
-  } catch (e) {
-    failure = e;
   }
-  // Restore each worktree's own stash by SHA, last first, whatever happened. Stashes are shared by all linked worktrees,
-  // so nothing is ever looked up by position or label: a stash that will not apply is left in place (named by sha and
-  // path) and the others are still restored.
-  const stuck: { path: string; sha: string }[] = [];
-  for (const { path, sha } of stashed.reverse()) {
-    opts.onStep?.(`restoring ${path}`);
-    const applied = await ctx.exec(["git", "stash", "apply", "--index", sha], { cwd: path });
-    if (applied.code !== 0) {
-      stuck.push({ path, sha });
-      continue;
-    }
-    const list = await ctx.exec(["git", "stash", "list", "--format=%H %gd"], { cwd: path });
-    const ref = list.stdout.split("\n").find((l) => l.startsWith(`${sha} `))?.split(" ")[1];
-    if (ref) await ctx.exec(["git", "stash", "drop", ref], { cwd: path });
-  }
-  if (stuck.length > 0) {
-    const note = `could not restore your changes in ${stuck.map((s) => `${s.path} (stash ${s.sha}, kept in git stash)`).join(", ")}`;
-    const base = failure instanceof Error ? `${failure.message}; ` : "";
-    throw new StkError(`${base}${note}`, failure instanceof StkError ? failure.code : "git-failed", failure instanceof StkError ? failure.data : undefined);
-  }
-  if (failure) throw failure;
-  return { prs };
+  const note = behindText(r.behind);
+  return { prs: open.map((p) => p.number), heads: r.heads, ...(note ? { note } : {}) };
 }
 
 // ---------- session ----------

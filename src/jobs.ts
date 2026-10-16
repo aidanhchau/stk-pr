@@ -25,8 +25,8 @@ export interface Job {
   force: boolean;
   /** Local checkout the runner should use; without it the runner resolves one from the repo slug. */
   repoDir?: string;
-  /** rebase-stack: stash uncommitted changes in the stack's worktrees first and restore them afterwards. */
-  stash?: boolean;
+  /** rebase-stack: local checkouts of rebased branches that now differ from origin (left untouched), for the end-of-job message. */
+  note?: string;
   status: JobStatus;
   steps: StepResult[];
   /** Planned step count of a stack merge (what `steps.length` counts toward). */
@@ -55,7 +55,7 @@ export interface Job {
   waiting?: string;
 }
 
-export type JobSpec = Pick<Job, "kind" | "repo" | "pr" | "method" | "force" | "repoDir" | "stash" | "stack">;
+export type JobSpec = Pick<Job, "kind" | "repo" | "pr" | "method" | "force" | "repoDir" | "stack">;
 
 export interface JobOpts {
   /** Is this process alive? Default: `kill(pid, 0)`. */
@@ -285,8 +285,8 @@ export const serviceRunner: JobRunner = async (job, update, ctx) => {
     return;
   }
   if (job.kind === "rebase-stack") {
-    const r = await rebaseStack(c, job.pr, { stash: job.stash === true, label: job.id, onStep: (message) => update({ progress: { pr: job.pr, phase: "pending", message } }) });
-    update({ prs: r.prs });
+    const r = await rebaseStack(c, job.pr, { onStep: (message) => update({ progress: { pr: job.pr, phase: "pending", message } }) });
+    update({ prs: r.prs, ...(r.note ? { note: r.note } : {}) });
     return;
   }
   const info = await stackInfo(c, job.pr, { method, force, upTo: job.pr });

@@ -7,7 +7,7 @@ import { StkError, mergeOutcomeOk, mergeOutcomeText, type Blocker, type MergeMet
 import { jobStatusText } from "../jobs";
 import { isWaitable } from "../watch";
 import { waitLabel } from "../waiting";
-import { list as prList, planItems, prStatus, stackSummary, withExpectedRebases, worktreeNote, type PrStateKind, type PrStatus } from "../stackview";
+import { list as prList, planItems, prStatus, stackSummary, withExpectedRebases, type PrStateKind, type PrStatus } from "../stackview";
 import { mergedPrs, stepStatuses } from "../jobview";
 import { ConfirmSheet, OutputSheet } from "./confirm";
 import { ImageSheet } from "./image-sheet";
@@ -507,13 +507,6 @@ const STATUS_VIEW: Record<PrStateKind, { glyph: GlyphName; tone: Tone }> = {
   merged: { glyph: "check", tone: "merged" },
 };
 
-/** A job's `no-worktree` failure: the branches that need a worktree before the merge can start. */
-function missingFrom(code: string | undefined, data: unknown): { pr: number; branch: string }[] {
-  if (code !== "step-failed" && code !== "no-worktree") return [];
-  const w = (data as { worktrees?: { pr: number; branch: string }[] } | undefined)?.worktrees;
-  return Array.isArray(w) && w.every((x) => typeof x?.pr === "number" && typeof x.branch === "string") ? w : [];
-}
-
 export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const store = useStoreInstance();
   const { height: H } = useTermSize();
@@ -524,9 +517,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const [info, setInfo] = useState<Outcome<StackInfo> | null>(null);
   const [planning, setPlanning] = useState(true);
   const [starting, setStarting] = useState(false);
-  const [creatingWt, setCreatingWt] = useState(false);
   const [tick, setTick] = useState(0);
-  const [replanTick, setReplanTick] = useState(0);
   const [startedId, setStartedId] = useState<string | null>(null);
   const [startErr, setStartErr] = useState<string | null>(null);
   const [cursor, setCursor] = useState(0);
@@ -559,13 +550,11 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const [rebaseId, setRebaseId] = useState<string | null>(null);
   const rebasing = rebaseJob?.status === "running";
   const rebaseFailed = rebaseJob?.status === "failed" && rebaseJob.id === rebaseId;
-  const dirtyWts: { path: string; files: string[] }[] =
-    rebaseFailed && rebaseJob?.errorCode === "dirty-worktree" ? ((rebaseJob.errorData as { worktrees?: { path: string; files: string[] }[] } | undefined)?.worktrees ?? []) : [];
   const staleNote = info?.ok ? info.value.notes.find((x) => x.action === "rebase-stack") : undefined;
   const phase: Phase = !job || (job.status !== "running" && job.id !== startedId) ? "plan" : job.status === "running" ? "running" : job.status === "done" ? "done" : "failed";
   const results: StepResult[] = phase === "plan" ? [] : (job?.steps ?? []);
   // the one error the sheet shows: the failed merge job, else the rebase job, else a request that did not start
-  const failMsg = phase === "failed" ? (job?.error ?? "The stack merge stopped.") : rebaseFailed && dirtyWts.length === 0 ? (rebaseJob?.error ?? "The stack rebase failed.") : startErr;
+  const failMsg = phase === "failed" ? (job?.error ?? "The stack merge stopped.") : rebaseFailed ? (rebaseJob?.error ?? "The stack rebase failed.") : startErr;
 
   useEffect(() => {
     if (phase !== "plan" || rebasing) return;
@@ -579,9 +568,9 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
     return () => {
       live = false;
     };
-  }, [store, n, method, force, phase, target, rebasing, replanTick]);
+  }, [store, n, method, force, phase, target, rebasing]);
 
-  const waiting = planning || starting || creatingWt || rebasing || phase === "running";
+  const waiting = planning || starting || rebasing || phase === "running";
   useEffect(() => {
     if (!waiting || reducedMotion()) return;
     const id = setInterval(() => setTick((t) => t + 1), 300);
@@ -598,15 +587,11 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const landedPrs = phase === "plan" ? new Set<number>() : mergedPrs(results, job?.merged);
   const can = phase === "plan" && !planning && !!ok && plan.length > 0;
   const tidx = Math.max(0, members.findIndex((m) => m.number === targetNum));
-  const wtOf = (pr: number) => ok?.rebaseWorktrees.find((w) => w.pr === pr);
-  // branches that need a worktree before the merge can start: known up front, or named by the failed job
-  const needWt: { pr: number; branch: string }[] =
-    phase === "plan" ? (ok?.rebaseWorktrees.filter((w) => w.kind === "none") ?? []) : missingFrom(phase === "failed" ? job?.errorCode : undefined, job?.errorData);
 
   const confirm = async () => {
     if (staleNote) {
       setStartErr(null);
-      const o = await store.startRebaseStack(n, { stash: dirtyWts.length > 0 });
+      const o = await store.startRebaseStack(n);
       if (o.ok) setRebaseId(o.value.jobId);
       else setStartErr(o.error.message);
       return;
@@ -618,24 +603,6 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
     setStarting(false);
     if (o.ok) setStartedId(o.value.jobId);
     else setStartErr(o.error.message);
-  };
-
-  const createWorktrees = async () => {
-    if (creatingWt || needWt.length === 0) return;
-    setStartErr(null);
-    setCreatingWt(true);
-    for (const w of needWt) {
-      const o = await store.openWorktree(w.pr, true);
-      if (!o.ok) {
-        setStartErr(o.error.message);
-        setCreatingWt(false);
-        return;
-      }
-    }
-    setCreatingWt(false);
-    setStartedId(null);
-    setRebaseId(null);
-    setReplanTick((t) => t + 1);
   };
 
   // The job is a merge-when-ready one that has not started merging: cancelling it is still possible.
@@ -665,7 +632,6 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
     if (waitingJob && k.name === "c" && !k.ctrl && !k.meta) return void store.cancelMergeWhenReady(waitingJob.pr);
     if (phase === "running" || rebasing) return;
     if (k.ctrl || k.meta) return;
-    if (k.name === "c" && needWt.length > 0) return void createWorktrees();
     if (isConfirm(k)) {
       if (phase === "done") store.closeSheet();
     } else if (phase === "failed" && k.name === "r") {
@@ -834,8 +800,6 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
           text(`     ${job.progress.phase === "enqueued" ? "queued by GitHub" : (job.progress.message ?? "waiting for GitHub")}`, "muted");
         }
         if (it.why) wrapped(it.why, "muted", 5);
-        const wt = phase === "plan" && it.worktreePr !== undefined ? worktreeNote(wtOf(it.worktreePr)) : null;
-        if (wt) wrapped(wt.text, wt.ok ? "faint" : "error", 5);
       });
       if (items.length > 0 && tidx < members.length - 1) {
         text(`${prList(members.slice(tidx + 1).map((m) => m.number))} will need a stack rebase before ${tidx === members.length - 2 ? "it merges" : "they merge"}.`, "muted");
@@ -881,9 +845,9 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const title = phase === "done" ? `Stack #${job?.pr ?? topNum} finished` : `${force || forced ? "Force merge stack" : "Merge stack"} #${topNum}`;
   const keys =
     phase === "plan"
-      ? `↑↓ pick · ⏎ merge up to here · f force · t ${method}${canWait ? " · w when ready" : ""}${needWt.length > 0 ? " · c create worktree" : ""}`
+      ? `↑↓ pick · ⏎ merge up to here · f force · t ${method}${canWait ? " · w when ready" : ""}`
       : phase === "failed"
-        ? `r plan again${needWt.length > 0 ? " · c create worktree" : ""}`
+        ? "r plan again"
         : "";
 
   return (
@@ -892,7 +856,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
       <scrollbox ref={scroll} height={viewH} flexShrink={0} scrollY>
         <box flexDirection="column">{lines}</box>
       </scrollbox>
-      {failMsg && dirtyWts.length === 0 && (
+      {failMsg && (
         <>
           <Gap />
           {wrapText(failMsg, 80).map((l, i) => (
@@ -906,32 +870,21 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
           <Txt tone={mergeOutcomeOk(job?.outcome) ? "muted" : "error"}>{`${job ? mergeOutcomeText(job) : ""}. Esc or ⏎ to close.`}</Txt>
         </>
       )}
-      {phase === "plan" && staleNote && !rebasing && dirtyWts.length === 0 && (
+      {phase === "plan" && staleNote && !rebasing && (
         <>
           <Gap />
           <Txt tone="muted">{`Rewrites and force-pushes ${prCount(members.length)}.`}</Txt>
         </>
       )}
-      {dirtyWts.length > 0 && (
-        <>
-          <Gap />
-          <Txt tone="error">Rebase stack didn't start: uncommitted changes in</Txt>
-          {dirtyWts.map((d) => (
-            <Txt key={d.path} tone="muted">{`  ${d.path}: ${d.files.slice(0, 4).join(", ")}${d.files.length > 4 ? ` +${d.files.length - 4}` : ""}`}</Txt>
-          ))}
-          <Txt tone="muted">⏎ stashes them, rebases, then restores them.</Txt>
-        </>
-      )}
       <Footer left={rebasing ? "runs in background · esc to close" : phase === "plan" || phase === "failed" ? keys : waitingJob ? "runs in background · c cancel waiting · esc to close" : phase === "running" ? "runs in background · esc to close" : ""} cancel={phase === "plan" && !rebasing ? "Cancel" : "Close"}>
-        {needWt.length > 0 && !rebasing && <Pill label={creatingWt ? waitLabel("Creating", tick, reducedMotion()) : "Create worktree"} hint="c" variant="secondary" disabled={creatingWt} onPress={() => void createWorktrees()} />}
         {canWait && <Pill label="Merge when ready" hint="w" variant="secondary" disabled={starting} onPress={() => void whenReady()} />}
         {phase === "failed" && !rebasing && <Pill label="Plan again" hint="r" variant="primary" onPress={() => setStartedId(null)} />}
         {phase === "plan" && !rebasing && (
           <Pill
-            label={starting ? waitLabel("Starting", tick, reducedMotion()) : planning ? waitLabel("Planning", tick, reducedMotion()) : staleNote ? (dirtyWts.length > 0 ? "Stash and rebase" : "Rebase stack") : label}
+            label={starting ? waitLabel("Starting", tick, reducedMotion()) : planning ? waitLabel("Planning", tick, reducedMotion()) : staleNote ? "Rebase stack" : label}
             hint="⏎"
             variant={staleNote ? "primary" : force || forced ? "secondary" : "primary"}
-            disabled={starting || planning || creatingWt || needWt.length > 0 || (staleNote ? false : !can)}
+            disabled={starting || planning || (staleNote ? false : !can)}
             onPress={() => void confirm()}
           />
         )}

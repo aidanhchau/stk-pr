@@ -512,4 +512,13 @@ describe("planNativeStackMerge", () => {
     });
     expect(r).toMatchObject({ ok: true, sha: "m1", detail: "merged #3 with downstack #1, #2" });
   });
+
+  test("executePlan: rebase-stack appends the note the rebase returned after `; `", async () => {
+    const gh = { merge: async () => ({ status: "merged" as const }), retarget: async () => {}, waitChecks: async () => {}, rebaseStack: async () => "local checkouts left untouched" };
+    const deps = { exec: async () => ({ code: 0, stdout: "", stderr: "" }), repoDir: "", gh };
+    const [withNote] = await executePlan([{ kind: "rebase-stack", pr: 2 }], deps);
+    expect(withNote).toMatchObject({ ok: true, detail: "rebased the stack from #2 onto the trunk in a temporary checkout and pushed with leases; local checkouts left untouched" });
+    const [plain] = await executePlan([{ kind: "rebase-stack", pr: 2 }], { ...deps, gh: { ...gh, rebaseStack: async () => {} } });
+    expect(plain!.detail).toBe("rebased the stack from #2 onto the trunk in a temporary checkout and pushed with leases");
+  });
 });

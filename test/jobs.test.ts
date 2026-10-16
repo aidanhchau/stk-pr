@@ -17,11 +17,12 @@ function fakeMergeGithub(
 ): { exec: Exec; puts: string[] } {
   const { native, result, blocked = [] } = o;
   const puts: string[] = [];
+  const head = (n: number) => (rebased ? `new${n}` : `sha${n}`);
   const pr = (n: number) => {
     const at = chain.indexOf(n);
     return {
       number: n, title: `PR ${n}`, url: `https://github.com/o/r/pull/${n}`, author: { login: "me" }, state: merged.has(n) ? "MERGED" : "OPEN", isDraft: false,
-      headRefName: `b${n}`, baseRefName: at > 0 && !rebased ? `b${chain[at - 1]}` : "main", headRefOid: `sha${n}`, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+      headRefName: `b${n}`, baseRefName: at > 0 && !rebased ? `b${chain[at - 1]}` : "main", headRefOid: head(n), mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
       reviewDecision: blocked.includes(n) ? "REVIEW_REQUIRED" : "APPROVED", statusCheckRollup: [],
       createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z", body: "", files: [],
     };
@@ -29,8 +30,9 @@ function fakeMergeGithub(
   const ok = (v: unknown) => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
   const page = { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] };
   const merged = new Set<number>();
-  // gh stack push moves the open PRs onto the trunk (GitHub leaves them on the merged branch until then)
+  // the leased push of the restack moves the open PRs onto the trunk (GitHub leaves them on the merged branch until then)
   let rebased = false;
+  let checkedOut = "";
   const exec: Exec = async (argv, opts) => {
     const a = argv.join(" ");
     if (a.includes("merge-async")) {
@@ -45,14 +47,32 @@ function fakeMergeGithub(
       if (result === "merged") for (const m of native ? chain.filter((x) => x <= n) : [n]) merged.add(m);
       return { code: 0, stdout: `HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ status: result, details: {} })}`, stderr: "" };
     }
-    if (a.startsWith("gh stack ")) {
-      if (a === "gh stack push") rebased = true;
-      return { code: 0, stdout: "", stderr: "" };
+    if (argv[0] === "git") {
+      const g = argv.filter((x, i) => !(x === "-c" || argv[i - 1] === "-c")).slice(1).join(" ");
+      const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+      const none = { code: 1, stdout: "", stderr: "" };
+      if (g.startsWith("fetch ") || g.startsWith("worktree add") || g.startsWith("worktree remove") || g === "worktree prune" || g.startsWith("rebase ")) return ok();
+      if (g.startsWith("merge-base --is-ancestor")) return ok();
+      if (g === "worktree list --porcelain") return ok(chain.map((n) => `worktree /wt-${n}\nHEAD sha${n}\nbranch refs/heads/b${n}\n\n`).join(""));
+      if (g === "rev-parse --verify --quiet refs/remotes/origin/main") return ok("trunk0\n");
+      const remote = /^rev-parse --verify --quiet refs\/remotes\/origin\/b(\d+)$/.exec(g);
+      if (remote) return ok(`${head(Number(remote[1]))}\n`);
+      // local branches sit at the planned heads
+      const local = /^rev-parse --verify --quiet refs\/heads\/b(\d+)$/.exec(g);
+      if (local) return ok(`sha${local[1]}\n`);
+      if (g.startsWith("checkout --detach ")) {
+        checkedOut = g.slice("checkout --detach sha".length);
+        return ok();
+      }
+      if (g === "rev-parse HEAD") return ok(`new${checkedOut}\n`);
+      if (g.startsWith("push --atomic")) {
+        rebased = true;
+        return ok();
+      }
+      const ls = /^ls-remote origin refs\/heads\/b(\d+)$/.exec(g);
+      if (ls) return ok(`${head(Number(ls[1]))}\trefs/heads/b${ls[1]}\n`);
+      return none;
     }
-    if (a === "git worktree list --porcelain") return { code: 0, stdout: chain.map((n) => `worktree /wt-${n}\nHEAD sha${n}\nbranch refs/heads/b${n}\n\n`).join(""), stderr: "" };
-    if (a === "git status --porcelain") return { code: 0, stdout: "", stderr: "" };
-    if (a.startsWith("git rev-parse --verify refs/heads/")) return { code: 0, stdout: `sha${argv[3]!.replace("refs/heads/b", "")}\n`, stderr: "" };
-    if (a.startsWith("git ls-remote origin refs/heads/")) return { code: 0, stdout: `sha${argv[3]!.replace("refs/heads/b", "")}\t${argv[3]}\n`, stderr: "" };
     if (argv[1] === "repo") return ok({ owner: { login: "o" }, name: "r", defaultBranchRef: { name: "main" } });
     if (argv[1] === "pr" && argv[2] === "list") return ok(chain.filter((n) => !merged.has(n)).map(pr));
     if (argv[1] === "pr" && argv[2] === "view") return ok(pr(Number(argv[3])));
