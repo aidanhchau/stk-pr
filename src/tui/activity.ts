@@ -19,14 +19,12 @@ export type RL =
   | { t: "head"; left: Span[]; right?: string; muted?: boolean }
   | { t: "text"; spans: Span[]; muted?: boolean; rail?: boolean; indent?: number }
   | { t: "gap"; rail?: boolean; indent?: number }
-  /** A drawn image, `rows` cells tall. `indent`: columns before the image; `railIndent`: columns before the rail (see `indentRow`). */
-  | { t: "image"; src: string; alt: string; cols: number; rows: number; indent: number; rail?: boolean; railIndent?: number }
-  /** Images side by side (a table row's), `rows` cells tall in all, captions included. Indents as for `image`. */
-  | { t: "images"; items: ImageGroupItem[]; rows: number; indent: number; rail?: boolean; railIndent?: number }
+  /** Drawn image(s), `rows` cells tall in all (one item, or a table row's side by side). `indent`: columns before them; `railIndent`: columns before the rail (see `indentRow`). */
+  | { t: "image"; items: ImageGroupItem[]; rows: number; indent: number; rail?: boolean; railIndent?: number }
   | { t: "input" };
 
 /** Cells a row occupies. */
-export const rowHeight = (r: RL): number => (r.t === "image" || r.t === "images" ? r.rows : 1);
+export const rowHeight = (r: RL): number => (r.t === "image" ? r.rows : 1);
 export const rowsHeight = (rows: RL[]): number => rows.reduce((n, r) => n + rowHeight(r), 0);
 
 /** 0 = one-line preview, 1 = capped body, 2 = full body with `<details>` open. */
@@ -213,16 +211,14 @@ export function bodyRows(body: string, level: Level, w: number, cap = BODY_CAP, 
   const all = layoutRows(dropTitle ? withoutTitle(blocks) : blocks, w, { details: level === 2, removed, images });
   const shown = level === 2 ? all : all.slice(0, cap);
   const rows: RL[] = shown.map((r): RL => {
-    if (r.t === "image") return { t: "image", src: r.src, alt: r.alt, cols: r.cols, rows: r.rows, indent: r.indent };
-    if (r.t === "images") return { t: "images", items: r.items, rows: r.rows, indent: r.indent };
+    if (r.t === "image") return { t: "image", items: r.items, rows: r.rows, indent: r.indent };
     if (r.image) images?.request(r.image);
     return r.spans.length ? { t: "text", spans: r.spans } : { t: "gap" };
   });
   if (shown.length < all.length) {
     const hidden = new Set<string>();
     for (const r of all.slice(shown.length)) {
-      if (r.t === "image") hidden.add(r.src);
-      else if (r.t === "images") for (const it of r.items) hidden.add(it.src);
+      if (r.t === "image") for (const it of r.items) hidden.add(it.src);
       else if (r.image) hidden.add(r.image);
     }
     const pics = hidden.size ? `, ${hidden.size} ${hidden.size === 1 ? "image" : "images"}` : "";
@@ -252,7 +248,7 @@ const pad = (n: number): Span[] => (n ? [{ text: " ".repeat(n), style: "plain" }
 /** Shift a row right by `n` columns. A railed row moves its rail too (`indent` pads before it), so nested rails stay under their head. */
 const indentRow = (r: RL, n: number): RL => {
   if (!n) return r;
-  if (r.t === "image" || r.t === "images") return r.rail ? { ...r, railIndent: (r.railIndent ?? 0) + n } : { ...r, indent: r.indent + n };
+  if (r.t === "image") return r.rail ? { ...r, railIndent: (r.railIndent ?? 0) + n } : { ...r, indent: r.indent + n };
   if ((r.t === "text" || r.t === "gap") && r.rail) return { ...r, indent: (r.indent ?? 0) + n };
   return r.t === "head" ? { ...r, left: [...pad(n), ...r.left] } : r.t === "text" ? { ...r, spans: [...pad(n), ...r.spans] } : r;
 };
@@ -279,7 +275,7 @@ export function convoRows(e: ConversationEntry, level: Level, x: RowCtx): RL[] {
   return [convoHead(e, level, x), ...bodyRows(e.body, level, x.w, undefined, undefined, false, x.images).map(withRail)];
 }
 
-const withRail = (r: RL): RL => (r.t === "text" || r.t === "gap" || r.t === "image" || r.t === "images" ? { ...r, rail: true } : r);
+const withRail = (r: RL): RL => (r.t === "text" || r.t === "gap" || r.t === "image" ? { ...r, rail: true } : r);
 
 const locOf = (th: ReviewThread): string => (th.path ? `${th.path}${th.line ? `:${th.line}` : ""}` : "");
 

@@ -290,11 +290,13 @@ function parseLines(lines: string[], fences: string[], images: ImageRef[]): Bloc
       const grid: ImageRef[][][] = [];
       i--;
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]!.replace(/^\s*(?:>\s?)+/, ""))) {
-        const raw = lines[i]!.replace(/^\s*(?:>\s?)+/, "").trim().slice(1, -1).split("|");
+        // a `\|` is a pipe inside the cell, not a column break; it is unescaped in the cell's text and in its images' src and alt
+        const raw = lines[i]!.replace(/^\s*(?:>\s?)+/, "").trim().slice(1, -1).split(/(?<!\\)\|/);
         i++;
+        const unpipe = (s: string) => s.replace(/\\\|/g, "|");
         // images in a cell are content: kept per cell, apart from the cell's text
-        const imgs = raw.map((c) => [...c.matchAll(IMG_RE)].map((m) => images[Number(m[1])]!));
-        const cells = raw.map((c) => plain(tidy(inline(c.replace(IMG_RE, "")))));
+        const imgs = raw.map((c) => [...c.matchAll(IMG_RE)].map((m) => ({ src: unpipe(images[Number(m[1])]!.src), alt: unpipe(images[Number(m[1])]!.alt) })));
+        const cells = raw.map((c) => plain(tidy(inline(unpipe(c.replace(IMG_RE, ""))))));
         if (!imgs.some((c) => c.length) && cells.every((c) => /^:?-{2,}:?$/.test(c) || c === "")) continue;
         rows.push(cells);
         grid.push(imgs);
@@ -545,7 +547,7 @@ export function fitImage(width: number, height: number, maxCols: number, cell: {
 export const TABLE_IMAGE_MIN_COLS = 40;
 const TABLE_IMAGE_GAP = 2;
 
-/** One image of an `images` row: drawn `cols`x`rows` cells at column `x` of the row, in a `slot`-wide column, under an optional caption line. */
+/** One image of a drawn row: `cols`x`rows` cells at column `x` of the row, in a `slot`-wide column, under an optional caption line. */
 export interface ImageGroupItem {
   src: string;
   alt: string;
@@ -557,14 +559,11 @@ export interface ImageGroupItem {
 }
 
 /**
- * A laid-out row: a line of styled spans, a drawn image `rows` cells tall, or side-by-side images (a table row's; `rows` is the whole
- * height, a caption line included when any item has one). `image` on a text row names the image it stands in for
+ * A laid-out row: a line of styled spans, or drawn images (one for a standalone image, several side by side for a table row's);
+ * `rows` is the whole height, a caption line included when any item has one. `image` on a text row names the image it stands in for
  * (loading / failed): the view starts that download only if the row is actually shown.
  */
-export type Row =
-  | { t: "text"; spans: Span[]; image?: string }
-  | { t: "image"; src: string; alt: string; cols: number; rows: number; indent: number }
-  | { t: "images"; items: ImageGroupItem[]; rows: number; indent: number };
+export type Row = { t: "text"; spans: Span[]; image?: string } | { t: "image"; items: ImageGroupItem[]; rows: number; indent: number };
 
 const textRows = (rows: Span[][]): Row[] => rows.map((spans) => ({ t: "text", spans }));
 const isBlank = (r: Row): boolean => r.t === "text" && !r.spans.length;
@@ -572,7 +571,7 @@ const isBlank = (r: Row): boolean => r.t === "text" && !r.spans.length;
 /** `layoutRows` as plain text lines (search text, previews, tests): a drawn image is its `▣ alt` line. */
 export function layoutBlocks(blocks: Block[], w: number, opts: LayoutOpts): Span[][] {
   return layoutRows(blocks, w, opts).map((r) =>
-    r.t === "text" ? r.spans : [{ text: r.t === "image" ? `▣ ${r.alt}` : r.items.map((i) => `▣ ${i.alt}`).join("  "), style: "muted" as const }],
+    r.t === "text" ? r.spans : [{ text: r.items.map((i) => `▣ ${i.alt}`).join("  "), style: "muted" as const }],
   );
 }
 
@@ -602,7 +601,8 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
   const imageRows = (src: string, alt: string) => {
     const meta = opts.images?.lookup(src);
     if (opts.images && meta?.status === "ready") {
-      out.push({ t: "image", src, alt, indent: 0, ...fitImage(meta.width, meta.height, w, opts.images.cell) });
+      const { cols, rows } = fitImage(meta.width, meta.height, w, opts.images.cell);
+      out.push({ t: "image", items: [{ src, alt, caption: null, cols, rows, x: 0, slot: cols }], rows, indent: 0 });
       return;
     }
     const note = !opts.images ? "" : meta?.status === "error" ? ` · ${meta.reason}` : " · loading image";
@@ -623,7 +623,7 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
         return { src: it.img.src, alt: it.img.alt || "image", caption: it.caption, slot, x: k * (slot + TABLE_IMAGE_GAP), ...fitImage(m.width, m.height, slot, env.cell) };
       });
       const captioned = placed.some((p) => p.caption);
-      out.push({ t: "images", items: placed, rows: (captioned ? 1 : 0) + Math.max(...placed.map((p) => p.rows)), indent: 0 });
+      out.push({ t: "image", items: placed, rows: (captioned ? 1 : 0) + Math.max(...placed.map((p) => p.rows)), indent: 0 });
       return;
     }
     items.forEach((it, k) => {
@@ -724,7 +724,7 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
         } else {
           emit(wrapSpans([{ text: `▾ ${plain(b.summary)}`, style: "muted" }], w));
           for (const r of layoutRows(b.body, w - 2, opts)) {
-            out.push(r.t === "image" || r.t === "images" ? { ...r, indent: r.indent + 2 } : r.spans.length ? { ...r, spans: [{ text: "  ", style: "plain" }, ...r.spans] } : r);
+            out.push(r.t === "image" ? { ...r, indent: r.indent + 2 } : r.spans.length ? { ...r, spans: [{ text: "  ", style: "plain" }, ...r.spans] } : r);
           }
         }
         break;

@@ -72,7 +72,7 @@ describe("image rows", () => {
 
   test("a ready image is one row carrying its height, between blank lines", () => {
     const r = rows(env("ready"));
-    expect(r.map((x) => (x.t === "image" ? `image ${x.cols}x${x.rows}` : x.t === "text" ? plain(x.spans) : "images"))).toEqual(["intro", "", "image 80x15", "", "outro"]);
+    expect(r.map((x) => (x.t === "image" ? `image ${x.items[0]!.cols}x${x.rows}` : plain(x.spans)))).toEqual(["intro", "", "image 80x15", "", "outro"]);
   });
 
   test("loading and failed images are one muted line that names the image to request", () => {
@@ -89,14 +89,14 @@ describe("image rows", () => {
 
   test("inside open <details> the image is indented; closed details hide it", () => {
     const body = `<details><summary>s</summary>\n\n![c](${SVG})\n\n</details>`;
-    expect(rows(env("ready"), true, body).find((x) => x.t === "image")).toMatchObject({ indent: 2, cols: 78 });
+    expect(rows(env("ready"), true, body).find((x) => x.t === "image")).toMatchObject({ indent: 2, items: [{ cols: 78 }] });
     expect(rows(env("ready"), false, body).map((x) => x.t === "text" && plain(x.spans))).toEqual(["▸ s"]);
   });
 
   test("bodyRows: an image is one line for the cap, rowsHeight counts its rows, and only shown images are requested", () => {
     const body = `![change](${SVG})\n\n${Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n\n")}`;
     const out = bodyRows(body, 1, 80, 4, undefined, false, env("ready"));
-    expect(out[0]).toMatchObject({ t: "image", rows: 15, cols: 80, indent: 0 });
+    expect(out[0]).toMatchObject({ t: "image", rows: 15, items: [{ cols: 80, caption: null, x: 0 }], indent: 0 });
     const last = out.at(-1);
     expect(last?.t === "text" && plain(last.spans)).toMatch(/more lines$/);
     expect(rowsHeight(out)).toBe(out.length - 1 + 15);
@@ -121,7 +121,7 @@ describe("images in tables", () => {
     lookup: () => (status === "ready" ? { status, width: 800, height: 400 } : { status }),
   });
   const rows = (body: string, w: number, e?: ImageEnv) => layoutRows(parseComment(body).blocks, w, { details: true, images: e });
-  const shape = (r: ReturnType<typeof rows>[number]) => (r.t === "text" ? plain(r.spans) : r.t === "image" ? `image ${r.cols}x${r.rows}` : `images ${r.items.map((i) => `${i.cols}x${i.rows}@${i.x}`).join(" ")} h${r.rows}`);
+  const shape = (r: ReturnType<typeof rows>[number]) => (r.t === "text" ? plain(r.spans) : `image ${r.items.map((i) => `${i.cols}x${i.rows}@${i.x}`).join(" ")} h${r.rows}`);
 
   test("cell images are kept per cell, the header is the caption source, the separator row is not mistaken for an image row", () => {
     const [t] = parseComment(table).blocks;
@@ -145,20 +145,20 @@ describe("images in tables", () => {
 
   test("ready images with room go side by side under their header captions, in one row", () => {
     const r = rows(table, 100, env("ready"));
-    expect(r.map(shape)).toEqual(["images 49x12@0 49x12@51 h13"]);
+    expect(r.map(shape)).toEqual(["image 49x12@0 49x12@51 h13"]);
     const g = r[0]!;
-    expect(g.t === "images" && g.items.map((i) => i.caption)).toEqual(["Collapsed", "Expanded"]);
+    expect(g.t === "image" && g.items.map((i) => i.caption)).toEqual(["Collapsed", "Expanded"]);
   });
 
   test("each image needs 40 columns: 81 columns stack, 82 sit side by side", () => {
-    expect(rows(table, 81, env("ready")).map(shape)).toEqual(["Collapsed", "image 80x20", "", "Expanded", "image 80x20"]);
-    expect(rows(table, 82, env("ready")).map((x) => x.t)).toEqual(["images"]);
+    expect(rows(table, 81, env("ready")).map(shape)).toEqual(["Collapsed", "image 80x20@0 h20", "", "Expanded", "image 80x20@0 h20"]);
+    expect(rows(table, 82, env("ready")).map(shape)).toEqual(["image 40x10@0 40x10@42 h11"]);
   });
 
   test("three images need 3x40 columns and two gaps", () => {
     const three = `| a | b | c |\n|---|---|---|\n| ![1](${A}) | ![2](${B}) | ![3](https://x.test/c.png) |`;
     expect(rows(three, 123, env("ready")).map((x) => x.t)).toEqual(["text", "image", "text", "text", "image", "text", "text", "image"]);
-    expect(rows(three, 124, env("ready")).map((x) => x.t)).toEqual(["images"]);
+    expect(rows(three, 124, env("ready")).map((x) => (x.t === "image" ? x.items.length : 0))).toEqual([3]);
   });
 
   test("images still loading stack as `▣ alt` lines under their captions, naming what to request", () => {
@@ -173,16 +173,16 @@ describe("images in tables", () => {
 
   test("text cells keep their text, labelled by the header, above the row's images", () => {
     const mixed = `| Name | Shot |\n|---|---|\n| Alpha | ![a](${A}) |\n| Beta | ![b](${B}) |`;
-    expect(rows(mixed, 100, env("ready")).map(shape)).toEqual(["Name: Alpha", "Shot", "image 80x20", "", "Name: Beta", "Shot", "image 80x20"]);
+    expect(rows(mixed, 100, env("ready")).map(shape)).toEqual(["Name: Alpha", "Shot", "image 80x20@0 h20", "", "Name: Beta", "Shot", "image 80x20@0 h20"]);
   });
 
   test("a single image cell with a caption is stacked like a standalone image", () => {
-    expect(rows(`| Before |\n|---|\n| ![a](${A}) |`, 100, env("ready")).map(shape)).toEqual(["Before", "image 80x20"]);
+    expect(rows(`| Before |\n|---|\n| ![a](${A}) |`, 100, env("ready")).map(shape)).toEqual(["Before", "image 80x20@0 h20"]);
   });
 
   test("details indent side-by-side rows", () => {
     const r = rows(`<details><summary>s</summary>\n\n${table}\n\n</details>`, 100, env("ready"));
-    expect(r.find((x) => x.t === "images")).toMatchObject({ indent: 2 });
+    expect(r.find((x) => x.t === "image" && x.items.length === 2)).toMatchObject({ indent: 2 });
   });
 
   test("bodyRows: height counts the group once; the cap hint names hidden images; only shown loading images are requested", () => {
@@ -197,5 +197,11 @@ describe("images in tables", () => {
     const requested: string[] = [];
     expect(hint(env("loading", requested))).toMatch(/more lines, 2 images$/);
     expect(requested).toEqual([]);
+  });
+
+  test("escaped pipes stay inside their cell, and are unescaped in image src and alt", () => {
+    const [t] = parseComment(`| a | b |\n|---|---|\n| ![x\\|y](https://x.test/p.png?a=1\\|2) | one \\| two |`).blocks;
+    expect(t).toMatchObject({ t: "table", rows: [["a", "b"], ["", "one | two"]] });
+    expect(t?.t === "table" && t.images?.[1]).toEqual([[{ src: "https://x.test/p.png?a=1|2", alt: "x|y" }], []]);
   });
 });

@@ -595,7 +595,7 @@ interface Reply {
  * One drawn image. Sent at the pixel size it is drawn at (`imageVariant`; the base image until that is ready). A click opens it large and
  * stops there: the comment's own click (select, then fold) is not also triggered. Hidden while a sheet is open, so no placement lingers over it.
  */
-function ImageView({ src, alt, cols, rows, marginLeft = 0 }: { src: string; alt: string; cols: number; rows: number; marginLeft?: number }) {
+function ImageView({ src, alt, cols, rows }: { src: string; alt: string; cols: number; rows: number }) {
   const store = useStoreInstance();
   const covered = useStore((s) => s.sheet !== null);
   const img = useImageSource(src, cols, rows, !covered);
@@ -604,13 +604,13 @@ function ImageView({ src, alt, cols, rows, marginLeft = 0 }: { src: string; alt:
     e.stopPropagation();
     store.openSheet({ kind: "image", src, alt });
   };
-  return <image source={img.source} fit="fill" protocol="auto" width={cols} height={rows} marginLeft={marginLeft} flexShrink={0} onMouseDown={open} onMouseUp={(e) => e.stopPropagation()} />;
+  return <image source={img.source} fit="fill" protocol="auto" width={cols} height={rows} flexShrink={0} onMouseDown={open} onMouseUp={(e) => e.stopPropagation()} />;
 }
 
-/** An image row, or a table row's images side by side (`images`): each in its own `slot`-wide column under its caption, each opening its own sheet. */
-function ImageRow({ r, rail }: { r: Extract<RL, { t: "image" | "images" }>; rail?: string }) {
+/** Drawn image(s): each in its own `slot`-wide column under its caption (if any), each opening its own sheet. */
+function ImageRow({ r, rail }: { r: Extract<RL, { t: "image" }>; rail?: string }) {
   const p = useTheme();
-  const captioned = r.t === "images" && r.items.some((it) => it.caption);
+  const captioned = r.items.some((it) => it.caption);
   return (
     <box height={r.rows} flexShrink={0} flexDirection="row" paddingLeft={rail ? (r.railIndent ?? 0) : 2}>
       {rail && (
@@ -618,24 +618,20 @@ function ImageRow({ r, rail }: { r: Extract<RL, { t: "image" | "images" }>; rail
           {Array.from({ length: r.rows }, () => "│ ").join("\n")}
         </text>
       )}
-      {r.t === "image" ? (
-        <ImageView src={r.src} alt={r.alt} cols={r.cols} rows={r.rows} marginLeft={r.indent} />
-      ) : (
-        <box flexDirection="row" marginLeft={r.indent} height={r.rows} flexShrink={0}>
-          {r.items.map((it, k) => (
-            <box key={`${it.src}:${k}`} width={it.slot} height={r.rows} flexShrink={0} flexDirection="column" marginRight={r.items[k + 1] ? r.items[k + 1]!.x - it.x - it.slot : 0}>
-              {captioned && (
-                <box height={1} flexShrink={0} overflow="hidden">
-                  <text fg={p.ink} wrapMode="none" truncate>
-                    <strong>{it.caption ?? ""}</strong>
-                  </text>
-                </box>
-              )}
-              <ImageView src={it.src} alt={it.alt} cols={it.cols} rows={it.rows} />
-            </box>
-          ))}
-        </box>
-      )}
+      <box flexDirection="row" marginLeft={r.indent} height={r.rows} flexShrink={0}>
+        {r.items.map((it, k) => (
+          <box key={`${it.src}:${k}`} width={it.slot} height={r.rows} flexShrink={0} flexDirection="column" marginRight={r.items[k + 1] ? r.items[k + 1]!.x - it.x - it.slot : 0}>
+            {captioned && (
+              <box height={1} flexShrink={0} overflow="hidden">
+                <text fg={p.ink} wrapMode="none" truncate>
+                  <strong>{it.caption ?? ""}</strong>
+                </text>
+              </box>
+            )}
+            <ImageView src={it.src} alt={it.alt} cols={it.cols} rows={it.rows} />
+          </box>
+        ))}
+      </box>
     </box>
   );
 }
@@ -703,7 +699,6 @@ function RowsView({
               </box>
             );
           case "image":
-          case "images":
             return <ImageRow key={i} r={r} rail={r.rail ? rail : undefined} />;
           case "gap":
             return r.rail ? (
