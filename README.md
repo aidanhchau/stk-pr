@@ -229,7 +229,7 @@ Partial merges: the sheet merges up to the PR it was opened on (`S` on a PR page
 
 ## Tern plugin (optional)
 
-`plugin/` is a small launcher for the Tern terminal; stk works fine without it. Link it with `tern plugin link <path-to-stk>/plugin`. It needs `stk` on Tern's PATH, or set `STK_CMD` (for example `bun /path/to/stk/src/cli.ts`) in Tern's environment. Each command opens the UI in a split beside the focused pane (a new tab if the split fails).
+`plugin/` is a small launcher for the Tern terminal; stk works fine without it. Link it with `tern plugin link <path-to-stk>/plugin`. It needs `stk` on Tern's PATH, or set `STK_CMD` (for example `bun /path/to/stk/src/cli.ts`) in Tern's environment. Launcher commands open the UI in a split beside the focused pane. PR board and Open PR fall back to a new tab if the split fails.
 
 | Command | Action |
 | --- | --- |
@@ -239,6 +239,8 @@ Partial merges: the sheet merges up to the PR it was opened on (`S` on a PR page
 | `stk: Toggle OMP restyle` | Load or unload `omp.css`, a restyle of omp's pane; the choice persists. |
 
 GitHub PR links (`https://github.com/<owner>/<repo>/pull/<n>`) clicked in any pane open in stk, with the clicked pane as the session pane. Option-click keeps the browser.
+
+The link is claimed immediately; pane lookup and process startup run on a deferred timer, outside Tern's 50 ms link-hook budget. PR links and Session PRs use asynchronous `tern inspect` / `tern split` commands, keeping cold shell startup off the window's plugin thread so it cannot disable a callback hook. The launch keeps the clicked pane even if focus moves, and is skipped if that pane disappears before launch. If the CLI cannot find or split the source pane, an error toast reports the failure instead of opening somewhere else.
 
 ## Worktrees
 

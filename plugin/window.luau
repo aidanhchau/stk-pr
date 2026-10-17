@@ -83,32 +83,40 @@ local function cli_block(cx: WindowCx, pane: number, done: (number?, string, Win
 	if not started then done(nil, tostring(err), cx) end
 end
 
+-- Runs a Tern CLI command asynchronously; only its result is handled on the window thread.
+local function run_cli(cx: WindowCx?, args: { string }, done: (boolean, string, WindowCx?) -> ())
+	local argv = { TERN_BIN }
+	for _, arg in args do table.insert(argv, arg) end
+	local ran, err = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(result: ProcessResult, ncx: WindowCx?)
+		done(result.status == 0, if result.status == 0 then "" else cli_failure(result), ncx)
+	end)
+	if not ran then done(false, tostring(err), cx) end
+end
+
 -- Runs `tern <build(block)>` against `pane`; `done(ok, why, cx)` gets the verdict.
 local function tern_cli(cx: WindowCx, pane: number, build: (string) -> { string }, done: (boolean, string, WindowCx?) -> ())
 	cli_block(cx, pane, function(block: number?, why: string, fcx: WindowCx?)
 		if block == nil then return done(false, why, fcx) end
-		local argv = { TERN_BIN }
-		for _, arg in build(string.format("%d", block)) do table.insert(argv, arg) end
-		local ran, err = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(result: ProcessResult, ncx: WindowCx?)
-			done(result.status == 0, if result.status == 0 then "" else cli_failure(result), ncx)
-		end)
-		if not ran then done(false, tostring(err), fcx) end
+		run_cli(fcx, build(string.format("%d", block)), done)
 	end)
+end
+
+local function split_args(block: string, launch: Launch): { string }
+	local args = { "split", block, "right" }
+	if launch.cwd then
+		table.insert(args, "--cwd")
+		table.insert(args, launch.cwd)
+	end
+	for _, arg in { "--", tern.getenv("SHELL") or "/bin/zsh", "-lic", launch.command or STK } do table.insert(args, arg) end
+	return args
 end
 
 -- Opens `launch` in a split to the right of `pane`. The window API first; the CLI for panes it doesn't know.
 -- Only when neither can split does it open a tab, and says why.
 local function split_right(cx: WindowCx, pane: number, launch: Launch)
 	if cx.layout:split(pane, "right", launch) ~= nil then return end
-	local line = launch.command or STK
 	tern_cli(cx, pane, function(block: string): { string }
-		local args = { "split", block, "right" }
-		if launch.cwd then
-			table.insert(args, "--cwd")
-			table.insert(args, launch.cwd)
-		end
-		for _, arg in { "--", tern.getenv("SHELL") or "/bin/zsh", "-lic", line } do table.insert(args, arg) end
-		return args
+		return split_args(block, launch)
 	end, function(ok: boolean, why: string, ncx: WindowCx?)
 		if ok then return end
 		local wcx = ncx or cx
@@ -124,30 +132,29 @@ local function launch(cx: WindowCx, pane: number, repo: string, pr: number?)
 	split_right(cx, pane, { cwd = repo, command = tui_command(repo, pr) })
 end
 
--- Launch the TUI beside `pane` with a pre-built stk subcommand line (repo-less: cwd = the pane's dir
--- or home).
-local function launch_line(cx: WindowCx, pane: number, cwd: string?, args: string)
-	local line = STK .. " tui " .. args
-	local launch: Launch = { command = line }
-	if cwd and cwd ~= "" then launch.cwd = cwd end
-	split_right(cx, pane, launch)
-end
-
-local function pane_cwd(cx: WindowCx, id: number): string?
-	for _, p in cx.session:panes() do
-		if p.pane == id and p.cwd ~= nil and p.cwd ~= "" then return p.cwd end
-	end
-	return nil
-end
-
 -- Launch the TUI beside `pane` with `--session-pane` naming `pane` as the CLI knows it: stk reads the session
 -- with `tern capture`, which doesn't know the window API's id for panes opened after the daemon's handover.
--- Without a CLI id (no tern binary, pane gone) the window id is passed as before.
+-- Use the CLI for the split too: native cx.layout:split can exceed the window callback's budget on a cold
+-- shell launch, even from a timer. Recheck the source after inspect; never launch beside a new focused pane.
 local function launch_session(cx: WindowCx, pane: number, args: string)
-	local cwd = pane_cwd(cx, pane)
-	cli_block(cx, pane, function(block: number?, _why: string, fcx: WindowCx?)
-		local id = string.format("%d", block or pane)
-		launch_line(fcx or cx, pane, cwd, args .. (if args == "" then "" else " ") .. "--session-pane " .. id)
+	cli_block(cx, pane, function(block: number?, why: string, fcx: WindowCx?)
+		if fcx == nil then return end
+		if block == nil then
+			fcx:toast("error", "Could not open the stk TUI", why)
+			return
+		end
+		for _, source in fcx.session:panes() do
+			if source.pane == pane then
+				local id = string.format("%d", block)
+				local line = STK .. " tui " .. args .. (if args == "" then "" else " ") .. "--session-pane " .. id
+				local launch: Launch = { command = line }
+				if source.cwd and source.cwd ~= "" then launch.cwd = source.cwd end
+				run_cli(fcx, split_args(id, launch), function(ok: boolean, err: string, ncx: WindowCx?)
+					if not ok and ncx then ncx:toast("error", "Could not open the stk TUI", err) end
+				end)
+				return
+			end
+		end
 	end)
 end
 
@@ -159,8 +166,8 @@ local function is_stk_pane(p: PaneInfo): boolean
 end
 
 -- GitHub PR links (…/pull/N, optional /files, /commits, ?query, #anchor) open in the TUI;
--- ⌥-click keeps the browser. The source pane (link.pane, else the focused
--- one) is also the session pane.
+-- ⌥-click keeps the browser. Copy the source pane and arguments, then defer all pane enumeration and
+-- process spawning beyond route.link's 50 ms budget; timer callbacks receive a fresh window context.
 tern.route.link(function(link: LinkRequest, cx: WindowCx)
 	local owner, name, num = string.match(link.url, "^https://github%.com/([^/]+)/([^/]+)/pull/(%d+)")
 	if not owner or not name or not num then return nil end
@@ -168,7 +175,17 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx)
 	local pane: number? = link.pane
 	if pane == nil then pane = cx.session:focused() end
 	if pane == nil then return nil end
-	launch_session(cx, pane, "--gh " .. sh_quote(owner .. "/" .. name) .. " --pr " .. num)
+	local args = "--gh " .. sh_quote(owner .. "/" .. name) .. " --pr " .. num
+	tern.timer(0, function(freshCx: WindowCx?)
+		if freshCx == nil then return end
+		for _, source in freshCx.session:panes() do
+			if source.pane == pane then
+				launch_session(freshCx, pane, args)
+				return
+			end
+		end
+		-- The clicked pane was closed before the timer fired; don't launch beside a different pane.
+	end)
 	return { handled = true }
 end)
 
