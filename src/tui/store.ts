@@ -120,6 +120,8 @@ export type Sheet =
   | { kind: "review"; n: number; event: ReviewEvent; repo?: RepoSlug }
   | { kind: "stack"; n: number; repo?: RepoSlug; /** merge up to this PR (default: `n`, the PR the sheet was opened on); "top" = the whole stack */ upTo?: number | "top" }
   | { kind: "worktree"; n: number; repo?: RepoSlug }
+  /** Ready / draft / close / reopen for the PR page's PR or the board's selected row (`p`). */
+  | { kind: "state" }
   | { kind: "help" }
   | { kind: "palette"; /** initial command-line text */ query?: string }
   | { kind: "output"; title: string; command: string; output: string; code: number }

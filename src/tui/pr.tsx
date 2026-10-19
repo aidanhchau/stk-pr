@@ -21,6 +21,9 @@ import { layoutBlocks, parseComment, preview, threadFix, type ImageEnv, type Spa
 import { jobDockText, type Job } from "../jobs";
 import { diffKey, mergeMethodOf, runningJobOf, useStore, useStoreInstance, type Store } from "./store";
 import { checkSummary, currentChecks, type CurrentCheck } from "./pr-checks";
+import { openUrl, openInBrowser } from "./browser";
+import { commandFacts, openStateSheet, runCommand } from "./commands";
+import { stateActions } from "../commands";
 import { CommitCheckRow, CommitRow, commitColumns, useCommitHistory, type HistoryItem } from "./pr-history";
 import { G, SPACE, clip, lerpHex, personColor, useLayout, useTheme, type Palette } from "./theme";
 import { Clipped, ErrorState, Loading, Pill, Rule, Scroll, StatusGlyph, Txt, toneColor, useScreenKeys, useScrollFollow, useVimNav, useVimSearch, type Chrome, type Tone } from "./ui";
@@ -62,7 +65,7 @@ function describe(b: Blocker, d: PrDetail): Desc {
     case "threads":
       return { glyph: "fail", label: `${plural(b.count, "unresolved thread")}`, detail: "", short: `${plural(b.count, "thread")} open` };
     case "draft":
-      return { glyph: "pending", label: "Draft", detail: "mark ready for review", short: "draft" };
+      return { glyph: "pending", label: "Draft", detail: "⏎ mark ready for review", short: "draft" };
     case "conflict":
       return { glyph: "fail", label: `Conflicts with ${b.base ?? "base"}`, detail: "resolve locally and push", short: `conflicts with ${b.base ?? "base"}` };
     case "behind":
@@ -209,21 +212,6 @@ function age(iso: string): string {
 const MINUS = process.env.STK_ASCII === "1" ? "-" : "−";
 /** 999 -> `999`, 12400 -> `12k`. */
 const num = (n: number) => (n >= 1000 ? `${n >= 10000 ? Math.round(n / 1000) : Math.round(n / 100) / 10}k` : String(n));
-
-/** Open a URL in the default browser. Spawns directly (never an OSC 8 link: the Tern plugin routes GitHub PR links back into stk). `STK_OPEN` overrides the opener. */
-export function openUrl(url: string) {
-  const opener = process.env.STK_OPEN ?? (process.platform === "darwin" ? "open" : "xdg-open");
-  try {
-    Bun.spawn([opener, url], { stdout: "ignore", stderr: "ignore" });
-  } catch {
-    /* no opener available */
-  }
-}
-
-export function openInBrowser(store: Store, url: string) {
-  openUrl(url);
-  store.toast("Opened in browser");
-}
 
 /**
  * Text of the rows `<diff>` renders for a patch (one entry per row): headers and `@@` lines are not drawn; split view pairs -/+ runs.
@@ -745,7 +733,9 @@ type Item =
   | { id: string; kind: "passing" }
   | { id: string; kind: "file"; path: string }
   | { id: "files"; kind: "files" }
-  | { id: string; kind: "stack"; n: number };
+  | { id: string; kind: "stack"; n: number }
+  /** The Draft row under Blocking merge: ⏎ marks the PR ready for review. */
+  | { id: "bl-draft"; kind: "draft" };
 
 interface Block {
   key: string;
@@ -838,6 +828,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   const quiet = [...passing, ...skipped];
   const files = [...d.files].sort(byTree);
   const info = mergeInfo(d);
+  const hasStateActions = stateActions(commandFacts(store.getState())).length > 0;
 
   /** Every searchable item in display order, visible or not (collapsed, hidden bot/low-signal, passing checks). */
   const searchItems = useMemo(() => {
@@ -871,6 +862,11 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   if (d.stack) {
     mark();
     for (const e of [...d.stack.entries].reverse()) items.push({ id: `s:${e.number}`, kind: "stack", n: e.number });
+  }
+  const draftBlocked = !info.closed && d.blockers.some((b) => b.kind === "draft");
+  if (draftBlocked) {
+    mark();
+    items.push({ id: "bl-draft", kind: "draft" });
   }
   if (activity.length) mark();
   for (const r of actRows) {
@@ -963,6 +959,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       }
     }
     else if (cur.kind === "desc") setDescLevel(descLevel === 2 ? 1 : 2);
+    else if (cur.kind === "draft") runCommand(store, "ready");
     else if (cur.kind === "passing") setPassingOpen((v) => !v);
     else if (cur.kind === "check") {
       if (cur.url) openUrl(cur.url);
@@ -1047,6 +1044,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       {!info.closed && <Pill label="Approve" hint="a" onPress={() => store.openSheet({ kind: "review", n, event: "APPROVE" })} />}
       {!info.closed && <Pill label="Request changes" hint="x" onPress={() => store.openSheet({ kind: "review", n, event: "REQUEST_CHANGES" })} />}
       <Pill label="Comment" hint="C" onPress={() => store.openSheet({ kind: "review", n, event: "COMMENT" })} />
+      {hasStateActions && <Pill label="State" hint="p" onPress={() => openStateSheet(store)} />}
     </box>,
   );
   gap("pills-gap");
@@ -1141,10 +1139,9 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     push("bl", 1, <Label label="Blocking merge" meta={info.descs.length} />);
     gap("bl-gap");
     const lw = Math.min(34, Math.max(...info.descs.map((x) => x.label.length)));
-    info.descs.forEach((x, i) =>
-      push(
-        `bl${i}`,
-        1,
+    info.descs.forEach((x, i) => {
+      const isDraft = d.blockers[i]?.kind === "draft";
+      const row = (selected: boolean) => (
         <box height={1} flexDirection="row" flexShrink={0}>
           <StatusGlyph status={x.glyph} />
           <text>{"  "}</text>
@@ -1154,11 +1151,20 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
             </text>
           </box>
           <box flexGrow={1} flexShrink={1} marginLeft={2} height={1} overflow="hidden">
-            <T tone="muted">{x.detail}</T>
+            <T tone="muted" sel={selected}>{x.detail}</T>
           </box>
-        </box>,
-      ),
-    );
+        </box>
+      );
+      if (!isDraft) return push(`bl${i}`, 1, row(false));
+      push(
+        `bl${i}`,
+        1,
+        <Sel selected={hlKey === "bl-draft"} h={1} onSelect={() => setCurId("bl-draft")} onOpen={openCur}>
+          {row(hlKey === "bl-draft")}
+        </Sel>,
+        { item: "bl-draft", lead: 2 },
+      );
+    });
     gap("bl-end", 2);
   }
 
@@ -1623,6 +1629,8 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
         return store.openSheet({ kind: "review", n, event: "REQUEST_CHANGES" });
       case "C":
         return store.openSheet({ kind: "review", n, event: "COMMENT" });
+      case "p":
+        return openStateSheet(store);
       case "o":
         if (cur?.kind === "desc") return openInBrowser(store, pr.url);
         if (cur?.kind === "convo") return openInBrowser(store, cur.e.url);

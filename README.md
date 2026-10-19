@@ -94,6 +94,7 @@ Board:
 | `1` `2` `3`, `tab` | Switch scope (`shift-tab` goes backwards) |
 | `/` | Filter by title, branch, number |
 | `w` | Worktree sheet |
+| `p` | PR state: mark ready for review, convert to draft, close, reopen (only what applies; close and draft ask first) |
 | `o` | Open PR in the browser |
 | `S` | Merge stack (when the PR is stacked) |
 | `d` | Toggle density |
@@ -111,6 +112,7 @@ PR:
 | `M` | Force merge |
 | `t` | Cycle merge method |
 | `S` | Merge stack |
+| `p` | PR state: mark ready for review, convert to draft, close, reopen. On a draft, `⏎` on the Draft row under Blocking merge marks it ready. |
 | `w` | Worktree sheet |
 | `o` | Open the selected commit, comment or PR in the browser (also click `#n` or `github ↗`) |
 | `⏎`, `l` | Toggle the selected section or commit's checks; open a file diff or check log |
