@@ -7,8 +7,9 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { prReadiness, type BoardPr, type RepoSlug, type SessionPr } from "../service";
 import type { Blocker } from "../types";
+import { openInBrowser } from "./browser";
 import { openStateSheet } from "./commands";
-import { MergeJobStatus, openInBrowser } from "./pr";
+import { MergeJobStatus } from "./pr";
 import { jobCovers } from "../jobs";
 import { repoKey, useStore, useStoreInstance, type TuiScope } from "./store";
 import { G, SPACE, clip, useLayout, useTheme } from "./theme";
@@ -644,7 +645,11 @@ export function Board({ scope }: { scope: TuiScope }) {
     if (k.name === "tab") store.setScope(scopes[(scopeIdx + (k.shift ? scopes.length - 1 : 1)) % scopes.length]!.key);
     else if (k.sequence === "R" && store.getState().workspace) store.openSheet({ kind: "palette", query: "repo " });
     else if (k.name === "w" && !k.shift && sel && !sel.fold) store.openSheet({ kind: "worktree", n: sel.pr.number, repo: sel.repo ?? undefined });
-    else if (k.name === "p" && !k.shift && sel && !sel.fold) openStateSheet(store);
+    else if (k.name === "p" && !k.shift && sel && !sel.fold) {
+      // The command target is the stored cursor; bind it to the highlighted row (it may be unset or hidden by the filter).
+      store.setBoardCursor(sel.key);
+      openStateSheet(store);
+    }
     else if ((k.name === "s" && k.shift) || k.sequence === "S") {
       if (!sel || sel.fold) return;
       const stacked = sel.parent !== null || sel.stackSize > 0;

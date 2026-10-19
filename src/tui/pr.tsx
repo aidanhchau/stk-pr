@@ -21,6 +21,7 @@ import { layoutBlocks, parseComment, preview, threadFix, type ImageEnv, type Spa
 import { jobDockText, type Job } from "../jobs";
 import { diffKey, mergeMethodOf, runningJobOf, useStore, useStoreInstance, type Store } from "./store";
 import { checkSummary, currentChecks, type CurrentCheck } from "./pr-checks";
+import { openUrl, openInBrowser } from "./browser";
 import { commandFacts, openStateSheet, runCommand } from "./commands";
 import { stateActions } from "../commands";
 import { CommitCheckRow, CommitRow, commitColumns, useCommitHistory, type HistoryItem } from "./pr-history";
@@ -211,21 +212,6 @@ function age(iso: string): string {
 const MINUS = process.env.STK_ASCII === "1" ? "-" : "−";
 /** 999 -> `999`, 12400 -> `12k`. */
 const num = (n: number) => (n >= 1000 ? `${n >= 10000 ? Math.round(n / 1000) : Math.round(n / 100) / 10}k` : String(n));
-
-/** Open a URL in the default browser. Spawns directly (never an OSC 8 link: the Tern plugin routes GitHub PR links back into stk). `STK_OPEN` overrides the opener. */
-export function openUrl(url: string) {
-  const opener = process.env.STK_OPEN ?? (process.platform === "darwin" ? "open" : "xdg-open");
-  try {
-    Bun.spawn([opener, url], { stdout: "ignore", stderr: "ignore" });
-  } catch {
-    /* no opener available */
-  }
-}
-
-export function openInBrowser(store: Store, url: string) {
-  openUrl(url);
-  store.toast("Opened in browser");
-}
 
 /**
  * Text of the rows `<diff>` renders for a patch (one entry per row): headers and `@@` lines are not drawn; split view pairs -/+ runs.

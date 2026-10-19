@@ -45,7 +45,7 @@ const detailOf = (kind: Kind): PrDetail => {
 };
 
 /** The real App over a seeded store whose gh calls are recorded, never run. */
-async function renderApp(kind: Kind, screen: AppState["screen"], cursor: string | null) {
+async function renderApp(kind: Kind, screen: AppState["screen"], cursor: string | null, others = true) {
   const calls: string[][] = [];
   const exec = async (argv: readonly string[]) => {
     calls.push([...argv]);
@@ -60,7 +60,7 @@ async function renderApp(kind: Kind, screen: AppState["screen"], cursor: string 
   seed.set({
     screen,
     boardCursor: cursor,
-    boards: { mine: { status: "ready", data: { repo, trunk: "main", prs: [prOf(kind)].map((p) => ({ ...p, repo })) }, refreshing: false } },
+    boards: { mine: { status: "ready", data: { repo, trunk: "main", prs: [prOf(kind), ...(others ? [prOf("open", 2)] : [])].map((p) => ({ ...p, repo })) }, refreshing: false } },
     prCache: { "o/r#1": { status: "ready", data: detailOf(kind), refreshing: false, at: Date.now() } },
   });
   const title = spyOn(CliRenderer.prototype, "setTerminalTitle").mockImplementation(() => {});
@@ -88,7 +88,7 @@ async function renderApp(kind: Kind, screen: AppState["screen"], cursor: string 
 }
 
 const page = (kind: Kind) => renderApp(kind, { kind: "pr", repo, n: 1, scope: "mine" }, null);
-const board = (kind: Kind) => renderApp(kind, { kind: "board", scope: "mine" }, "o/r#1");
+const board = (kind: Kind) => renderApp(kind, { kind: "board", scope: "mine" }, "o/r#1", kind !== "merged");
 
 const facts = (state: PrFacts["state"], isDraft: boolean): PrFacts => ({
   state,
@@ -254,4 +254,31 @@ test("on the board, p on a merged row toasts and opens no sheet", async () => {
   s.mockInput.pressKey("p");
   await frame();
   expect(store.getState().sheet).toBeNull();
+});
+
+test("on a fresh board (no stored cursor), p acts on the highlighted row", async () => {
+  const { s, store, frame } = await renderApp("draft", { kind: "board", scope: "mine" }, null);
+  s.mockInput.pressKey("p");
+  const text = await frame();
+  expect(store.getState().sheet).toEqual({ kind: "state" });
+  const cursor = store.getState().boardCursor;
+  expect(cursor).toMatch(/^o\/r#[12]$/);
+  expect(text).toContain(`#${cursor!.slice(-1)} ·`);
+});
+
+test("on a filtered board, p acts on the visible row, not the hidden stored cursor", async () => {
+  const { s, store, calls, frame } = await renderApp("draft", { kind: "board", scope: "mine" }, "o/r#2");
+  s.mockInput.pressKey("/");
+  await frame();
+  await s.mockInput.typeText("Change 1");
+  await frame();
+  s.mockInput.pressEnter();
+  await frame();
+  s.mockInput.pressKey("p");
+  const text = await frame();
+  expect(store.getState().boardCursor).toBe("o/r#1");
+  expect(text).toContain("#1 · draft");
+  s.mockInput.pressKey("r");
+  await frame();
+  expect(calls.map((c) => c.join(" "))).toEqual(["gh pr ready 1 -R o/r"]);
 });

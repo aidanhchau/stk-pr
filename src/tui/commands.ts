@@ -5,7 +5,7 @@ import { nativeUpTo, type PullRequest, type Blocker } from "../types";
 import { jobCovers } from "../jobs";
 import { waitVerdict } from "../watch";
 import { describeBlocker, describeRerunStep, describeSubmitEntry, type BoardPr, type RepoSlug } from "../service";
-import { openInBrowser } from "./pr";
+import { openInBrowser } from "./browser";
 import { mergeMethodOf, paletteItems, repoKey, type AppState, type Store } from "./store";
 
 export interface CommandTarget {
