@@ -231,7 +231,7 @@ Partial merges: the sheet merges up to the PR it was opened on (`S` on a PR page
 
 ## Tern plugin (optional)
 
-`plugin/` is a small launcher for the Tern terminal; stk works fine without it. Link it with `tern plugin link <path-to-stk>/plugin`. It needs `stk` on Tern's PATH, or set `STK_CMD` (for example `bun /path/to/stk/src/cli.ts`) in Tern's environment. Launcher commands open the UI in a split beside the focused pane. PR board and Open PR fall back to a new tab if the split fails.
+`plugin/` is a small launcher for the Tern terminal; stk works fine without it. Link it with `tern plugin link <path-to-stk>/plugin`. It needs `stk` on the PATH Tern gives new panes (its login environment), or set `STK_CMD` (for example `bun /path/to/stk/src/cli.ts`) in Tern's environment. The UI starts as `sh -c`, not through your shell's startup files, so variables you export only in `.zshrc` are not set in it. Launcher commands open the UI in a split beside the focused pane. PR board and Open PR fall back to a new tab if the split fails.
 
 | Command | Action |
 | --- | --- |
@@ -242,7 +242,7 @@ Partial merges: the sheet merges up to the PR it was opened on (`S` on a PR page
 
 GitHub PR links (`https://github.com/<owner>/<repo>/pull/<n>`) clicked in any pane open in stk, with the clicked pane as the session pane. Option-click keeps the browser.
 
-The link is claimed immediately; pane lookup and process startup run on a deferred timer, outside Tern's 50 ms link-hook budget. PR links and Session PRs use asynchronous `tern inspect` / `tern split` commands, keeping cold shell startup off the window's plugin thread so it cannot disable a callback hook. The launch keeps the clicked pane even if focus moves, and is skipped if that pane disappears before launch. If the CLI cannot find or split the source pane, an error toast reports the failure instead of opening somewhere else.
+A link click starts the launch straight from the link hook. When Tern's window API can split beside the clicked pane (pane ids below 2^44), that is one call that returns at once. Otherwise (the daemon's pane ids pass 2^44 once it has served 4096 connections, and then the window API can neither split nor close those panes) the plugin runs asynchronous `tern inspect` / `tern split` commands, and `tern close` for closing an stk pane, so nothing on the window thread can pass Tern's 50 ms hook budget. The window API shows such a pane under the low 44 bits of the CLI's id; the plugin maps it back by exact match, else by the one listed pane with those low bits, and says so in an error toast when none or several match instead of acting on another pane. The launch keeps the clicked pane even if focus moves, and is skipped if that pane disappears before launch.
 
 ## Worktrees
 

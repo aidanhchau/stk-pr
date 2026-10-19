@@ -54,31 +54,51 @@ local function existing_tui(cx: WindowCx, repo: string): number?
 	return nil
 end
 
--- Since Tern 0.9.0, cx.layout:split returns nil and cx.layout:close does nothing for panes opened after the
--- session daemon's handover (the window's plugin API doesn't know their ids), while the `tern` CLI still finds
--- them, under the pane id or that id plus the host bit (2^44). `tern split` on an unknown id still spawns a
--- detached shell, so `tern inspect` picks the id first. Plugin processes don't inherit the app's PATH, so
--- prefer the binary inside the app bundle.
+-- The window API and the `tern` CLI name a pane differently. A daemon pane id is (n << 32) | k, where n advances with
+-- every client connection to the daemon (each `tern` call counts, including the splits below), so ids pass 2^44
+-- after 4096 connections. The window API reports only the low 44 bits (the bits above are its host number), and
+-- since Tern 0.9.0 cx.layout:split returns nil and cx.layout:close does nothing for a pane whose id is 2^44 or more.
+-- Only the CLI can act on those, under the full id. Tern 0.9.4 measured: window id 554050781185 for CLI id
+-- 35738422870017 (= 2 * 2^44 + 554050781185); 0.9.1 only ever showed one 2^44 of difference (the host bit).
+-- `tern split` on an unknown id still spawns a detached shell, so `tern inspect` picks the id first.
+-- Plugin processes don't inherit the app's PATH, so prefer the binary inside the app bundle.
 local TERN_APP_BIN = "/Applications/Tern.app/Contents/MacOS/tern"
 local TERN_BIN = if tern.fs.exists(TERN_APP_BIN) then TERN_APP_BIN else "tern"
-local HOST_BIT = 2 ^ 44
+local WINDOW_ID_SPAN = 2 ^ 44
 
 local function cli_failure(result: ProcessResult): string
 	local why = string.gsub(result.stderr, "%s+$", "")
 	return if why ~= "" then why else "tern exited " .. tostring(result.status)
 end
 
--- Finds the id the `tern` CLI knows `pane` by (the pane id or that id plus the host bit); `done(block, why, cx)`
--- gets nil and the reason when there is none. tern.process.run raises when the binary can't be spawned; that is
--- reported through `done` too (with `cx`).
+-- The id the CLI knows `pane` by among `tern inspect`'s `panes`: that id when listed, else the one listed id equal to
+-- it plus a multiple of 2^44. Never guesses: nil and the reason when no pane matches or several do.
+local function cli_id(panes: { any }, pane: number): (number?, string)
+	for _, info in panes do
+		if info.pane == pane then return info.pane, "" end
+	end
+	if pane >= WINDOW_ID_SPAN then return nil, "no such pane in tern inspect" end
+	local found: number? = nil
+	local count = 0
+	for _, info in panes do
+		local id: number = info.pane
+		if id >= WINDOW_ID_SPAN and id % WINDOW_ID_SPAN == pane then
+			found = id
+			count += 1
+		end
+	end
+	if count > 1 then return nil, string.format("%d panes in tern inspect share the window id %d", count, pane) end
+	return found, if found then "" else "no such pane in tern inspect"
+end
+
+-- Finds the id the `tern` CLI knows `pane` by; `done(block, why, cx)` gets nil and the reason when there is none.
+-- tern.process.run raises when the binary can't be spawned; that is reported through `done` too (with `cx`).
 local function cli_block(cx: WindowCx, pane: number, done: (number?, string, WindowCx?) -> ())
 	local started, err = pcall(tern.process.run, { TERN_BIN, "inspect", "--json" }, { timeout_ms = 10000 }, function(found: ProcessResult, fcx: WindowCx?)
 		local ok, parsed = pcall(tern.json.decode, found.stdout)
 		if found.status ~= 0 or not ok then return done(nil, cli_failure(found), fcx) end
-		for _, info in parsed.panes or {} do
-			if info.pane == pane or info.pane == pane + HOST_BIT then return done(info.pane, "", fcx) end
-		end
-		done(nil, "no such pane in tern inspect", fcx)
+		local id, why = cli_id(parsed.panes or {}, pane)
+		done(id, why, fcx)
 	end)
 	if not started then done(nil, tostring(err), cx) end
 end
@@ -101,13 +121,16 @@ local function tern_cli(cx: WindowCx, pane: number, build: (string) -> { string 
 	end)
 end
 
+-- The pane's program is `sh -c <command>`, not a login shell: the daemon starts every pane in Tern's login
+-- environment (the PATH a new shell pane starts with), and `$SHELL -lic` only added the shell's startup files, about
+-- 0.15-0.3 s in front of every launch.
 local function split_args(block: string, launch: Launch): { string }
 	local args = { "split", block, "right" }
 	if launch.cwd then
 		table.insert(args, "--cwd")
 		table.insert(args, launch.cwd)
 	end
-	for _, arg in { "--", tern.getenv("SHELL") or "/bin/zsh", "-lic", launch.command or STK } do table.insert(args, arg) end
+	for _, arg in { "--", "/bin/sh", "-c", launch.command or STK } do table.insert(args, arg) end
 	return args
 end
 
@@ -132,29 +155,41 @@ local function launch(cx: WindowCx, pane: number, repo: string, pr: number?)
 	split_right(cx, pane, { cwd = repo, command = tui_command(repo, pr) })
 end
 
+-- The window's own record of `pane`. cx.session:pane, tab_of and resolve don't find a pane with a CLI id of 2^44 or
+-- more, but cx.session:panes() lists it (by its low 44 bits), so enumerate.
+local function window_pane(cx: WindowCx, pane: number): PaneInfo?
+	for _, info in cx.session:panes() do
+		if info.pane == pane then return info end
+	end
+	return nil
+end
+
 -- Launch the TUI beside `pane` with `--session-pane` naming `pane` as the CLI knows it: stk reads the session
--- with `tern capture`, which doesn't know the window API's id for panes opened after the daemon's handover.
--- Use the CLI for the split too: native cx.layout:split can exceed the window callback's budget on a cold
--- shell launch, even from a timer. Recheck the source after inspect; never launch beside a new focused pane.
+-- with `tern capture`, which takes the CLI's id. A pane below 2^44 has the same id in both (and the window API can
+-- split beside it: 0.1 ms measured on 0.9.4, the shell starts asynchronously). Other panes get the CLI path:
+-- `tern inspect` for the id, then `tern split`, both asynchronous, so nothing on the window thread can pass its
+-- 50 ms budget. Recheck the source after inspect; never launch beside a new focused pane.
 local function launch_session(cx: WindowCx, pane: number, args: string)
+	local function launch_for(id: number, source: PaneInfo): Launch
+		local line = STK .. " tui " .. args .. (if args == "" then "" else " ") .. "--session-pane " .. string.format("%d", id)
+		local launch: Launch = { command = line }
+		if source.cwd and source.cwd ~= "" then launch.cwd = source.cwd end
+		return launch
+	end
+	local source = window_pane(cx, pane)
+	if source == nil then return end
+	if pane < WINDOW_ID_SPAN and cx.layout:split(pane, "right", launch_for(pane, source)) ~= nil then return end
 	cli_block(cx, pane, function(block: number?, why: string, fcx: WindowCx?)
 		if fcx == nil then return end
 		if block == nil then
 			fcx:toast("error", "Could not open the stk TUI", why)
 			return
 		end
-		for _, source in fcx.session:panes() do
-			if source.pane == pane then
-				local id = string.format("%d", block)
-				local line = STK .. " tui " .. args .. (if args == "" then "" else " ") .. "--session-pane " .. id
-				local launch: Launch = { command = line }
-				if source.cwd and source.cwd ~= "" then launch.cwd = source.cwd end
-				run_cli(fcx, split_args(id, launch), function(ok: boolean, err: string, ncx: WindowCx?)
-					if not ok and ncx then ncx:toast("error", "Could not open the stk TUI", err) end
-				end)
-				return
-			end
-		end
+		local current = window_pane(fcx, pane)
+		if current == nil then return end
+		run_cli(fcx, split_args(string.format("%d", block), launch_for(block, current)), function(ok: boolean, err: string, ncx: WindowCx?)
+			if not ok and ncx then ncx:toast("error", "Could not open the stk TUI", err) end
+		end)
 	end)
 end
 
@@ -166,8 +201,9 @@ local function is_stk_pane(p: PaneInfo): boolean
 end
 
 -- GitHub PR links (…/pull/N, optional /files, /commits, ?query, #anchor) open in the TUI;
--- ⌥-click keeps the browser. Copy the source pane and arguments, then defer all pane enumeration and
--- process spawning beyond route.link's 50 ms budget; timer callbacks receive a fresh window context.
+-- ⌥-click keeps the browser. The hook only reads the source pane and starts the launch: the native split returns
+-- at once and `tern.process.run` doesn't wait, so there's no need for a timer hop (which added 20-100 ms), and
+-- the rest runs in process callbacks.
 tern.route.link(function(link: LinkRequest, cx: WindowCx)
 	local owner, name, num = string.match(link.url, "^https://github%.com/([^/]+)/([^/]+)/pull/(%d+)")
 	if not owner or not name or not num then return nil end
@@ -175,22 +211,12 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx)
 	local pane: number? = link.pane
 	if pane == nil then pane = cx.session:focused() end
 	if pane == nil then return nil end
-	local args = "--gh " .. sh_quote(owner .. "/" .. name) .. " --pr " .. num
-	tern.timer(0, function(freshCx: WindowCx?)
-		if freshCx == nil then return end
-		for _, source in freshCx.session:panes() do
-			if source.pane == pane then
-				launch_session(freshCx, pane, args)
-				return
-			end
-		end
-		-- The clicked pane was closed before the timer fired; don't launch beside a different pane.
-	end)
+	launch_session(cx, pane, "--gh " .. sh_quote(owner .. "/" .. name) .. " --pr " .. num)
 	return { handled = true }
 end)
 
 -- Closing a stk TUI pane skips Tern's confirmation (`tern close` is the raw close; cx.layout:close silently
--- does nothing for panes the window API doesn't know, see tern_cli). The override runs on a 50 ms budget, so
+-- does nothing for panes the window API doesn't know, see cli_id). The override runs on a 50 ms budget, so
 -- the close happens in the CLI's callback.
 tern.override("close_pane", function(cx: WindowCx)
 	local id = cx.session:focused()
