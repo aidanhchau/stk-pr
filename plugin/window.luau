@@ -122,8 +122,8 @@ local function tern_cli(cx: WindowCx, pane: number, build: (string) -> { string 
 end
 
 -- The pane's program is `sh -c <command>`, not a login shell: the daemon starts every pane in Tern's login
--- environment (the PATH a new shell pane starts with), and `$SHELL -lic` only added the shell's startup files, about
--- 0.15-0.3 s in front of every launch.
+-- environment (verified on the real daemon: `stk` in ~/.bun/bin and `gh` in /opt/homebrew/bin are on the PATH), and
+-- `$SHELL -lic` only added the shell's startup files, about 0.15-0.3 s in front of every launch.
 local function split_args(block: string, launch: Launch): { string }
 	local args = { "split", block, "right" }
 	if launch.cwd then
@@ -165,10 +165,10 @@ local function window_pane(cx: WindowCx, pane: number): PaneInfo?
 end
 
 -- Launch the TUI beside `pane` with `--session-pane` naming `pane` as the CLI knows it: stk reads the session
--- with `tern capture`, which takes the CLI's id. A pane below 2^44 has the same id in both (and the window API can
--- split beside it: 0.1 ms measured on 0.9.4, the shell starts asynchronously). Other panes get the CLI path:
--- `tern inspect` for the id, then `tern split`, both asynchronous, so nothing on the window thread can pass its
--- 50 ms budget. Recheck the source after inspect; never launch beside a new focused pane.
+-- with `tern capture`, which takes the CLI's id. Always the CLI path, never cx.layout:split: a cold native split took
+-- over 50 ms on Tern 0.9.1, and an overrun disables route.link until a reload. `tern inspect` for the id, then
+-- `tern split`, both asynchronous, so nothing on the window thread can pass its budget. Recheck the source after
+-- inspect; never launch beside a new focused pane.
 local function launch_session(cx: WindowCx, pane: number, args: string)
 	local function launch_for(id: number, source: PaneInfo): Launch
 		local line = STK .. " tui " .. args .. (if args == "" then "" else " ") .. "--session-pane " .. string.format("%d", id)
@@ -178,7 +178,6 @@ local function launch_session(cx: WindowCx, pane: number, args: string)
 	end
 	local source = window_pane(cx, pane)
 	if source == nil then return end
-	if pane < WINDOW_ID_SPAN and cx.layout:split(pane, "right", launch_for(pane, source)) ~= nil then return end
 	cli_block(cx, pane, function(block: number?, why: string, fcx: WindowCx?)
 		if fcx == nil then return end
 		if block == nil then
@@ -201,9 +200,8 @@ local function is_stk_pane(p: PaneInfo): boolean
 end
 
 -- GitHub PR links (…/pull/N, optional /files, /commits, ?query, #anchor) open in the TUI;
--- ⌥-click keeps the browser. The hook only reads the source pane and starts the launch: the native split returns
--- at once and `tern.process.run` doesn't wait, so there's no need for a timer hop (which added 20-100 ms), and
--- the rest runs in process callbacks.
+-- ⌥-click keeps the browser. The hook only reads the source pane and starts `tern inspect` (`tern.process.run`
+-- doesn't wait), so there's no need for a timer hop (which added 20-100 ms); the rest runs in process callbacks.
 tern.route.link(function(link: LinkRequest, cx: WindowCx)
 	local owner, name, num = string.match(link.url, "^https://github%.com/([^/]+)/([^/]+)/pull/(%d+)")
 	if not owner or not name or not num then return nil end
