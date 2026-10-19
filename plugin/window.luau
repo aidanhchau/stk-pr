@@ -71,18 +71,21 @@ local function cli_failure(result: ProcessResult): string
 	return if why ~= "" then why else "tern exited " .. tostring(result.status)
 end
 
--- The id the CLI knows `pane` by among `tern inspect`'s `panes`: that id when listed, else the one listed id equal to
--- it plus a multiple of 2^44. Never guesses: nil and the reason when no pane matches or several do.
+-- The id the CLI knows `pane` by among `tern inspect`'s `panes`: the one listed id equal to it plus a multiple of 2^44
+-- (itself included). Never guesses: nil and the reason when no pane matches or several do. Several can: the window
+-- reports both p and p + 2^44 as p, so an exact match alone doesn't identify the pane.
 local function cli_id(panes: { any }, pane: number): (number?, string)
-	for _, info in panes do
-		if info.pane == pane then return info.pane, "" end
+	if pane >= WINDOW_ID_SPAN then
+		for _, info in panes do
+			if info.pane == pane then return info.pane, "" end
+		end
+		return nil, "no such pane in tern inspect"
 	end
-	if pane >= WINDOW_ID_SPAN then return nil, "no such pane in tern inspect" end
 	local found: number? = nil
 	local count = 0
 	for _, info in panes do
 		local id: number = info.pane
-		if id >= WINDOW_ID_SPAN and id % WINDOW_ID_SPAN == pane then
+		if id % WINDOW_ID_SPAN == pane then
 			found = id
 			count += 1
 		end
