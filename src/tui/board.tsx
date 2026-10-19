@@ -7,6 +7,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { prReadiness, type BoardPr, type RepoSlug, type SessionPr } from "../service";
 import type { Blocker } from "../types";
+import { openStateSheet } from "./commands";
 import { MergeJobStatus, openInBrowser } from "./pr";
 import { jobCovers } from "../jobs";
 import { repoKey, useStore, useStoreInstance, type TuiScope } from "./store";
@@ -643,6 +644,7 @@ export function Board({ scope }: { scope: TuiScope }) {
     if (k.name === "tab") store.setScope(scopes[(scopeIdx + (k.shift ? scopes.length - 1 : 1)) % scopes.length]!.key);
     else if (k.sequence === "R" && store.getState().workspace) store.openSheet({ kind: "palette", query: "repo " });
     else if (k.name === "w" && !k.shift && sel && !sel.fold) store.openSheet({ kind: "worktree", n: sel.pr.number, repo: sel.repo ?? undefined });
+    else if (k.name === "p" && !k.shift && sel && !sel.fold) openStateSheet(store);
     else if ((k.name === "s" && k.shift) || k.sequence === "S") {
       if (!sel || sel.fold) return;
       const stacked = sel.parent !== null || sel.stackSize > 0;
@@ -757,9 +759,9 @@ export const boardChrome: Chrome = {
     const workspace = useStore((s) => !!s.workspace);
     const repo: [string, string][] = workspace ? [["R", "repo"]] : [];
     return mode === "wide" ? (
-      <KeyHints hints={[["j/k", "move"], ["⏎", "open"], ["w", "worktree"], ["S", "merge stack"], ["T", "group"], ...repo, ["/", "search"], ["?", "help"]]} />
+      <KeyHints hints={[["j/k", "move"], ["⏎", "open"], ["w", "worktree"], ["p", "state"], ["S", "merge stack"], ["T", "group"], ...repo, ["/", "search"], ["?", "help"]]} />
     ) : (
-      <KeyHints hints={[["j/k", "move"], ["⏎", "open"], ["w", "worktree"], ["S", "stack"], ["T", "group"], ...repo, ["?", "help"]]} />
+      <KeyHints hints={[["j/k", "move"], ["⏎", "open"], ["w", "worktree"], ["p", "state"], ["S", "stack"], ["T", "group"], ...repo, ["?", "help"]]} />
     );
   },
 };

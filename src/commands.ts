@@ -176,6 +176,24 @@ export function available(c: CommandDef, f: PrFacts | null): boolean {
   }
 }
 
+/** The state-changing commands the PR state sheet offers, in row order, with the letter that runs each inside the sheet. */
+export const STATE_ACTIONS = [
+  { id: "ready", key: "r", label: "Ready for review" },
+  { id: "draft", key: "d", label: "Convert to draft" },
+  { id: "reopen", key: "o", label: "Reopen" },
+  { id: "close", key: "c", label: "Close" },
+] as const satisfies readonly { id: CommandId; key: string; label: string }[];
+
+export type StateAction = (typeof STATE_ACTIONS)[number];
+
+/** The state actions that make sense for the PR (none for a merged PR or no target). */
+export function stateActions(f: PrFacts | null): StateAction[] {
+  return STATE_ACTIONS.filter((a) => {
+    const c = COMMANDS.find((x) => x.id === a.id);
+    return c !== undefined && available(c, f);
+  });
+}
+
 export interface RankedCommand {
   def: CommandDef;
   /** Indices into `def.name` for highlighting. */

@@ -1,6 +1,6 @@
 /** TUI bindings of the `:` palette commands: resolve the PR a command acts on (PR page, else board cursor) and run it. */
 import { planGh } from "../ghproxy";
-import { isMergedBase, type CommandId, type PrFacts } from "../commands";
+import { isMergedBase, stateActions, type CommandId, type PrFacts } from "../commands";
 import { nativeUpTo, type PullRequest, type Blocker } from "../types";
 import { jobCovers } from "../jobs";
 import { waitVerdict } from "../watch";
@@ -106,6 +106,15 @@ const blockerWords = (bs: Blocker[]): string =>
   bs
     .map((b) => (b.kind === "checks" ? "checks" : b.kind === "review" ? "review" : b.kind === "threads" ? "open threads" : b.kind === "base-not-trunk" ? describeBlocker(b) : b.kind))
     .join(", ");
+
+/** `p`: open the state sheet for the current target; a merged PR (nothing to change) or no target toasts instead. */
+export function openStateSheet(store: Store): void {
+  const s = store.getState();
+  const t = commandTarget(s);
+  if (!t) return void store.toast("No pull request selected", "error");
+  if (stateActions(commandFacts(s)).length === 0) return void store.toast(`#${t.n} is ${t.pr.state.toLowerCase()}; its state can’t change`, "info");
+  store.openSheet({ kind: "state" });
+}
 
 /** Run a palette command against the current target. Destructive ones go through the confirm sheet. */
 export function runCommand(store: Store, id: CommandId): void {

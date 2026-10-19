@@ -4,6 +4,8 @@ import { useKeyboard } from "@opentui/react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { describeBlocker, type CreatePrPlan, type RepoSlug, type MergeDryRun, type OpenResult, type ReviewEvent, type StackInfo } from "../service";
 import { StkError, mergeOutcomeOk, mergeOutcomeText, type Blocker, type MergeMethod, type PlanStep, type StepResult } from "../types";
+import { COMMANDS, STATE_ACTIONS, stateActions, type StateAction } from "../commands";
+import { commandFacts, commandTarget, runCommand } from "./commands";
 import { jobStatusText } from "../jobs";
 import { isWaitable } from "../watch";
 import { waitLabel } from "../waiting";
@@ -30,6 +32,8 @@ export function Sheets({ sheet }: { sheet: Active }) {
       return <StackSheet n={sheet.n} upTo={sheet.upTo} />;
     case "worktree":
       return <WorktreeSheet n={sheet.n} />;
+    case "state":
+      return <StateSheet />;
     case "help":
       return <HelpSheet />;
     case "palette":
@@ -988,6 +992,7 @@ const HELP: { label: string; keys: [string, string][] }[] = [
       ["1 2 3  tab", "switch scope"],
       ["/", "filter by title, branch, #"],
       ["w", "worktree"],
+      ["p", "PR state: ready / draft / reopen / close"],
       ["S", "merge stack"],
       ["o", "open PR in browser"],
       ["d", "density"],
@@ -1008,6 +1013,7 @@ const HELP: { label: string; keys: [string, string][] }[] = [
       ["t", "merge method"],
       ["S", "merge stack"],
       ["U", "update branch (when behind)"],
+      ["p", "PR state: ready / draft / reopen / close"],
       ["w", "worktree"],
       ["o", "open comment (or PR) in browser"],
       ["⏎ l", "open file diff · expand comment or thread"],
@@ -1037,6 +1043,7 @@ const HELP: { label: string; keys: [string, string][] }[] = [
       ["t", "merge method"],
       ["f", "force (stack)"],
       ["j k", "options / scroll"],
+      ["r d o c", "PR state sheet: ready / draft / reopen / close"],
       ["i  esc", "edit text / leave edit"],
     ],
   },
@@ -1088,6 +1095,61 @@ function HelpSheet() {
     </Sheet>
   );
 }
+
+// ---------- PR state ----------
+
+/** `p`: the state changes available for this PR (ready / draft / reopen / close). A letter or ⏎ runs the same command as the palette (destructive ones confirm first). */
+function StateSheet() {
+  const store = useStoreInstance();
+  const ids = useStore((s) => stateActions(commandFacts(s)).map((a) => a.id).join(","));
+  const actions = STATE_ACTIONS.filter((a) => ids.split(",").includes(a.id));
+  const [cursor, setCursor] = useState(0);
+  const at = Math.min(cursor, Math.max(0, actions.length - 1));
+  const target = useStore((s) => commandTarget(s));
+  const run = (a: StateAction) => {
+    store.closeSheet();
+    runCommand(store, a.id);
+  };
+  useVimNav({ count: actions.length, cursor: at, setCursor, pageSize: actions.length, enabled: true, sheet: true, onOpen: () => actions[at] && run(actions[at]) });
+  useKeyboard((k) => {
+    if (k.ctrl || k.meta || k.super) return;
+    const a = actions.find((x) => x.key === k.sequence);
+    if (a) run(a);
+  });
+  return (
+    <Sheet title={target ? `#${target.n} ${G.sep} ${stateWord(target.pr)}` : "State"} width={64}>
+      <Gap />
+      {actions.length === 0 && (
+        <Line>
+          <Txt tone="muted">Nothing to change</Txt>
+        </Line>
+      )}
+      {actions.map((a, i) => {
+        const c = COMMANDS.find((x) => x.id === a.id)!;
+        return (
+          <box key={a.id} flexShrink={0} onMouseDown={() => (at === i ? run(a) : setCursor(i))}>
+            <Line selected={i === at}>
+              <box width={18} flexShrink={0}>
+                <Txt bold>{a.label}</Txt>
+              </box>
+              <box flexGrow={1} flexShrink={1} overflow="hidden" marginRight={1}>
+                <Txt tone="muted" truncate>
+                  {c.destructive ? `${c.hint} ${G.sep} asks first` : c.hint}
+                </Txt>
+              </box>
+              <box width={1} flexShrink={0}>
+                <Txt tone="muted">{a.key}</Txt>
+              </box>
+            </Line>
+          </box>
+        );
+      })}
+      <Footer left="j/k move" cancel="Close" />
+    </Sheet>
+  );
+}
+
+const stateWord = (pr: { state: string; isDraft: boolean }) => (pr.state === "OPEN" ? (pr.isDraft ? "draft" : "open") : pr.state.toLowerCase());
 
 // ---------- create PR ----------
 
