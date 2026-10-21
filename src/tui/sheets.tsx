@@ -587,8 +587,10 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const plan = ok ? ok.plan : [];
   const forced = plan.some((s) => s.kind === "merge" && s.admin);
   const trunk = ok?.stack.trunk ?? null;
-  // once a job exists the sheet shows the job's own plan (the one it computed at start), not the earlier preview
-  const viewPlan = phase === "plan" ? withExpectedRebases(plan, ok?.stack.native === true) : (job?.plan ?? results.map((r) => r.step));
+  // a just-started job has no plan until its runner has re-read the stack: keep showing the preview meanwhile
+  const jobPlanPending = phase === "running" && !job?.plan && results.length === 0;
+  // once a job has its plan the sheet shows the job's own plan (the one it computed at start), not the earlier preview
+  const viewPlan = phase === "plan" || jobPlanPending ? withExpectedRebases(plan, ok?.stack.native === true) : (job?.plan ?? results.map((r) => r.step));
   const items = planItems(viewPlan, trunk ?? "the trunk", ok?.method ?? method);
   const landedPrs = phase === "plan" ? new Set<number>() : mergedPrs(results, job?.merged);
   const can = phase === "plan" && !planning && !!ok && plan.length > 0;
@@ -784,7 +786,9 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
       push(<Gap />);
       push(<SectionLabel label="Plan" meta={planning ? `${items.length} step${items.length === 1 ? "" : "s"} · ${waitLabel("updating plan", tick, reducedMotion())}` : `${items.length} step${items.length === 1 ? "" : "s"}`} />);
       if (items.length === 0) {
-        text(planning ? "…" : force ? "Nothing can be merged." : "Nothing can be merged yet. Press f to plan a force merge.", planning ? "faint" : "error");
+        // "nothing can be merged" is a verdict on a finished plan; while planning or while a job is starting it is not known yet
+        if (planning || jobPlanPending) text("…", "faint");
+        else if (phase === "plan") text(force ? "Nothing can be merged." : "Nothing can be merged yet. Press f to plan a force merge.", "error");
       }
       items.forEach((it, i) => {
         const st = status(it.steps);

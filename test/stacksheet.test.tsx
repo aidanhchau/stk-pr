@@ -184,3 +184,16 @@ test("reopened from a lower member, the sheet shows the running whole-stack job 
   expect(text).toContain("runs in background");
   expect(text).not.toContain("merge up to here ·");
 });
+
+test("right after a stack merge starts, before its job has a plan, the sheet keeps the plan and never says nothing can be merged", async () => {
+  const repo = { owner: "maple", name: "maple-gtm" };
+  const { store } = await mount([A, B], { n: 2463 });
+  // the runner writes the job at once but adds its plan only after it has re-read the stack
+  const job: Job = { id: "j2", kind: "stack-merge", repo, pr: 2463, method: "squash", force: true, status: "running", steps: [], total: 0, prs: [2462, 2463], pid: process.pid, startedAt: 1, updatedAt: 1 };
+  (store as unknown as { set: (p: object) => void }).set({ jobs: { [`${repoKey(repo)}#2463`]: job } });
+  const text = await settle();
+  if (process.env.STK_PRINT) console.log(text);
+  expect(text).not.toContain("Nothing can be merged");
+  expect(text).toContain("1. Merge #2462");
+  expect(text).toContain("3. Merge #2463");
+});
