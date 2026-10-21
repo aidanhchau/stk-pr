@@ -284,6 +284,7 @@ function ghRecorder() {
       retarget: async (n: number) => void calls.push(`retarget ${n}`),
       waitChecks: async (n: number) => void calls.push(`wait ${n}`),
       rebaseStack: async (n: number) => void calls.push(`rebase-stack ${n}`),
+      refreshMergeability: async (n: number) => void calls.push(`refresh ${n}`),
     },
   };
 }

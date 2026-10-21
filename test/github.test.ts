@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
+  closeAndReopenPr,
   closePr,
   markReady,
   reopenPr,
@@ -262,6 +263,90 @@ describe("merge-async", () => {
     expect(err.code).toBe("merge-timeout");
     expect(err.data).toEqual({ uuid: "u-1", pr: 5 });
     expect(err.message).toContain("u-1");
+  });
+
+  const POLL = ["gh", "api", "-i", "repos/o/r/pulls/5/merge-async/u-1"];
+  const PULL = ["gh", "api", "-i", "repos/o/r/pulls/5"];
+  const tls = { code: 1, stderr: 'Get "https://api.github.com/repos/o/r/pulls/5/merge-async/u-1": net/http: TLS handshake timeout' };
+
+  test("mergeAsync: a poll that hits a TLS timeout once is retried and the merge is reported", async () => {
+    const polls = [tls, http(200, { status: "merged", details: { sha: "m9" } })];
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, () => polls.shift()!],
+    ]);
+    const sleeps: number[] = [];
+    const out = await mergeAsync(exec, SLUG, 5, { method: "squash", pollMs: 10, sleep: async (ms) => void sleeps.push(ms) });
+    expect(out).toMatchObject({ status: "merged", sha: "m9" });
+    expect(sleeps).toEqual([10, 10]);
+    expect(calls.filter((c) => c.argv.includes("PUT"))).toHaveLength(1);
+    expect(calls.some((c) => c.argv.join(" ") === PULL.join(" "))).toBe(false);
+  });
+
+  test("mergeAsync: a poll that keeps failing falls back to the PR; merged means success with its merge sha", async () => {
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, tls],
+      [PULL, http(200, { state: "closed", merged: true, merge_commit_sha: "abc123" })],
+    ]);
+    const seen: string[] = [];
+    const sleeps: number[] = [];
+    const out = await mergeAsync(exec, SLUG, 5, { method: "squash", pollMs: 10, onProgress: (p) => seen.push(p.phase), sleep: async (ms) => void sleeps.push(ms) });
+    expect(out).toMatchObject({ status: "merged", uuid: "u-1", sha: "abc123" });
+    expect(seen).toEqual(["requested", "merged"]);
+    // bounded: 4 poll attempts with doubling backoff, and the merge request is sent once
+    expect(calls.filter((c) => c.argv.join(" ") === POLL.join(" "))).toHaveLength(4);
+    expect(sleeps).toEqual([10, 10, 20, 40]);
+    expect(calls.filter((c) => c.argv.includes("PUT"))).toHaveLength(1);
+  });
+
+  test("mergeAsync: a poll that keeps failing while the PR is still open is an unknown-outcome error, not a failed merge", async () => {
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, tls],
+      [PULL, http(200, { state: "open", merged: false, merge_commit_sha: null })],
+    ]);
+    const err = await mergeAsync(exec, SLUG, 5, { method: "squash", sleep: async () => {} }).catch((e) => e);
+    expect(err).toBeInstanceOf(StkError);
+    expect(err.code).toBe("gh-failed");
+    expect(err.message).toContain("outcome of the merge of #5 is unknown");
+    expect(err.message).toContain("TLS handshake timeout");
+    expect(err.message).toContain("still open");
+    expect(err.message).not.toContain("failed:");
+    expect(calls.filter((c) => c.argv.includes("PUT"))).toHaveLength(1);
+  });
+
+  test("mergeAsync: a definite 4xx answer to the poll is not retried, but the PR is still re-read", async () => {
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, http(404, { message: "Not Found" })],
+      [PULL, http(200, { state: "closed", merged: true, merge_commit_sha: "zz" })],
+    ]);
+    const out = await mergeAsync(exec, SLUG, 5, { method: "squash", sleep: async () => {} });
+    expect(out).toMatchObject({ status: "merged", sha: "zz" });
+    expect(calls.filter((c) => c.argv.join(" ") === POLL.join(" "))).toHaveLength(1);
+  });
+
+  test("mergeAsync: poll retries stop at the caller's timeoutMs and throw merge-timeout with the uuid", async () => {
+    const { exec } = fake([
+      [PUT, http(202, pending)],
+      [POLL, tls],
+    ]);
+    // a fake clock the injected sleep advances; no real waiting
+    let clock = 1_000_000;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => clock);
+    const sleeps: number[] = [];
+    const outcome = await mergeAsync(exec, SLUG, 5, { method: "squash", pollMs: 20, timeoutMs: 50, sleep: async (ms) => void (sleeps.push(ms), (clock += ms)) }).then(
+      () => null,
+      (e: unknown) => e as StkError,
+    );
+    nowSpy.mockRestore();
+    const err = outcome!;
+    expect(err).toBeInstanceOf(StkError);
+    expect(err.code).toBe("merge-timeout");
+    expect(err.data).toEqual({ uuid: "u-1", pr: 5 });
+    // backoff would be 20, 40, 80 after the first poll delay: each sleep is capped to what is left of the 50ms deadline
+    expect(sleeps).toEqual([20, 20, 10]);
   });
 });
 
@@ -638,3 +723,60 @@ describe("PR state mutations", () => {
     expect(((await rerunFailedChecks(f.exec, "/w", 1).catch((e: unknown) => e)) as StkError).code).toBe("rate-limited");
   });
 });
+
+describe("closeAndReopenPr", () => {
+  const SLUG = { owner: "o", name: "r" };
+  const tls = { code: 1, stderr: 'Patch "https://api.github.com/repos/o/r/pulls/5": net/http: TLS handshake timeout' };
+  /** A PR #5 that is open until a PATCH closes it; `close` answers the close, `reopens` the successive reopen attempts. */
+  const prFake = (close: "ok" | "lost" | "rejected", reopens: ("ok" | "tls")[]) => {
+    let state: "open" | "closed" = "open";
+    const patches: string[] = [];
+    const exec: Exec = async (argv, opts) => {
+      if (argv.includes("PATCH")) {
+        const want = JSON.parse(opts!.stdin!).state as string;
+        patches.push(want);
+        if (want === "closed") {
+          if (close === "rejected") return { ...http(403, { message: "Forbidden" }), stderr: "" };
+          state = "closed";
+          return close === "lost" ? { code: 1, stdout: "", stderr: tls.stderr } : { ...http(200, {}), stderr: "" };
+        }
+        if (reopens.shift() === "tls") return { code: 1, stdout: "", stderr: tls.stderr };
+        state = "open";
+        return { ...http(200, {}), stderr: "" };
+      }
+      return { ...http(200, { state, merged: false }), stderr: "" };
+    };
+    return { exec, patches };
+  };
+  const sleeps: number[] = [];
+  const sleep = async (ms: number) => void sleeps.push(ms);
+
+  test("a close whose response was lost (but applied) is still followed by the reopen", async () => {
+    const { exec, patches } = prFake("lost", ["ok"]);
+    await closeAndReopenPr(exec, SLUG, 5, sleep, 10);
+    expect(patches).toEqual(["closed", "open"]);
+  });
+
+  test("a reopen that fails transiently is retried until it works", async () => {
+    const { exec, patches } = prFake("ok", ["tls", "tls", "ok"]);
+    await closeAndReopenPr(exec, SLUG, 5, sleep, 10);
+    expect(patches).toEqual(["closed", "open", "open", "open"]);
+  });
+
+  test("a reopen that keeps failing ends with a loud message naming the PR as closed and its URL", async () => {
+    const { exec, patches } = prFake("ok", ["tls", "tls", "tls", "tls", "tls"]);
+    const err = await closeAndReopenPr(exec, SLUG, 5, sleep, 10).catch((e) => e);
+    expect(err).toBeInstanceOf(StkError);
+    expect(err.message).toContain("#5 is CLOSED");
+    expect(err.message).toContain("https://github.com/o/r/pull/5");
+    expect(patches).toEqual(["closed", "open", "open", "open", "open"]);
+  });
+
+  test("a close that was rejected (the PR still reads as open) throws that error and never reopens", async () => {
+    const { exec, patches } = prFake("rejected", []);
+    const err = await closeAndReopenPr(exec, SLUG, 5, sleep, 10).catch((e) => e);
+    expect(err.message).toContain("closing #5 failed");
+    expect(patches).toEqual(["closed"]);
+  });
+});
+

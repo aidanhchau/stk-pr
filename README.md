@@ -198,6 +198,8 @@ stk [--repo DIR] [--json] <command>
 
 `--force` merges through GitHub's merge-async API with `bypass_rules: true`. That bypasses failing or pending checks, missing review, and unresolved threads, as far as your repository permissions allow. It never bypasses a merge conflict or a draft PR; those still block. Every merge runs as a detached job (`stk jobs`), so it keeps going after you close the TUI.
 
+While a merge request is pending stk polls its status. A poll that fails for a transient reason (network, TLS, timeout, a 5xx) is retried up to four times with a doubling delay, never past the merge's own 10-minute limit (running into it is a `merge-timeout`). If the status still cannot be read, stk re-reads the PR itself: merged counts as merged (with its merge commit), and a PR that is still open is reported as `the outcome of the merge of #N is unknown` with the poll error, so check GitHub before merging again. The merge request itself is never sent twice.
+
 ## Stack merge
 
 `stk stack <n>` prints the plan. `stk stack <n> --merge` runs it, stopping at the first failing step. The plan merges the stack bottom-up and ends before the first PR that is blocked (or has a conflict or draft, even with `--force`). The bottom PR is merged directly. Before any step runs, every restack is preflighted: origin must still be at the PR head recorded when the plan was made, and the local branch tip must equal it or be an ancestor of it. A stale clean local branch is fast-forwarded; a branch that is ahead or diverged is refused (`diverged`), so a bad branch cannot leave a half-merged stack.
@@ -218,6 +220,8 @@ A GitHub-native stack lands as one merge when nothing needs bypassing. With `--f
 - **With `bypass_rules`**, GitHub does nothing: the next PR stays based on the merged branch, in the stack, and would fail with `cannot be merged because it has a merge conflict`. stk rebases the remaining PRs in a temporary checkout and then re-links them (see below), waits while GitHub recomputes the next PR's mergeability, and plans again.
 
 A conflict check that hasn't finished after about 12 seconds, a rebase conflict, or a PR that is no longer mergeable stops the run with the reason; prerequisites are checked again before each rebase. Merging only part of a stack leaves PRs above the selected target unmerged; use `stk rebase-stack <n>` (or `:rebase-stack`) if their base has merged.
+
+After a re-link GitHub can keep showing the next PR as `CONFLICTING` although its head already contains its base. When a member still shows as conflicting after the usual re-reads, stk compares its head against its base (REST compare). If the head is not behind and the PR is not tracked in a native GitHub stack (a lone PR left after the re-link), no conflict is possible, so stk closes and reopens that PR once (`PATCH pulls/{n}` with `state`) to make GitHub recompute, records a `refresh-mergeability` step in the plan and job log, and continues. The close and reopen are one guarded unit: once a close was attempted (even if its response was lost) the reopen is always attempted, with retries, re-reading the PR first. If it cannot be reopened the run stops with a message naming the PR as closed and its URL. A PR still in a native stack is never closed (it could disturb the stack): the run stops and tells you to close and reopen it yourself. If the head is behind its base, or the flag survives the reopen, the run stops with the reason.
 
 ### Rebasing a native stack
 

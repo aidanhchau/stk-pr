@@ -184,6 +184,13 @@ export function planItems(plan: PlanStep[], trunk: string, method: MergeMethod):
           why: `${lastLanded === null ? "GitHub left it on a merged branch" : `after #${lastLanded} lands; a bypass merge leaves it on the merged branch`}; runs in a temporary checkout`,
         });
         break;
+      case "refresh-mergeability":
+        items.push({
+          steps: [i],
+          text: `Close and reopen #${s.pr} so GitHub recomputes its conflict flag`,
+          why: "GitHub still shows it as conflicting although its head already contains its base (a stale flag)",
+        });
+        break;
       case "merge": {
         const inc = s.includes ?? [s.pr];
         const bypass = s.admin ? bypassWords(s.bypass) : "";

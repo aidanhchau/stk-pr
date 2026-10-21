@@ -311,6 +311,7 @@ describe("executePlan", () => {
       retarget: async (n: number, base: string) => void log.push(`retarget ${n} ${base}`),
       waitChecks: async (n: number) => void log.push(`wait ${n}`),
       rebaseStack: async () => {},
+      refreshMergeability: async () => {},
     };
     const seen: boolean[] = [];
     return { log, seen, deps: { exec: fakeExec, repoDir: "/r", git, gh, onStep: (r: { ok: boolean }) => seen.push(r.ok) } };
@@ -491,6 +492,7 @@ describe("planNativeStackMerge", () => {
       retarget: async () => {},
       waitChecks: async () => {},
       rebaseStack: async () => {},
+      refreshMergeability: async () => {},
     };
     const results = await executePlan(planNativeStackMerge(native(), { method: "squash", force: false }), {
       exec: async () => ({ code: 0, stdout: "", stderr: "" }),
@@ -504,7 +506,7 @@ describe("planNativeStackMerge", () => {
   });
 
   test("executePlan: merged native step names the downstack PRs it landed", async () => {
-    const gh = { merge: async () => ({ status: "merged" as const, sha: "m1" }), retarget: async () => {}, waitChecks: async () => {}, rebaseStack: async () => {} };
+    const gh = { merge: async () => ({ status: "merged" as const, sha: "m1" }), retarget: async () => {}, waitChecks: async () => {}, rebaseStack: async () => {}, refreshMergeability: async () => {} };
     const [r] = await executePlan(planNativeStackMerge(native(), { method: "squash", force: false }), {
       exec: async () => ({ code: 0, stdout: "", stderr: "" }),
       repoDir: "",
@@ -514,7 +516,7 @@ describe("planNativeStackMerge", () => {
   });
 
   test("executePlan: rebase-stack appends the note the rebase returned after `; `", async () => {
-    const gh = { merge: async () => ({ status: "merged" as const }), retarget: async () => {}, waitChecks: async () => {}, rebaseStack: async () => "local checkouts left untouched" };
+    const gh = { merge: async () => ({ status: "merged" as const }), retarget: async () => {}, waitChecks: async () => {}, rebaseStack: async () => "local checkouts left untouched", refreshMergeability: async () => {} };
     const deps = { exec: async () => ({ code: 0, stdout: "", stderr: "" }), repoDir: "", gh };
     const [withNote] = await executePlan([{ kind: "rebase-stack", pr: 2 }], deps);
     expect(withNote).toMatchObject({ ok: true, detail: "rebased the stack from #2 onto the trunk in a temporary checkout and pushed with leases; local checkouts left untouched" });

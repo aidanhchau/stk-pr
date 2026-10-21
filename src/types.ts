@@ -130,7 +130,9 @@ export type PlanStep =
   | { kind: "push"; branch: string; expectedRemoteSha: string; cwd: string }
   | { kind: "wait-checks"; pr: number }
   /** Native stack: rebase the open PRs onto the trunk in a temporary checkout after a lower PR landed; `pr` is the bottom open PR. */
-  | { kind: "rebase-stack"; pr: number };
+  | { kind: "rebase-stack"; pr: number }
+  /** A member still shows as conflicting although its head already contains its base (a stale GitHub flag): close and reopen it so GitHub recomputes. */
+  | { kind: "refresh-mergeability"; pr: number };
 
 export interface StepResult {
   step: PlanStep;

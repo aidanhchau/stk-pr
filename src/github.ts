@@ -755,8 +755,17 @@ function apiError(res: { status: number; body: unknown; text: string }, what: st
   const body = res.body as RawMergeAsync | null;
   // GitHub's JSON body carries the reason (`details.message` for merge-async, `message` for plain API errors); the HTTP code only helps when there is none
   const msg = body?.details?.message ?? body?.message;
-  if (msg) return new StkError(`${what} failed: ${msg}`, "gh-failed");
-  return new StkError(`${what} failed (HTTP ${res.status})${res.text ? `: ${res.text}` : ""}`, "gh-failed");
+  // `http` lets a caller tell a server hiccup (5xx) from a definite answer
+  const data = { http: res.status };
+  if (msg) return new StkError(`${what} failed: ${msg}`, "gh-failed", data);
+  return new StkError(`${what} failed (HTTP ${res.status})${res.text ? `: ${res.text}` : ""}`, "gh-failed", data);
+}
+
+/** A failure worth asking again: no HTTP answer at all (network, TLS, timeout, gh itself failing) or a 5xx. A definite 4xx or a rate limit is not. */
+function isTransient(e: unknown): boolean {
+  if (!(e instanceof StkError) || e.code !== "gh-failed") return false;
+  const http = (e.data as { http?: number } | undefined)?.http;
+  return http === undefined || http >= 500;
 }
 
 /**
@@ -793,10 +802,129 @@ export async function mergeAsyncStatus(exec: Exec, where: Where, number: number,
   return mapMergeAsync(res.body as RawMergeAsync | null, res.text);
 }
 
+/** Poll attempts before giving up on a status answer (each retry waits twice as long as the one before, up to 30s). */
+const POLL_ATTEMPTS = 4;
+
+/** The caller's overall deadline for a retry loop: past it no more retries are made and `expired()` is thrown. */
+interface RetryLimit {
+  deadline: number;
+  expired: () => StkError;
+}
+
+async function retryTransient<T>(call: () => Promise<T>, sleep: (ms: number) => Promise<void>, baseMs: number, limit?: RetryLimit): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await call();
+    } catch (e) {
+      if (attempt >= POLL_ATTEMPTS || !isTransient(e)) throw e;
+      const wait = Math.min(baseMs * 2 ** (attempt - 1), 30_000);
+      const left = limit ? limit.deadline - Date.now() : Infinity;
+      if (left <= 0) throw limit!.expired();
+      await sleep(Math.min(wait, left));
+    }
+  }
+}
+
+/**
+ * Close a PR and reopen it (makes GitHub recompute its mergeability) as one guarded unit. Once a close was attempted,
+ * the reopen is always attempted too, even when the close call itself errored (it may have been applied with the
+ * response lost): each try re-reads the PR first and stops as soon as it is open. A close that provably never applied
+ * rethrows its own error. If the PR cannot be reopened after bounded retries the error names it as closed, with its URL.
+ */
+export async function closeAndReopenPr(exec: Exec, where: Where, number: number, sleep: (ms: number) => Promise<void>, baseMs: number): Promise<void> {
+  const { owner, name } = await slugOf(exec, where);
+  let closeError: unknown = null;
+  try {
+    await setPrState(exec, where, number, "closed");
+  } catch (e) {
+    closeError = e;
+  }
+  let last: unknown = closeError;
+  for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt++) {
+    try {
+      const now = await pullOutcome(exec, where, number);
+      if (now.state === "open") {
+        if (closeError) throw closeError;
+        return;
+      }
+      if (now.state === "merged") throw new StkError(`#${number} was merged while stk was refreshing its mergeability; nothing to reopen`, "gh-failed");
+      await setPrState(exec, where, number, "open");
+      return;
+    } catch (e) {
+      // the close never applied (the PR reads as open): that error is the answer; a merged PR cannot be reopened either
+      if (e === closeError || (e instanceof StkError && !isTransient(e) && e.message.includes("was merged while"))) throw e;
+      last = e;
+      if (attempt < POLL_ATTEMPTS) await sleep(Math.min(baseMs * 2 ** (attempt - 1), 30_000));
+    }
+  }
+  const cause = last instanceof Error ? last.message : String(last);
+  throw new StkError(
+    `#${number} is CLOSED: stk closed it to make GitHub recompute its mergeability and could not reopen it (${cause}); reopen it now: https://github.com/${owner}/${name}/pull/${number}`,
+    "gh-failed",
+    { pr: number },
+  );
+}
+
+/** A PR's REST outcome: still open, closed unmerged, or merged (`mergeCommit` is the merge commit). */
+export interface PullOutcome {
+  state: "open" | "closed" | "merged";
+  mergeCommit: string | null;
+}
+
+export async function pullOutcome(exec: Exec, where: Where, number: number): Promise<PullOutcome> {
+  const { owner, name } = await slugOf(exec, where);
+  const res = await ghApiRaw(exec, where, [`repos/${owner}/${name}/pulls/${number}`]);
+  if (res.status !== 200) throw apiError(res, `reading #${number}`);
+  const b = res.body as { state?: string; merged?: boolean; merged_at?: string | null; merge_commit_sha?: string | null } | null;
+  const merged = b?.merged === true || !!b?.merged_at;
+  return { state: merged ? "merged" : b?.state === "closed" ? "closed" : "open", mergeCommit: b?.merge_commit_sha ?? null };
+}
+
+/**
+ * The status poll of a merge request that was already sent could not be answered. The merge may well have landed (a
+ * dropped poll says nothing about it), so ask GitHub about the PR itself before reporting anything: merged is a
+ * success; anything else is an error that says the outcome is unknown. The request is never re-sent.
+ */
+async function settleAfterPollError(
+  exec: Exec,
+  where: Where,
+  number: number,
+  uuid: string,
+  cause: unknown,
+  sleep: (ms: number) => Promise<void>,
+  baseMs: number,
+  limit: RetryLimit,
+): Promise<MergeAsyncState> {
+  const why = cause instanceof Error ? cause.message : String(cause);
+  let outcome: PullOutcome;
+  try {
+    outcome = await retryTransient(() => pullOutcome(exec, where, number), sleep, baseMs, limit);
+  } catch (e) {
+    if (e instanceof StkError && e.code === "merge-timeout") throw e;
+    const again = e instanceof Error ? e.message : String(e);
+    throw new StkError(
+      `the outcome of the merge of #${number} is unknown: its status could not be read (${why}) and neither could the PR (${again}); check GitHub before merging again`,
+      "gh-failed",
+      { uuid, pr: number },
+    );
+  }
+  if (outcome.state === "merged") {
+    return { status: "merged", uuid, message: "confirmed by re-reading the PR after the merge status poll failed", ...(outcome.mergeCommit ? { sha: outcome.mergeCommit } : {}) };
+  }
+  const now = outcome.state === "open" ? "still open" : "closed without being merged";
+  throw new StkError(
+    `the outcome of the merge of #${number} is unknown: its status could not be read (${why}) and the PR is ${now}; check GitHub before merging again`,
+    "gh-failed",
+    { uuid, pr: number },
+  );
+}
+
 /**
  * Merges via merge-async and resolves only on a final state: `merged`, or `enqueued` (merge queue; not
  * merged yet). `failed` throws gh-failed; running past the timeout throws merge-timeout carrying the uuid.
- * Never passes --delete-branch: stacked children depend on the branch until retargeted.
+ * A status poll that errors is retried with backoff when the error looks transient; if it still cannot be answered
+ * the PR itself is re-read: merged counts as merged, still open throws an unknown-outcome gh-failed (the merge
+ * request is never re-sent). Never passes --delete-branch: stacked children depend on the branch until retargeted.
  */
 export async function mergeAsync(
   exec: Exec,
@@ -814,17 +942,18 @@ export async function mergeAsync(
   emit("requested", state);
   const uuid = state.uuid;
   const started = Date.now();
+  const deadline = started + timeoutMs;
+  const expired = () => new StkError(`merge of #${number} still pending after ${Math.round(timeoutMs / 1000)}s (request ${uuid})`, "merge-timeout", { uuid, pr: number });
   while (state.status === "pending") {
     if (!uuid) throw new StkError(`merge of #${number} is pending but GitHub returned no request id`, "gh-failed");
-    if (Date.now() - started >= timeoutMs) {
-      throw new StkError(
-        `merge of #${number} still pending after ${Math.round(timeoutMs / 1000)}s (request ${uuid})`,
-        "merge-timeout",
-        { uuid, pr: number },
-      );
-    }
+    if (Date.now() >= deadline) throw expired();
     await sleep(pollMs);
-    state = await mergeAsyncStatus(exec, where, number, uuid);
+    try {
+      state = await retryTransient(() => mergeAsyncStatus(exec, where, number, uuid), sleep, pollMs, { deadline, expired });
+    } catch (e) {
+      if (e instanceof StkError && e.code === "merge-timeout") throw e;
+      state = await settleAfterPollError(exec, where, number, uuid, e, sleep, pollMs, { deadline, expired });
+    }
     if (state.status === "pending") emit("pending", { ...state, uuid: state.uuid ?? uuid });
   }
   const final = { ...state, uuid: state.uuid ?? uuid };
@@ -1017,6 +1146,13 @@ export async function unstackPrStack(exec: Exec, where: Where, stack: number): P
   if (res.status === 409) throw new StkError(`GitHub is modifying stack ${stack}; try again in a moment${msg ? `: ${msg}` : ""}`, "gh-failed");
   if (res.status === 422) throw new StkError(`GitHub cannot unstack stack ${stack}${msg ? `: ${msg}` : ""}`, "gh-failed");
   throw apiError(res, `unstacking stack ${stack}`);
+}
+
+/** Close or reopen a PR (REST `PATCH pulls/{n}` with `state`); closing and reopening makes GitHub recompute a stale mergeability. */
+export async function setPrState(exec: Exec, where: Where, number: number, state: "open" | "closed"): Promise<void> {
+  const { owner, name } = await slugOf(exec, where);
+  const res = await ghApiRaw(exec, where, ["-X", "PATCH", `repos/${owner}/${name}/pulls/${number}`, "--input", "-"], JSON.stringify({ state }));
+  if (res.status !== 200) throw apiError(res, `${state === "open" ? "reopening" : "closing"} #${number}`);
 }
 
 /** Point a PR at another base branch (REST `PATCH pulls/{n}`). GitHub answers 422 while the PR is still in a stack. */
