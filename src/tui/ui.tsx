@@ -1,7 +1,7 @@
 /** Shared primitives for every screen (design v2 §4-§8). Colours come from the Palette; screens never hardcode hex. */
 import { MacOSScrollAccel, RGBA, type InputRenderable, type KeyEvent, type MouseEvent, type ScrollBoxRenderable } from "@opentui/core";
-import { useKeyboard } from "@opentui/react";
-import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ComponentType, type ReactNode, type Ref, type RefObject } from "react";
+import { useKeyboard, useRenderer } from "@opentui/react";
+import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ComponentType, type ReactNode, type Ref, type RefObject } from "react";
 import { useStore, useStoreInstance, type Toast } from "./store";
 import { GLIDE_FRAME_MS, GLIDE_MIN, anchorRestore, clampTop, glideSteps, scrolloffTarget } from "./scrollmath";
 import { G, SPACE, clip, lerpHex, reducedMotion, useLayout, useTermSize, useTheme, type Palette } from "./theme";
@@ -59,30 +59,38 @@ const WHEEL_ACCEL = new MacOSScrollAccel();
 /**
  * Scroll area inside a Page. Extends 2 cols into the gutter on both sides so the selection
  * fill of `Row` can bleed; content is still at the page's content column. Rows go directly inside.
- * `onMouseDrag` sees every drag over the content (events bubble up to it), whichever row is under the pointer.
+ * The mouse never moves the view except the wheel: dragging to select text must not scroll, so ScrollBox's drag auto-scroll is switched off.
  */
 export function Scroll({
   children,
   scrollRef,
   onWheel,
-  onMouseDrag,
 }: {
   children: ReactNode;
   scrollRef?: Ref<ScrollBoxRenderable>;
   onWheel?: (dir: "up" | "down") => void;
-  onMouseDrag?: (e: MouseEvent) => void;
 }) {
   const p = useTheme();
+  const ref = useCallback(
+    (sb: ScrollBoxRenderable | null) => {
+      // ScrollBox scrolls itself while a drag ends within 3 rows of its edge (up to 72 lines/s), and @opentui/core 0.6.x has no option to
+      // turn that off. `updateAutoScroll` is its only way in (`startAutoScroll` is reached only from it), so a no-op on the instance
+      // disables it. Revisit when @opentui/core is upgraded.
+      if (sb) sb.updateAutoScroll = () => {};
+      if (typeof scrollRef === "function") scrollRef(sb);
+      else if (scrollRef) (scrollRef as { current: ScrollBoxRenderable | null }).current = sb;
+    },
+    [scrollRef],
+  );
   return (
     <scrollbox
-      ref={scrollRef}
+      ref={ref}
       scrollY
       // Never focusable: a focused scrollbox also scrolls itself on j/k/h/l/up/down/pageup/pagedown (by 1/5 viewport, no animation)
       // on top of our own cursor-follow, so after any click every j moved the cursor AND jerked the viewport.
       focusable={false}
       scrollAcceleration={WHEEL_ACCEL}
       onMouseScroll={onWheel ? (e: { scroll?: { direction?: string } }) => onWheel(e.scroll?.direction === "up" ? "up" : "down") : undefined}
-      onMouseDrag={onMouseDrag}
       flexGrow={1}
       flexShrink={1}
       flexBasis={0}
@@ -350,6 +358,36 @@ export function SignBand({ title, right, sub, children }: { title: ReactNode; ri
 
 export type PillVariant = "neutral" | "primary" | "secondary" | "danger-quiet";
 
+/** The tap in progress: one at a time, since there is one pointer. */
+let tapping: { x: number; y: number; dragged: boolean; owner: object } | null = null;
+const cancelTap = (e: MouseEvent) => {
+  if (tapping && (Math.abs(tapping.x - e.x) > 1 || tapping.y !== e.y)) tapping.dragged = true;
+};
+
+/**
+ * Mouse handlers for a button or link. It fires on release, and only for a click: the pointer is released within one cell of the press
+ * and no drag went further than that (a drag is a text selection; one cell of jitter is allowed). A tap never moves the cursor or scrolls. OpenTUI sends a drag only to
+ * the element under the pointer, so a drag that leaves the button and comes back never reaches it; drags bubble to the root, which cancels
+ * the tap once one is more than a cell from the press (set at press), whichever element it passes over, and the cancel sticks.
+ */
+export function useTap(onTap?: () => void) {
+  const renderer = useRenderer();
+  const me = useRef({});
+  return {
+    onMouseDown: (e: MouseEvent) => {
+      tapping = { x: e.x, y: e.y, dragged: false, owner: me.current };
+      renderer.root.onMouseDrag = cancelTap;
+    },
+    onMouseUp: (e: MouseEvent) => {
+      const d = tapping;
+      if (!d || d.owner !== me.current) return;
+      tapping = null;
+      if (d.dragged || Math.abs(d.x - e.x) > 1 || d.y !== e.y) return;
+      onTap?.();
+    },
+  };
+}
+
 /**
  * 1-row pill (one space of fill each side). primary = ink bg (the one safe action), secondary/neutral = wash,
  * danger-quiet = wash with error-coloured label (never a red fill). `hint` is the key shown after the label.
@@ -368,11 +406,12 @@ export function Pill({
   onPress?: () => void;
 }) {
   const p = useTheme();
+  const tap = useTap(disabled ? undefined : onPress);
   const bg = variant === "primary" && !disabled ? p.ink : p.wash;
   const fg = disabled ? p.faint : variant === "primary" ? p.ground : variant === "danger-quiet" ? p.error : variant === "neutral" ? p.muted : p.ink;
   const hintFg = disabled ? p.faint : variant === "primary" ? lerpHex(p.ground, p.ink, 0.3) : p.muted;
   return (
-    <box flexDirection="row" flexShrink={0} onMouseDown={disabled ? undefined : onPress}>
+    <box flexDirection="row" flexShrink={0} {...tap}>
       <text fg={fg} bg={bg}>
         {" "}
         <strong>{label}</strong>
@@ -390,19 +429,23 @@ export function Kbd({ k, label }: { k: string; label?: string }) {
 
 /** Segmented tabs: no track; inactive tabs are muted text, the selected tab is a solid ink pill with ground-coloured bold text. */
 export function Segmented<K extends string>({ items, value, onChange }: { items: { key: K; label: string }[]; value: K; onChange: (k: K) => void }) {
-  const p = useTheme();
   return (
     <box flexDirection="row" alignSelf="flex-start" flexShrink={0}>
-      {items.map((it, i) => {
-        const on = it.key === value;
-        return (
-          <box key={it.key} flexDirection="row" marginLeft={i === 0 ? 0 : 1} onMouseDown={() => onChange(it.key)}>
-            <text fg={on ? p.ground : p.muted} bg={on ? p.ink : p.ground} wrapMode="none">
-              {on ? <strong>{` ${it.label} `}</strong> : ` ${it.label} `}
-            </text>
-          </box>
-        );
-      })}
+      {items.map((it, i) => (
+        <SegmentedTab key={it.key} first={i === 0} on={it.key === value} label={it.label} onPress={() => onChange(it.key)} />
+      ))}
+    </box>
+  );
+}
+
+function SegmentedTab({ first, on, label, onPress }: { first: boolean; on: boolean; label: string; onPress: () => void }) {
+  const p = useTheme();
+  const tap = useTap(onPress);
+  return (
+    <box flexDirection="row" marginLeft={first ? 0 : 1} {...tap}>
+      <text fg={on ? p.ground : p.muted} bg={on ? p.ink : p.ground} wrapMode="none">
+        {on ? <strong>{` ${label} `}</strong> : ` ${label} `}
+      </text>
     </box>
   );
 }
@@ -470,9 +513,6 @@ export interface RowProps {
   right?: ReactNode;
   /** Draw the hairline row after this row. */
   hairline?: boolean;
-  /** Click on a non-selected row selects it; click on the selected row opens it. */
-  onSelect?: () => void;
-  onOpen?: () => void;
 }
 
 /**
@@ -480,7 +520,7 @@ export interface RowProps {
  * into the gutter (needs to be inside `<Scroll>`). Hover = wash. Descendant `<Txt tone="muted">` automatically
  * switches to mutedOnSel while selected.
  */
-export function Row({ selected, depth = 0, glyph, title, titleTone, truncate, titleRight, meta, right, hairline, onSelect, onOpen }: RowProps) {
+export function Row({ selected, depth = 0, glyph, title, titleTone, truncate, titleRight, meta, right, hairline }: RowProps) {
   const p = useTheme();
   const [hover, setHover] = useState(false);
   const bg = selected ? p.sel : hover ? p.wash : p.ground;
@@ -496,7 +536,6 @@ export function Row({ selected, depth = 0, glyph, title, titleTone, truncate, ti
           marginRight={-SPACE.bleed}
           paddingLeft={SPACE.bleed}
           paddingRight={SPACE.bleed}
-          onMouseDown={() => (selected ? onOpen?.() : onSelect?.())}
           onMouseOver={() => setHover(true)}
           onMouseOut={() => setHover(false)}
         >

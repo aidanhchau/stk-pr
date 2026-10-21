@@ -330,7 +330,7 @@ export function PaletteSheet() {
       );
     }
     return (
-      <box key={row.kind === "pr" ? itemKey(row.r.item) : row.kind === "cmd" ? `cmd:${row.c.def.id}` : row.kind === "base" ? `base:${row.b.name}` : row.kind === "repo" ? `repo:${row.r.slug ?? "*"}` : row.kind === "session" ? `session:${row.r.id}` : row.kind} height={1} flexShrink={0} backgroundColor={bg} paddingLeft={1} paddingRight={1} marginLeft={-1} marginRight={-1} onMouseDown={() => (selected ? activate(i) : setCursor(i))}>
+      <box key={row.kind === "pr" ? itemKey(row.r.item) : row.kind === "cmd" ? `cmd:${row.c.def.id}` : row.kind === "base" ? `base:${row.b.name}` : row.kind === "repo" ? `repo:${row.r.slug ?? "*"}` : row.kind === "session" ? `session:${row.r.id}` : row.kind} height={1} flexShrink={0} backgroundColor={bg} paddingLeft={1} paddingRight={1} marginLeft={-1} marginRight={-1}>
         {body}
       </box>
     );

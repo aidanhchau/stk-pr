@@ -6,8 +6,8 @@
  * a/x/C review, m/M merge, t method, S stack, w worktree. Keys (diff open): j/k/gg/G/ctrl-* scroll, ]c [c hunks, ]f [f files,
  * s split, za/zo/zc fold, Esc/h close.
  */
-import type { DiffRenderable, MouseEvent as TuiMouseEvent, ScrollBoxRenderable } from "@opentui/core";
-import { useKeyboard, useRenderer } from "@opentui/react";
+import type { DiffRenderable, ScrollBoxRenderable } from "@opentui/core";
+import { useKeyboard } from "@opentui/react";
 import { Fragment, createContext, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { ReviewThread } from "../github";
 import type { PrDetail } from "../service";
@@ -26,7 +26,7 @@ import { commandFacts, openStateSheet, runCommand } from "./commands";
 import { stateActions } from "../commands";
 import { CommitCheckRow, CommitRow, commitColumns, useCommitHistory, type HistoryItem } from "./pr-history";
 import { G, SPACE, clip, lerpHex, personColor, useLayout, useTheme, type Palette } from "./theme";
-import { Clipped, ErrorState, Loading, Pill, Rule, Scroll, StatusGlyph, Txt, toneColor, useScreenKeys, useScrollFollow, useVimNav, useVimSearch, type Chrome, type Tone } from "./ui";
+import { Clipped, ErrorState, Loading, Pill, Rule, Scroll, StatusGlyph, Txt, toneColor, useScreenKeys, useScrollFollow, useTap, useVimNav, useVimSearch, type Chrome, type Tone } from "./ui";
 
 /** True while the PR page owns Esc / h (an open diff or reply input); app.tsx must not navigate back then. */
 let captures = false;
@@ -305,74 +305,22 @@ function T({ tone = "ink", bold, sel, children }: { tone?: Tone; bold?: boolean;
 }
 
 /**
- * The press in progress on the PR page. A text-selection drag sends drag events only to the row under the pointer (and no `out`
- * events), so the pressed item can't see a drag that leaves it; `trackPress` runs on the scroll area, where every drag bubbles.
- */
-let press: { x: number; y: number; dragged: boolean; owner: object; armed: boolean } | null = null;
-const trackPress = (e: TuiMouseEvent) => {
-  if (press && (Math.abs(press.x - e.x) > 1 || press.y !== e.y)) press.dragged = true;
-};
-
-/**
- * Mouse handlers for a cursor item. Pressing moves the cursor there; a click on the item already under the cursor opens it at once.
- * A click is a press and release with the pointer never more than one cell from the press (a stray one-cell selection is cleared):
- * moving further marks the press as a drag even if it comes back (`trackPress`), so a drag never opens anything. `body` also rejects
- * a release that leaves text selected (the second press of a double click, which selects a word), so a header's quick second click
- * still opens. `stop` keeps a header row's handling from reaching its block.
- */
-function useClick(selected: boolean, onSelect?: () => void, onOpen?: () => void, opts: { body?: boolean; stop?: boolean } = {}) {
-  const renderer = useRenderer();
-  /** Identity of this item's handlers: a release counts only for the item that took the press. */
-  const me = useRef({});
-  return {
-    onMouseDown: (e: TuiMouseEvent) => {
-      if (opts.stop) e.stopPropagation();
-      press = { x: e.x, y: e.y, dragged: false, owner: me.current, armed: selected };
-      if (!selected) onSelect?.();
-    },
-    onMouseUp: (e: TuiMouseEvent) => {
-      if (opts.stop) e.stopPropagation();
-      const d = press;
-      if (!d || d.owner !== me.current) return;
-      press = null;
-      if (!d.armed || d.dragged || !onOpen || Math.abs(d.x - e.x) > 1 || d.y !== e.y) return;
-      // More text selected than the cells crossed (a one-cell slip selects both ends) is a word/line selection, not a click.
-      const sel = renderer.getSelection();
-      if (opts.body && (sel?.getSelectedText() ?? "").length > Math.abs(d.x - e.x) + 1) return;
-      if (sel) renderer.clearSelection();
-      onOpen();
-    },
-  };
-}
-
-/**
  * Selectable block: selection = `sel` fill over all its lines, bleeding into the gutter (lives inside <Scroll>). `mark` draws an accent bar in the left bleed.
- * Clicks: see `useClick`; `current` (the item is under the cursor, default `selected`) arms them when the fill is drawn elsewhere (a header-only highlight).
+ * Pure display: the mouse never selects, opens or scrolls here (the cursor moves by key only), so dragging over a block just selects text.
  * Single-line rows take the board's hover wash; multi-line blocks (comment bodies) stay plain so the page doesn't flash while the pointer crosses it.
  */
 function Sel({
   selected,
-  current = selected,
   h,
-  onSelect,
-  onOpen,
-  body,
-  stop,
   mark,
   children,
 }: {
   selected: boolean;
-  current?: boolean;
   h: number;
-  onSelect?: () => void;
-  onOpen?: () => void;
-  body?: boolean;
-  stop?: boolean;
   mark?: boolean;
   children: ReactNode;
 }) {
   const p = useTheme();
-  const click = useClick(current, onSelect, onOpen, { body, stop });
   const [hover, setHover] = useState(false);
   const hoverable = h === 1;
   return (
@@ -385,7 +333,6 @@ function Sel({
       marginRight={-SPACE.bleed}
       paddingLeft={SPACE.bleed}
       paddingRight={SPACE.bleed}
-      {...click}
       onMouseOver={hoverable ? () => setHover(true) : undefined}
       onMouseOut={hoverable ? () => setHover(false) : undefined}
     >
@@ -431,12 +378,13 @@ function Label({ label, meta }: { label: string; meta?: ReactNode }) {
   );
 }
 
-/** Clickable header text: plain until hovered, then cobalt + underline. Opens the PR in the browser. */
+/** Clickable header text: plain until hovered, then cobalt + underline. A click (not a drag) opens the PR in the browser. */
 function PrLink({ label, muted, onPress }: { label: string; muted?: boolean; onPress: () => void }) {
   const p = useTheme();
   const [hover, setHover] = useState(false);
+  const tap = useTap(onPress);
   return (
-    <box flexShrink={0} height={1} onMouseDown={onPress} onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)}>
+    <box flexShrink={0} height={1} {...tap} onMouseOver={() => setHover(true)} onMouseOut={() => setHover(false)}>
       <text fg={hover ? p.cobalt : muted ? p.muted : p.ink} wrapMode="none">
         {hover ? <u>{label}</u> : label}
       </text>
@@ -580,19 +528,16 @@ interface Reply {
 }
 
 /**
- * One drawn image. Sent at the pixel size it is drawn at (`imageVariant`; the base image until that is ready). A click opens it large and
- * stops there: the comment's own click (select, then fold) is not also triggered. Hidden while a sheet is open, so no placement lingers over it.
+ * One drawn image. Sent at the pixel size it is drawn at (`imageVariant`; the base image until that is ready). A click (not a drag) opens it
+ * large; it moves no cursor. Hidden while a sheet is open, so no placement lingers over it.
  */
 function ImageView({ src, alt, cols, rows }: { src: string; alt: string; cols: number; rows: number }) {
   const store = useStoreInstance();
   const covered = useStore((s) => s.sheet !== null);
   const img = useImageSource(src, cols, rows, !covered);
+  const tap = useTap(() => store.openSheet({ kind: "image", src, alt }));
   if (!img || covered) return null;
-  const open = (e: TuiMouseEvent) => {
-    e.stopPropagation();
-    store.openSheet({ kind: "image", src, alt });
-  };
-  return <image source={img.source} fit="fill" protocol="auto" width={cols} height={rows} flexShrink={0} onMouseDown={open} onMouseUp={(e) => e.stopPropagation()} />;
+  return <image source={img.source} fit="fill" protocol="auto" width={cols} height={rows} flexShrink={0} {...tap} />;
 }
 
 /** Drawn image(s): each in its own `slot`-wide column under its caption (if any), each opening its own sheet. */
@@ -636,8 +581,6 @@ function RowsView({
   accent,
   reply,
   onInput,
-  onSelect,
-  onOpen,
 }: {
   rows: RL[];
   selected: boolean;
@@ -646,16 +589,13 @@ function RowsView({
   accent?: string;
   reply?: Reply | null;
   onInput?: (v: string) => void;
-  onSelect: () => void;
-  onOpen?: () => void;
 }) {
   const p = useTheme();
   const bodySel = selected && !headOnly;
   const rail = accent ? lerpHex(accent, p.ground, 0.4) : p.faint;
   const covered = useStore((s) => s.sheet !== null);
-  const headClick = useClick(selected, onSelect, onOpen, { stop: true });
   return (
-    <Sel selected={bodySel} current={selected} h={rowsHeight(rows)} onSelect={onSelect} onOpen={onOpen} body>
+    <Sel selected={bodySel} h={rowsHeight(rows)}>
       {rows.map((r, i) => {
         switch (r.t) {
           case "head": {
@@ -666,11 +606,11 @@ function RowsView({
               />
             );
             return headOnly ? (
-              <Sel key={i} selected={selected} h={1} onSelect={onSelect} onOpen={onOpen} stop>
+              <Sel key={i} selected={selected} h={1}>
                 {split}
               </Sel>
             ) : (
-              <box key={i} height={1} flexShrink={0} {...headClick}>
+              <box key={i} height={1} flexShrink={0}>
                 {split}
               </box>
             );
@@ -700,7 +640,7 @@ function RowsView({
             );
           case "input":
             return (
-              <box key={i} height={1} flexShrink={0} paddingLeft={2} onMouseDown={(e) => e.stopPropagation()} onMouseUp={(e) => e.stopPropagation()}>
+              <box key={i} height={1} flexShrink={0} paddingLeft={2}>
                 <input
                   focused={!covered}
                   value={reply?.value ?? ""}
@@ -1054,11 +994,10 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     const collapsed = descLevel < 2;
     const lineCount = hasDesc ? layoutBlocks(parseComment(pr.body).blocks, bodyW, { details: false }).length : 0;
     const selected = hlKey === "desc";
-    const select = () => setCurId("desc");
     push(
       "ds",
       1,
-      <Sel selected={selected} h={1} onSelect={select} onOpen={openCur}>
+      <Sel selected={selected} h={1}>
         <Label label="Description" meta={hasDesc && collapsed ? plural(lineCount, "line") : undefined} />
       </Sel>,
     );
@@ -1066,7 +1005,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     if (!hasDesc) push("ds-none", 1, <T tone="muted">No description</T>);
     else {
       const rows = bodyRows(pr.body, descLevel, bodyW, DESC_CAP, undefined, false, images);
-      push("desc", rowsHeight(rows), <RowsView rows={rows} selected={selected} headOnly onSelect={select} onOpen={openCur} />, { item: "desc", lead: 2 });
+      push("desc", rowsHeight(rows), <RowsView rows={rows} selected={selected} headOnly />, { item: "desc", lead: 2 });
     }
     gap("ds-end", 2);
   }
@@ -1102,7 +1041,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         id,
         1,
-        <Sel selected={selected} h={1} onSelect={() => setCurId(id)} onOpen={openCur} mark={here}>
+        <Sel selected={selected} h={1} mark={here}>
           <Split
             left={
               <box flexDirection="row" height={1}>
@@ -1159,7 +1098,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         `bl${i}`,
         1,
-        <Sel selected={hlKey === "bl-draft"} h={1} onSelect={() => setCurId("bl-draft")} onOpen={openCur}>
+        <Sel selected={hlKey === "bl-draft"} h={1}>
           {row(hlKey === "bl-draft")}
         </Sel>,
         { item: "bl-draft", lead: 2 },
@@ -1190,8 +1129,6 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
           accent={who ? personColor(p, who, pr.author) : undefined}
           reply={replying ? reply : null}
           onInput={item.kind === "thread" ? (v) => setReply({ id: item.th.id, value: v }) : undefined}
-          onSelect={() => setCurId(id)}
-          onOpen={openCur}
         />,
         { item: id, lead: i === 0 ? 2 : 0 },
       );
@@ -1202,7 +1139,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   // Historical results are deliberately separate from the current head's required checks.
   push(
     "commits", 1,
-    <Sel selected={hlKey === "commits"} h={1} onSelect={() => setCurId("commits")} onOpen={openCur}>
+    <Sel selected={hlKey === "commits"} h={1}>
       <Label label={`${history.open ? G.open : G.closed} Commits`} meta={history.resource?.data ? `${history.commits.length} ${G.sep} historical checks${history.resource.refreshing ? ` ${G.sep} refreshing` : ""}` : "history · load on open"} />
     </Sel>,
     { item: "commits" },
@@ -1217,14 +1154,14 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       if (item.kind === "commits") continue;
       if (item.kind === "commit-retry") {
         push(item.id, 2,
-          <Sel selected={selected} h={2} onSelect={() => setCurId(item.id)} onOpen={openCur}>
+          <Sel selected={selected} h={2}>
             <T tone="error">{`Couldn’t load history: ${history.resource?.error ?? "unknown error"}`}</T>
             <T sel={selected}>Retry commit history · Enter</T>
           </Sel>, { item: item.id });
         continue;
       }
       push(item.id, 1,
-        <Sel selected={selected} h={1} onSelect={() => setCurId(item.id)} onOpen={openCur}>
+        <Sel selected={selected} h={1}>
           {item.kind === "commit"
             ? <CommitRow commit={item.commit} open={history.isOpen(item.commit.sha)} selected={selected} age={age(item.commit.committedAt)} cols={cols} />
             : <CommitCheckRow check={item.check} selected={selected} />}
@@ -1249,7 +1186,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         id,
         1,
-        <Sel selected={selected} h={1} onSelect={() => setCurId(id)} onOpen={openCur}>
+        <Sel selected={selected} h={1}>
           <Split
             left={
               <box flexDirection="row" height={1}>
@@ -1273,7 +1210,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         "passing",
         1,
-        <Sel selected={sel} h={1} onSelect={() => setCurId("passing")} onOpen={openCur}>
+        <Sel selected={sel} h={1}>
           <box flexDirection="row" height={1}>
             <CheckGlyph state={skipped.length ? "skipped" : "pass"} />
             <text>{"  "}</text>
@@ -1296,7 +1233,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     push(
       "fl",
       1,
-      <Sel selected={fsel} h={1} onSelect={() => setCurId("files")} onOpen={openCur}>
+      <Sel selected={fsel} h={1}>
         <Label label={`${filesOpen ? G.open : G.closed} Files`} meta={<>{`${files.length} ${G.sep} `}<span fg={p.ok}>{`+${num(add)}`}</span>{" "}<span fg={p.error}>{`${MINUS}${num(del)}`}</span></>} />
       </Sel>,
       { item: "files", lead: 2 },
@@ -1318,7 +1255,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         id,
         1,
-        <Sel selected={selected} h={1} onSelect={() => setCurId(id)} onOpen={openCur}>
+        <Sel selected={selected} h={1}>
           <Split
             left={
               <T sel={selected} bold={active}>
@@ -1698,7 +1635,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       <box height={1} flexShrink={0} />
       <box flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} flexDirection="column">
         <QueryCtx.Provider value={search.query}>
-          <Scroll scrollRef={scrollRef} onWheel={follow.onWheel} onMouseDrag={trackPress}>
+          <Scroll scrollRef={scrollRef} onWheel={follow.onWheel}>
             {blocks.map((b) => (
               <Fragment key={b.key}>{b.node}</Fragment>
             ))}

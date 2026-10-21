@@ -160,22 +160,21 @@ test("keyboard search filters a large board to a distant PR and Enter opens its 
   expect(store.getState().boardCursor).toBe(keyOf(target));
 });
 
-test("clicking a nonselected row selects it, and a second click opens that row rather than the old selection", async () => {
+test("clicking a row neither selects nor opens it", async () => {
   const { s, store, frame, prs } = await renderBoard();
   const target = prs[4]!;
   let f = await frame();
   const y = rowOf(f, target.title);
   expect(y).toBeGreaterThanOrEqual(0);
+  const cursor = store.getState().boardCursor;
 
   await s.mockMouse.click(8, y);
+  await s.mockMouse.click(8, y);
+  await s.mockMouse.drag(8, y, 30, y + 3);
   f = await frame();
   expect(store.getState().screen.kind).toBe("board");
-  expect(store.getState().boardCursor).toBe(keyOf(target));
-  expect(rowOf(f, target.title)).toBeGreaterThanOrEqual(0);
-
-  await s.mockMouse.click(8, rowOf(f, target.title));
-  await frame();
-  expect(store.getState().screen).toMatchObject({ kind: "pr", n: target.number, repo: target.repo, scope: "mine" });
+  expect(store.getState().boardCursor).toBe(cursor);
+  expect(rowOf(f, target.title)).toBe(y);
 });
 
 test("refresh updates a selected row's title, readiness and blocker without moving selection", async () => {
