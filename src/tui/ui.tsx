@@ -360,15 +360,15 @@ export type PillVariant = "neutral" | "primary" | "secondary" | "danger-quiet";
 
 /** The tap in progress: one at a time, since there is one pointer. */
 let tapping: { x: number; y: number; dragged: boolean; owner: object } | null = null;
-const cancelTap = () => {
-  if (tapping) tapping.dragged = true;
+const cancelTap = (e: MouseEvent) => {
+  if (tapping && (Math.abs(tapping.x - e.x) > 1 || tapping.y !== e.y)) tapping.dragged = true;
 };
 
 /**
  * Mouse handlers for a button or link. It fires on release, and only for a click: the pointer is released within one cell of the press
- * and no drag happened in between (a drag is a text selection). A tap never moves the cursor or scrolls. OpenTUI sends a drag only to
+ * and no drag went further than that (a drag is a text selection; one cell of jitter is allowed). A tap never moves the cursor or scrolls. OpenTUI sends a drag only to
  * the element under the pointer, so a drag that leaves the button and comes back never reaches it; drags bubble to the root, which cancels
- * the tap (set at press), whichever element they pass over.
+ * the tap once one is more than a cell from the press (set at press), whichever element it passes over, and the cancel sticks.
  */
 export function useTap(onTap?: () => void) {
   const renderer = useRenderer();

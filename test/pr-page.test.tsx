@@ -198,6 +198,18 @@ test("dragging to the edge of the page while selecting does not scroll it or mov
   expect(rowOf(f, "first bot note")).toBeGreaterThanOrEqual(0);
 });
 
+test("one cell of jitter during a Pill press still counts as a click", async () => {
+  const { s, frame, store } = await renderPr();
+  const f = await frame();
+  const y = rowOf(f, "Comment C");
+  const x = f[y]!.indexOf("Comment C") + 2;
+  await s.mockMouse.pressDown(x, y);
+  await s.mockMouse.emitMouseEvent("drag", x + 1, y);
+  await s.mockMouse.release(x + 1, y);
+  await frame();
+  expect(store.getState().sheet).toMatchObject({ kind: "review", event: "COMMENT" });
+});
+
 test("a drag that leaves a Pill and comes back to release on it does not fire it", async () => {
   const { s, frame, store } = await renderPr();
   const f = await frame();
