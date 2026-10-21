@@ -148,8 +148,10 @@ describe("blockers", () => {
     expect(blockers(pr(1, "a", TRUNK, { mergeable: "UNKNOWN", mergeState: "BLOCKED" }), TRUNK)).toEqual([{ kind: "checking" }]);
   });
 
-  test("missing approval is a review blocker", () => {
-    expect(blockers(pr(1, "a", TRUNK, { reviewDecision: null }), TRUNK)).toEqual([{ kind: "review", decision: null }]);
+  test("missing required approval is a review blocker; no review policy (null decision) is not", () => {
+    expect(blockers(pr(1, "a", TRUNK, { reviewDecision: "REVIEW_REQUIRED" }), TRUNK)).toEqual([{ kind: "review", decision: "REVIEW_REQUIRED" }]);
+    expect(blockers(pr(1, "a", TRUNK, { reviewDecision: null }), TRUNK)).toEqual([]);
+    expect(blockers(pr(1, "a", TRUNK, { reviewDecision: null, mergeState: "BLOCKED" }), TRUNK)).toEqual([{ kind: "blocked" }]);
   });
 });
 
@@ -404,7 +406,7 @@ describe("executePlan", () => {
   test("force merge detail lists bypassed blockers", async () => {
     const h = harness();
     const p = planStackMerge(
-      { trunk: TRUNK, prs: [pr(1, "a", TRUNK, { reviewDecision: null })] },
+      { trunk: TRUNK, prs: [pr(1, "a", TRUNK, { reviewDecision: "REVIEW_REQUIRED" })] },
       { method: "squash", force: true },
       [],
     );

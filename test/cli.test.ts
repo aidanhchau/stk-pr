@@ -95,7 +95,7 @@ describe("cli", () => {
     expect(a.worktree).toBe("/work/wt-a");
     expect(b.worktree).toBeNull();
     expect(a.unresolvedThreads).toBe(2);
-    expect(a.blockers.map((x: { kind: string }) => x.kind)).toEqual(["checks", "review", "threads"]);
+    expect(a.blockers.map((x: { kind: string }) => x.kind)).toEqual(["checks", "threads"]);
     expect(b.blockers.map((x: { kind: string }) => x.kind)).toContain("conflict");
     expect(has("gh", "pr", "list", "--json")).toBe(true);
   });
@@ -150,7 +150,7 @@ describe("cli", () => {
     const j = envelope(r.out);
     expect(j.ok).toBe(false);
     expect(j.error.code).toBe("blocked");
-    expect(j.error.data.blockers.map((b: { kind: string }) => b.kind)).toEqual(["checks", "review", "threads"]);
+    expect(j.error.data.blockers.map((b: { kind: string }) => b.kind)).toEqual(["checks", "threads"]);
     expect(has("gh", "api", "-i", "-X", "PUT")).toBe(false);
   });
 
@@ -162,7 +162,7 @@ describe("cli", () => {
     const j = envelope(r.out);
     expect(j.data.admin).toBe(true);
     expect(j.data.method).toBe("squash");
-    expect(j.data.bypassed.map((b: { kind: string }) => b.kind)).toEqual(["checks", "review", "threads"]);
+    expect(j.data.bypassed.map((b: { kind: string }) => b.kind)).toEqual(["checks", "threads"]);
     const put = calls.find((c) => c.includes("PUT"))!;
     expect(put).toContain("repos/o/r/pulls/10/merge-async");
     expect(JSON.parse(stdins.at(-1)!)).toMatchObject({ merge_method: "squash", bypass_rules: true });
@@ -186,7 +186,7 @@ describe("cli", () => {
     const d = envelope(r.out).data;
     expect(d.wouldMerge).toBe(true);
     expect(d.admin).toBe(true);
-    expect(d.bypass.map((b: { kind: string }) => b.kind)).toEqual(["checks", "review", "threads"]);
+    expect(d.bypass.map((b: { kind: string }) => b.kind)).toEqual(["checks", "threads"]);
     expect(has("gh", "api", "-i", "-X", "PUT")).toBe(false);
 
     const blocked = envelope((await run("--json", "merge", "10", "--dry-run")).out).data;
