@@ -1,6 +1,6 @@
 /** Shared primitives for every screen (design v2 §4-§8). Colours come from the Palette; screens never hardcode hex. */
 import { MacOSScrollAccel, RGBA, type InputRenderable, type KeyEvent, type MouseEvent, type ScrollBoxRenderable } from "@opentui/core";
-import { useKeyboard } from "@opentui/react";
+import { useKeyboard, useRenderer } from "@opentui/react";
 import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ComponentType, type ReactNode, type Ref, type RefObject } from "react";
 import { useStore, useStoreInstance, type Toast } from "./store";
 import { GLIDE_FRAME_MS, GLIDE_MIN, anchorRestore, clampTop, glideSteps, scrolloffTarget } from "./scrollmath";
@@ -358,25 +358,31 @@ export function SignBand({ title, right, sub, children }: { title: ReactNode; ri
 
 export type PillVariant = "neutral" | "primary" | "secondary" | "danger-quiet";
 
+/** The tap in progress: one at a time, since there is one pointer. */
+let tapping: { x: number; y: number; dragged: boolean; owner: object } | null = null;
+const cancelTap = () => {
+  if (tapping) tapping.dragged = true;
+};
+
 /**
  * Mouse handlers for a button or link. It fires on release, and only for a click: the pointer is released within one cell of the press
- * and never dragged further (a drag is a text selection). A tap never moves the cursor or scrolls. `onMouseDrag` runs on the pressed
- * element, so a drag that leaves it and comes back still cancels the tap.
+ * and no drag happened in between (a drag is a text selection). A tap never moves the cursor or scrolls. OpenTUI sends a drag only to
+ * the element under the pointer, so a drag that leaves the button and comes back never reaches it; drags bubble to the root, which cancels
+ * the tap (set at press), whichever element they pass over.
  */
 export function useTap(onTap?: () => void) {
-  const down = useRef<{ x: number; y: number; dragged: boolean } | null>(null);
+  const renderer = useRenderer();
+  const me = useRef({});
   return {
     onMouseDown: (e: MouseEvent) => {
-      down.current = { x: e.x, y: e.y, dragged: false };
-    },
-    onMouseDrag: (e: MouseEvent) => {
-      const d = down.current;
-      if (d && (Math.abs(d.x - e.x) > 1 || d.y !== e.y)) d.dragged = true;
+      tapping = { x: e.x, y: e.y, dragged: false, owner: me.current };
+      renderer.root.onMouseDrag = cancelTap;
     },
     onMouseUp: (e: MouseEvent) => {
-      const d = down.current;
-      down.current = null;
-      if (!d || d.dragged || Math.abs(d.x - e.x) > 1 || d.y !== e.y) return;
+      const d = tapping;
+      if (!d || d.owner !== me.current) return;
+      tapping = null;
+      if (d.dragged || Math.abs(d.x - e.x) > 1 || d.y !== e.y) return;
       onTap?.();
     },
   };

@@ -198,6 +198,23 @@ test("dragging to the edge of the page while selecting does not scroll it or mov
   expect(rowOf(f, "first bot note")).toBeGreaterThanOrEqual(0);
 });
 
+test("a drag that leaves a Pill and comes back to release on it does not fire it", async () => {
+  const { s, frame, store } = await renderPr();
+  const f = await frame();
+  const y = rowOf(f, "Comment C");
+  const x = f[y]!.indexOf("Comment C") + 2;
+  await s.mockMouse.pressDown(x, y);
+  await s.mockMouse.emitMouseEvent("drag", 40, y + 4);
+  await s.mockMouse.emitMouseEvent("drag", x, y);
+  await s.mockMouse.release(x, y);
+  await frame();
+  expect(store.getState().sheet).toBeNull();
+  // The next plain click still works.
+  await s.mockMouse.click(x, y);
+  await frame();
+  expect(store.getState().sheet).toMatchObject({ kind: "review", event: "COMMENT" });
+});
+
 test("a click on a Pill button fires on release, and a drag across it does not", async () => {
   const { s, frame, store } = await renderPr();
   let f = await frame();
