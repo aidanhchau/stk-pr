@@ -35,6 +35,8 @@ interface FakeOptions {
   unexpectedDownstack?: boolean;
   /** After the push, #203 shows as conflicting (DIRTY, stale from before its base was recomputed) for this many reads. */
   dirtyReads?: number;
+  /** The member that shows the stale conflict (default #203). */
+  dirtyMember?: number;
   /** Closing and reopening #203 makes GitHub recompute: its stale conflict flag clears. */
   reopenClearsDirty?: boolean;
   /** What the compare API reports for a member's head against its base (default 0: the head contains the base). */
@@ -80,8 +82,8 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
   const member = (n: number) => ({
     number: n, title: `PR ${n}`, url: "", author: { login: "me" }, state: merged.has(n) && !o.staleMerged ? "MERGED" : "OPEN", isDraft: false,
     headRefName: `b${n}`, baseRefName: bases[n], headRefOid: n === B && oldHeadLeft > 0 ? "shaB0" : heads[n],
-    mergeable: n === C && dirtyLeft > 0 ? "CONFLICTING" : n === B && checkingLeft > 0 && o.checkingAs === "mergeable" ? "UNKNOWN" : "MERGEABLE",
-    mergeStateStatus: n === C && dirtyLeft > 0 ? "DIRTY" : n === B && checkingLeft > 0 ? (o.checkingAs === "mergeable" ? "BLOCKED" : "UNKNOWN") : "CLEAN",
+    mergeable: n === (o.dirtyMember ?? C) && dirtyLeft > 0 ? "CONFLICTING" : n === B && checkingLeft > 0 && o.checkingAs === "mergeable" ? "UNKNOWN" : "MERGEABLE",
+    mergeStateStatus: n === (o.dirtyMember ?? C) && dirtyLeft > 0 ? "DIRTY" : n === B && checkingLeft > 0 ? (o.checkingAs === "mergeable" ? "BLOCKED" : "UNKNOWN") : "CLEAN",
     reviewDecision: requires(n) ? "REVIEW_REQUIRED" : "APPROVED", statusCheckRollup: null, createdAt: "", updatedAt: "", reviewThreads: { nodes: [] },
   });
   const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
@@ -311,27 +313,46 @@ describe("stackMerge on a native stack", () => {
     const { ctx, puts, events } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 999 });
     const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, replan: noSleep }).catch((e: Error) => e)) as Error;
     expect(err.message).toContain("stack merge stopped at #203: GitHub still reports #203 as conflicting after the stack was re-linked");
-    expect(err.message).toContain("even after closing and reopening #203");
     expect(puts.map((p) => p.pr)).toEqual([A]);
-    // closed and reopened once, never twice
-    expect(events.filter((e) => e.startsWith("close") || e.startsWith("reopen"))).toEqual(["close 203", "reopen 203"]);
+    expect(events.some((e) => e.startsWith("close") || e.startsWith("reopen"))).toBe(false);
   });
 
-  test("a conflict flag that GitHub never recomputed (the head already contains its base) is cleared by closing and reopening the PR once, then the merge continues", async () => {
+  test("a stale flag on a member GitHub still tracks in a native stack is never closed or reopened: stops, saying so", async () => {
     clearRulesCache();
+    // head contains its base (behind 0), but #203 is in the re-created native stack
     const { ctx, puts, events } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 999, reopenClearsDirty: true });
+    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, replan: noSleep }).catch((e: Error) => e)) as Error;
+    expect(err.message).toContain("stack merge stopped at #203: GitHub still reports #203 as conflicting after the stack was re-linked");
+    expect(err.message).toContain("part of a GitHub stack");
+    expect(puts.map((p) => p.pr)).toEqual([A]);
+    expect(events.some((e) => e.startsWith("close") || e.startsWith("reopen"))).toBe(false);
+  });
+
+  test("a lone re-linked PR whose conflict flag is stale (head contains its base) is closed and reopened once, then the merge continues", async () => {
+    clearRulesCache();
+    const { ctx, puts, events } = fakeGithub({ review: "required", dirtyReads: 999, dirtyMember: B, reopenClearsDirty: true });
     const seen: StepResult[] = [];
     const plans: PlanStep[][] = [];
-    const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, onStep: (s) => seen.push(s), onPlan: (p) => plans.push(p), replan: noSleep });
-    expect(r.merged).toEqual([A, B, C]);
-    expect(puts.map((p) => p.sha)).toEqual(["shaA", "new203"]);
-    expect(events).toEqual(["merge 201", "push", "unstack", "base 202 main", "create 202,203", "close 203", "reopen 203", "merge 203"]);
+    const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, onStep: (s) => seen.push(s), onPlan: (p) => plans.push(p), replan: noSleep });
+    expect(r.merged).toEqual([A, B]);
+    expect(puts.map((p) => p.sha)).toEqual(["shaA", "shaB1"]);
+    expect(events).toEqual(["merge 201", "push", "unstack", "base 202 main", "close 202", "reopen 202", "merge 202"]);
     const refresh = r.results.find((x) => x.step.kind === "refresh-mergeability")!;
-    expect(refresh).toMatchObject({ ok: true, step: { kind: "refresh-mergeability", pr: C } });
-    expect(refresh.detail).toContain("conflict flag on #203 was stale");
-    expect(refresh.detail).toContain("closed and reopened #203");
+    expect(refresh).toMatchObject({ ok: true, step: { kind: "refresh-mergeability", pr: B } });
+    expect(refresh.detail).toContain("conflict flag on #202 was stale");
+    expect(refresh.detail).toContain("closed and reopened #202");
     expect(seen).toContain(refresh);
     expect(plans.some((p) => p.some((s) => s.kind === "refresh-mergeability"))).toBe(true);
+  });
+
+  test("a lone re-linked PR that still conflicts after the reopen stops, having closed and reopened it only once", async () => {
+    clearRulesCache();
+    const { ctx, puts, events } = fakeGithub({ review: "required", dirtyReads: 999, dirtyMember: B });
+    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: B, replan: noSleep }).catch((e: Error) => e)) as Error;
+    expect(err.message).toContain("stack merge stopped at #202: GitHub still reports #202 as conflicting after the stack was re-linked");
+    expect(err.message).toContain("even after closing and reopening #202");
+    expect(puts.map((p) => p.pr)).toEqual([A]);
+    expect(events.filter((e) => e.startsWith("close") || e.startsWith("reopen"))).toEqual(["close 202", "reopen 202"]);
   });
 
   test("a conflicting member whose head is behind its base is a real conflict: stop without closing or reopening anything", async () => {

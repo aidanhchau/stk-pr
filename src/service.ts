@@ -869,6 +869,8 @@ export async function stackMerge(
         const still = `GitHub still reports #${conflicted.number} as conflicting after the stack was re-linked`;
         if (typeof behind === "string") return stopped(`${still}, and checking whether that is stale failed (${behind}); merge again once it clears`, conflicted.number);
         if (behind > 0) return stopped(`${still}, and its head is ${behind} commit${behind === 1 ? "" : "s"} behind ${conflicted.baseRef}, so the conflict looks real; resolve it and merge again`, conflicted.number);
+        // closing a PR GitHub still tracks in a native stack could unlink or disturb the stack: leave it alone and say so
+        if (fresh.stack.native) return stopped(`${still}, and its head already contains ${conflicted.baseRef}, so the flag looks stale; it is part of a GitHub stack, so stk will not close and reopen it: close and reopen #${conflicted.number} yourself to make GitHub recompute, then merge again`, conflicted.number);
         const refresh: PlanStep = { kind: "refresh-mergeability", pr: conflicted.number };
         opts.onPlan?.([...results.map((r) => r.step), refresh, ...fresh.plan]);
         const refreshed = await executePlan([refresh], deps);
