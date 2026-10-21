@@ -149,7 +149,10 @@ export function blockers(pr: PullRequest, trunk: string, rules?: RepoRules | nul
   const failing = pr.checks.filter((c) => c.state === "fail").map((c) => c.name);
   const pending = pr.checks.filter((c) => c.state === "pending").map((c) => c.name);
   if (failing.length || pending.length) out.push({ kind: "checks", failing, pending });
-  if (pr.reviewDecision !== "APPROVED") out.push({ kind: "review", decision: pr.reviewDecision });
+  // GitHub leaves reviewDecision null when the base requires no review, so only an explicit decision blocks
+  if (pr.reviewDecision === "REVIEW_REQUIRED" || pr.reviewDecision === "CHANGES_REQUESTED") {
+    out.push({ kind: "review", decision: pr.reviewDecision });
+  }
   if (pr.unresolvedThreads > 0) out.push({ kind: "threads", count: pr.unresolvedThreads });
   if (pr.isDraft) out.push({ kind: "draft" });
   if (pr.mergeable === "CONFLICTING" || pr.mergeState === "DIRTY") out.push({ kind: "conflict", base: pr.baseRef });
