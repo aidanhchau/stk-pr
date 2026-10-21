@@ -6,7 +6,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, watch, writeFileSync, writeSync, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { merge, openCtx, openCtxForSlug, rebaseStack, stackInfo, stackMerge, type Ctx, type MergeDryRun, type MergeProgress } from "./service";
+import { merge, openCtx, openCtxForSlug, rebaseStack, settleMethod, stackInfo, stackMerge, type Ctx, type MergeDryRun, type MergeProgress } from "./service";
 import { exec } from "./exec";
 import { StkError, type PlanStep, type MergeMethod, type MergeOutcome, type RepoSlug, type StepResult } from "./types";
 import { rateLimitReset } from "./github";
@@ -276,12 +276,13 @@ export const fakeRunner: JobRunner = async (job, update) => {
 
 export const serviceRunner: JobRunner = async (job, update, ctx) => {
   const c = await ctx();
-  const { method, force } = job;
+  const { force } = job;
+  let { method } = job;
   const onProgress = (progress: MergeProgress) => update({ progress });
   if (job.kind === "merge") {
     update({ prs: [job.pr] });
     const r = await merge(c, job.pr, { method, force, onProgress });
-    update({ outcome: r.status, merged: r.status === "merged" ? [job.pr] : [] });
+    update({ method: r.method, ...(r.note ? { note: r.note } : {}), outcome: r.status, merged: r.status === "merged" ? [job.pr] : [] });
     return;
   }
   if (job.kind === "rebase-stack") {
@@ -290,7 +291,14 @@ export const serviceRunner: JobRunner = async (job, update, ctx) => {
     update({ prs: r.prs, ...(note ? { note } : {}) });
     return;
   }
-  const info = await stackInfo(c, job.pr, { method, force, upTo: job.pr });
+  let info = await stackInfo(c, job.pr, { method, force, upTo: job.pr });
+  // a remembered method the trunk rejects is swapped before the plan is shown or anything merges
+  const settled = await settleMethod(c, method, info.stack.trunk, false);
+  if (settled.method !== method) {
+    method = settled.method;
+    info = await stackInfo(c, job.pr, { method, force, upTo: job.pr });
+    update({ method, ...(settled.note ? { note: settled.note } : {}) });
+  }
   const planned = info.plan.flatMap((s) => (s.kind === "merge" ? (s.includes ?? [s.pr]) : []));
   // an empty plan records the PR that blocks it (the bottom one) so the outcome can name it
   update({ plan: info.plan, total: info.plan.length, prs: planned.length ? planned : info.stack.prs.slice(0, 1).map((p) => p.number) });

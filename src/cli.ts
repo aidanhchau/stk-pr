@@ -14,7 +14,6 @@ import {
   rebaseStack,
   resolve,
   review,
-  resolveMergeMethod,
   stackInfo,
   stackMerge,
   type BoardPr,
@@ -188,11 +187,13 @@ async function cmdResolve(ctx: Ctx, args: string[]): Promise<Result> {
 
 async function cmdMerge(ctx: Ctx, o: Opts, args: string[]): Promise<Result> {
   const n = parseNumber(args[0], "merge");
-  const method = await resolveMergeMethod(ctx, parseMethod(o.method));
+  const given = parseMethod(o.method);
+  const method = given ?? "squash";
+  const explicitMethod = given !== undefined;
   const force = !!o.force;
 
   if (o["dry-run"]) {
-    const d = await merge(ctx, n, { method, force, dryRun: true });
+    const d = await merge(ctx, n, { method, explicitMethod, force, dryRun: true });
     const unbypassable = d.blockers.filter((b) => b.kind === "conflict" || b.kind === "draft");
     return {
       data: d,
@@ -201,19 +202,21 @@ async function cmdMerge(ctx: Ctx, o: Opts, args: string[]): Promise<Result> {
         : `would NOT merge #${n}: ${describeBlockers(force ? unbypassable : d.blockers)}`,
     };
   }
-  const d = await merge(ctx, n, { method, force });
+  const d = await merge(ctx, n, { method, explicitMethod, force });
   const verb = d.status === "enqueued" ? "queued" : force ? "force-merged" : "merged";
-  const text = `${verb} #${n} (${method}${force ? ", bypass rules" : ""})${force && d.bypassed.length ? `, bypassed: ${describeBlockers(d.bypassed)}` : ""}`;
+  const text = `${verb} #${n} (${d.method}${force ? ", bypass rules" : ""})${force && d.bypassed.length ? `, bypassed: ${describeBlockers(d.bypassed)}` : ""}`;
   return { data: d, text: d.note ? `${text}\n${d.note}` : text };
 }
 
 async function cmdStack(ctx: Ctx, o: Opts, args: string[], deps: CliDeps, json: boolean): Promise<Result> {
   const n = parseNumber(args[0], "stack");
-  const method = await resolveMergeMethod(ctx, parseMethod(o.method));
+  const given = parseMethod(o.method);
+  const method = given ?? "squash";
+  const explicitMethod = given !== undefined;
   const force = !!o.force;
 
   if (!o.merge) {
-    const d = await stackInfo(ctx, n, { method, force });
+    const d = await stackInfo(ctx, n, { method, explicitMethod, force });
     const { stack, forks, plan } = d;
     const lines = [`stack onto ${stack.trunk}: ${stack.prs.map((p) => `#${p.number}`).join(" <- ")}`];
     for (const f of forks) lines.push(`fork: #${f.parent} has children ${f.children.map((c) => `#${c}`).join(", ")}`);
@@ -224,17 +227,17 @@ async function cmdStack(ctx: Ctx, o: Opts, args: string[], deps: CliDeps, json: 
 
   const r = await stackMerge(ctx, n, {
     method,
+    explicitMethod,
     force,
     onStep: (s) => {
       if (!json) deps.stdout(`${s.ok ? "ok  " : "FAIL"} ${s.detail}\n`);
     },
   });
   const count = `merged ${r.merged.length}/${r.total.length}`;
+  const text = r.remaining.length ? `${count}; stopped before ${r.remaining.map((p) => `#${p}`).join(", ")} (blocked)` : count;
   return {
     data: { results: r.results },
-    text: r.remaining.length
-      ? `${count}; stopped before ${r.remaining.map((p) => `#${p}`).join(", ")} (blocked)`
-      : count,
+    text: r.note ? `${text}\n${r.note}` : text,
   };
 }
 

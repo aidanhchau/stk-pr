@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { main } from "../src/cli";
 import { branchRules, repoMergeMethods } from "../src/github";
 import { effectiveMethod, fallbackNote, nextMethod } from "../src/methods";
-import { allowedMethodsFor, clearRulesCache } from "../src/service";
+import { allowedMethodsFor, clearRulesCache, merge, slugCtx, stackMerge } from "../src/service";
 import { planStackMerge } from "../src/stack";
 import { Store, mergeMethodNote, mergeMethodOf } from "../src/tui/store";
-import type { Exec, MergeMethod, PullRequest, Stack } from "../src/types";
+import type { Exec, MergeMethod, PlanStep, PullRequest, Stack } from "../src/types";
 
 const SLUG = { owner: "o", name: "r" };
 const ok = (body: unknown) => ({ code: 0, stdout: `HTTP/2.0 200 OK\r\n\r\n${JSON.stringify(body)}`, stderr: "" });
@@ -126,46 +125,104 @@ describe("Store with a restricted trunk", () => {
   });
 });
 
-describe("CLI --method pre-flight", () => {
-  function cli(rules: unknown[] | null) {
-    const calls: string[][] = [];
-    const gh = github({ rules });
-    const exec: Exec = async (argv, opts) => {
-      calls.push([...argv]);
-      if (argv[0] === "git" && argv[1] === "rev-parse") return { code: 0, stdout: "/work/repo\n", stderr: "" };
-      if (argv[0] === "git" && argv[1] === "worktree") return { code: 0, stdout: "worktree /work/repo\nHEAD 111\nbranch refs/heads/dev", stderr: "" };
-      if (argv.slice(0, 4).join(" ") === "gh repo view --json") {
-        return { code: 0, stdout: argv[4] === "defaultBranchRef" ? '{"defaultBranchRef":{"name":"dev"}}' : '{"owner":{"login":"o"},"name":"r"}', stderr: "" };
-      }
-      return gh.exec(argv, opts);
-    };
-    const out: string[] = [];
-    const run = async (...args: string[]) => ({
-      code: await main(["--repo", "/work/repo", "--json", ...args], { exec, stdout: (s) => void out.push(s), stderr: (s) => void out.push(s) }),
-      out: out.join(""),
-    });
-    return { run, calls };
-  }
+/** Fake GitHub for merging PR #7 (clean, approved) into `base`, with per-branch rulesets; records merge-async bodies. */
+function mergeWorld(o: { base: string; rules: Record<string, unknown[]> }) {
+  const calls: string[][] = [];
+  const puts: { method: string; url: string }[] = [];
+  const exec: Exec = async (argv, opts) => {
+    calls.push([...argv]);
+    const url = argv.at(-1)!;
+    if (argv.includes("defaultBranchRef")) return { code: 0, stdout: '{"defaultBranchRef":{"name":"main"}}', stderr: "" };
+    if (argv[1] === "pr" && argv[2] === "view") {
+      const pr = {
+        number: 7, title: "t", url: "u", author: { login: "a" }, state: "OPEN", isDraft: false, headRefName: "h", baseRefName: o.base, headRefOid: "sha7",
+        mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED", statusCheckRollup: [], createdAt: "", updatedAt: "",
+      };
+      return { code: 0, stdout: JSON.stringify(pr), stderr: "" };
+    }
+    if (argv.some((a) => a.startsWith("query="))) return { code: 0, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }), stderr: "" };
+    if (argv.includes("PUT")) {
+      puts.push({ method: JSON.parse(opts?.stdin ?? "{}").merge_method, url });
+      return { code: 0, stdout: `HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ status: "merged", details: { sha: "m1" } })}`, stderr: "" };
+    }
+    if (url === "repos/o/r") return ok({ allow_squash_merge: true, allow_merge_commit: true, allow_rebase_merge: true });
+    const branch = /^repos\/o\/r\/rules\/branches\/(.+)$/.exec(url)?.[1];
+    if (branch) return ok(o.rules[branch] ?? []);
+    return { code: 1, stdout: "", stderr: `unexpected: ${argv.join(" ")}` };
+  };
+  return { ctx: slugCtx(exec, SLUG), calls, puts };
+}
 
-  for (const cmd of [["merge", "7"], ["stack", "7", "--merge"]]) {
-    test(`${cmd[0]} --method merge is rejected before any PR is read or merged, listing the allowed methods`, async () => {
-      const { run, calls } = cli(SQUASH_REBASE_RULE);
-      const r = await run(...cmd, "--method", "merge");
-      expect(r.code).toBe(1);
-      expect(r.out).toContain("merge method 'merge' is not allowed on dev; allowed: squash, rebase");
-      expect(calls.some((c) => c.includes("PUT") || (c[1] === "pr" && c[2] === "view") || c.includes("graphql"))).toBe(false);
-    });
-  }
-
-  test("an allowed --method passes the pre-flight", async () => {
-    const { run } = cli(SQUASH_REBASE_RULE);
-    const r = await run("merge", "7", "--method", "rebase");
-    expect(r.out).not.toContain("is not allowed");
+describe("the method is settled when the merge runs", () => {
+  test("a remembered method the base rejects is swapped just before the PUT, and the result says so", async () => {
+    const { ctx, puts } = mergeWorld({ base: "main", rules: { main: SQUASH_REBASE_RULE } });
+    const r = await merge(ctx, 7, { method: "merge", force: false });
+    expect(puts.map((p) => p.method)).toEqual(["squash"]);
+    expect(r.method).toBe("squash");
+    expect(r.note).toBe("merge commits not allowed on main; merged with squash instead");
   });
 
-  test("when the allowed set cannot be read the method is not second-guessed", async () => {
-    const { run } = cli(null);
-    const r = await run("merge", "7", "--method", "merge");
-    expect(r.out).not.toContain("is not allowed");
+  test("an explicit method the base rejects fails before anything is sent, listing the allowed ones", async () => {
+    const { ctx, puts } = mergeWorld({ base: "main", rules: { main: SQUASH_REBASE_RULE } });
+    await expect(merge(ctx, 7, { method: "merge", explicitMethod: true, force: false })).rejects.toThrow("merge method 'merge' is not allowed on main; allowed: squash, rebase");
+    expect(puts).toEqual([]);
+  });
+
+  test("an unreadable allowed set leaves the method alone", async () => {
+    const { ctx, puts } = mergeWorld({ base: "main", rules: {} });
+    const failing: Exec = async (argv, opts) => (/^repos\/o\/r(\/rules\/.*)?$/.test(argv.at(-1)!) ? fail : ctx.exec(argv, opts));
+    await merge({ ...ctx, exec: failing }, 7, { method: "merge", force: false });
+    expect(puts.map((p) => p.method)).toEqual(["merge"]);
+  });
+
+  test("the rules are read for the PR's own base, not the default branch", async () => {
+    const { ctx, calls, puts } = mergeWorld({ base: "release", rules: { main: [], release: [{ type: "pull_request", parameters: { allowed_merge_methods: ["rebase"] } }] } });
+    await expect(merge(ctx, 7, { method: "squash", explicitMethod: true, force: false })).rejects.toThrow("merge method 'squash' is not allowed on release; allowed: rebase");
+    expect(calls.some((c) => c.at(-1) === "repos/o/r/rules/branches/release")).toBe(true);
+    expect(puts).toEqual([]);
+  });
+});
+
+describe("a stack settles its method against the stack trunk", () => {
+  /** Two-PR native stack on `main`, both clean and approved; main's ruleset allows squash and rebase. */
+  function stackWorld() {
+    const puts: string[] = [];
+    const member = (n: number, base: string) => ({
+      number: n, title: `PR ${n}`, url: "u", author: { login: "me" }, state: "OPEN", isDraft: false, headRefName: `b${n}`, baseRefName: base, headRefOid: `sha${n}`,
+      mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", reviewDecision: "APPROVED",
+      statusCheckRollup: { contexts: { nodes: [] } }, createdAt: "", updatedAt: "", reviewThreads: { nodes: [] },
+    });
+    const exec: Exec = async (argv, opts) => {
+      const query = argv.find((x) => x.startsWith("query=")) ?? "";
+      if (query.includes("stackEntry")) {
+        const nodes = [member(101, "main"), member(102, "b101")].map((pullRequest, i) => ({ position: i + 1, pullRequest }));
+        const repository = { defaultBranchRef: { name: "main" }, pullRequest: { stackEntry: { position: 2 }, stack: { size: 2, entries: { nodes } } } };
+        return { code: 0, stdout: JSON.stringify({ data: { repository } }), stderr: "" };
+      }
+      if (argv.includes("PUT")) {
+        puts.push(JSON.parse(opts?.stdin ?? "{}").merge_method);
+        return { code: 0, stdout: `HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ status: "merged", details: { sha: "m1" } })}`, stderr: "" };
+      }
+      const url = argv.at(-1)!;
+      if (url === "repos/o/r") return ok({});
+      if (url === "repos/o/r/rules/branches/main") return ok(SQUASH_REBASE_RULE);
+      return { code: 1, stdout: "", stderr: `unexpected: ${argv.join(" ")}` };
+    };
+    return { ctx: slugCtx(exec, SLUG), puts };
+  }
+
+  test("a remembered merge-commit stack plans and merges as squash", async () => {
+    const { ctx, puts } = stackWorld();
+    const plans: PlanStep[][] = [];
+    const r = await stackMerge(ctx, 101, { method: "merge", force: false, upTo: 102, onPlan: (p) => plans.push(p) });
+    expect(puts).toEqual(["squash"]);
+    expect(r.note).toBe("merge commits not allowed on main; merged with squash instead");
+    expect(plans.flat().every((s) => s.kind !== "merge" || s.method === "squash")).toBe(true);
+  });
+
+  test("an explicit method the trunk rejects fails before any merge", async () => {
+    const { ctx, puts } = stackWorld();
+    await expect(stackMerge(ctx, 101, { method: "merge", explicitMethod: true, force: false, upTo: 102 })).rejects.toThrow("allowed: squash, rebase");
+    expect(puts).toEqual([]);
   });
 });
