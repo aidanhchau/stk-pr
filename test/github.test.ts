@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
+  closeAndReopenPr,
   closePr,
   markReady,
   reopenPr,
@@ -324,6 +325,28 @@ describe("merge-async", () => {
     const out = await mergeAsync(exec, SLUG, 5, { method: "squash", sleep: async () => {} });
     expect(out).toMatchObject({ status: "merged", sha: "zz" });
     expect(calls.filter((c) => c.argv.join(" ") === POLL.join(" "))).toHaveLength(1);
+  });
+
+  test("mergeAsync: poll retries stop at the caller's timeoutMs and throw merge-timeout with the uuid", async () => {
+    const { exec } = fake([
+      [PUT, http(202, pending)],
+      [POLL, tls],
+    ]);
+    // a fake clock the injected sleep advances; no real waiting
+    let clock = 1_000_000;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => clock);
+    const sleeps: number[] = [];
+    const outcome = await mergeAsync(exec, SLUG, 5, { method: "squash", pollMs: 20, timeoutMs: 50, sleep: async (ms) => void (sleeps.push(ms), (clock += ms)) }).then(
+      () => null,
+      (e: unknown) => e as StkError,
+    );
+    nowSpy.mockRestore();
+    const err = outcome!;
+    expect(err).toBeInstanceOf(StkError);
+    expect(err.code).toBe("merge-timeout");
+    expect(err.data).toEqual({ uuid: "u-1", pr: 5 });
+    // backoff would be 20, 40, 80 after the first poll delay: each sleep is capped to what is left of the 50ms deadline
+    expect(sleeps).toEqual([20, 20, 10]);
   });
 });
 
@@ -700,3 +723,60 @@ describe("PR state mutations", () => {
     expect(((await rerunFailedChecks(f.exec, "/w", 1).catch((e: unknown) => e)) as StkError).code).toBe("rate-limited");
   });
 });
+
+describe("closeAndReopenPr", () => {
+  const SLUG = { owner: "o", name: "r" };
+  const tls = { code: 1, stderr: 'Patch "https://api.github.com/repos/o/r/pulls/5": net/http: TLS handshake timeout' };
+  /** A PR #5 that is open until a PATCH closes it; `close` answers the close, `reopens` the successive reopen attempts. */
+  const prFake = (close: "ok" | "lost" | "rejected", reopens: ("ok" | "tls")[]) => {
+    let state: "open" | "closed" = "open";
+    const patches: string[] = [];
+    const exec: Exec = async (argv, opts) => {
+      if (argv.includes("PATCH")) {
+        const want = JSON.parse(opts!.stdin!).state as string;
+        patches.push(want);
+        if (want === "closed") {
+          if (close === "rejected") return { ...http(403, { message: "Forbidden" }), stderr: "" };
+          state = "closed";
+          return close === "lost" ? { code: 1, stdout: "", stderr: tls.stderr } : { ...http(200, {}), stderr: "" };
+        }
+        if (reopens.shift() === "tls") return { code: 1, stdout: "", stderr: tls.stderr };
+        state = "open";
+        return { ...http(200, {}), stderr: "" };
+      }
+      return { ...http(200, { state, merged: false }), stderr: "" };
+    };
+    return { exec, patches };
+  };
+  const sleeps: number[] = [];
+  const sleep = async (ms: number) => void sleeps.push(ms);
+
+  test("a close whose response was lost (but applied) is still followed by the reopen", async () => {
+    const { exec, patches } = prFake("lost", ["ok"]);
+    await closeAndReopenPr(exec, SLUG, 5, sleep, 10);
+    expect(patches).toEqual(["closed", "open"]);
+  });
+
+  test("a reopen that fails transiently is retried until it works", async () => {
+    const { exec, patches } = prFake("ok", ["tls", "tls", "ok"]);
+    await closeAndReopenPr(exec, SLUG, 5, sleep, 10);
+    expect(patches).toEqual(["closed", "open", "open", "open"]);
+  });
+
+  test("a reopen that keeps failing ends with a loud message naming the PR as closed and its URL", async () => {
+    const { exec, patches } = prFake("ok", ["tls", "tls", "tls", "tls", "tls"]);
+    const err = await closeAndReopenPr(exec, SLUG, 5, sleep, 10).catch((e) => e);
+    expect(err).toBeInstanceOf(StkError);
+    expect(err.message).toContain("#5 is CLOSED");
+    expect(err.message).toContain("https://github.com/o/r/pull/5");
+    expect(patches).toEqual(["closed", "open", "open", "open", "open"]);
+  });
+
+  test("a close that was rejected (the PR still reads as open) throws that error and never reopens", async () => {
+    const { exec, patches } = prFake("rejected", []);
+    const err = await closeAndReopenPr(exec, SLUG, 5, sleep, 10).catch((e) => e);
+    expect(err.message).toContain("closing #5 failed");
+    expect(patches).toEqual(["closed"]);
+  });
+});
+

@@ -23,7 +23,7 @@ import {
   reopenPr,
   rerunFailedChecks,
   updateBranch,
-  setPrState,
+  closeAndReopenPr,
   behindBy,
   branchRules,
   fetchSessionPrs,
@@ -741,14 +741,7 @@ export async function stackMerge(
         const failing = checks.filter((c) => c.state === "fail").map((c) => c.name);
         if (failing.length) throw new StkError(`checks failed on #${pr}: ${failing.join(", ")}`, "gh-failed");
       },
-      refreshMergeability: async (pr) => {
-        await setPrState(ctx.exec, at(ctx), pr, "closed");
-        try {
-          await setPrState(ctx.exec, at(ctx), pr, "open");
-        } catch (e) {
-          throw new StkError(`closed #${pr} to refresh its mergeability but could not reopen it (${e instanceof Error ? e.message : String(e)}); reopen it by hand`, "gh-failed");
-        }
-      },
+      refreshMergeability: (pr) => closeAndReopenPr(ctx.exec, at(ctx), pr, opts.replan?.sleep ?? ((ms) => Bun.sleep(ms)), opts.replan?.delayMs ?? 2000),
       rebaseStack: async (pr) => {
         const rebased = await rebaseStack(ctx, pr, { knownHeads, ...(opts.replan ? { replan: opts.replan } : {}) });
         for (const n of rebased.prs) {

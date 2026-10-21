@@ -73,6 +73,7 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
   let dirtyLeft = 0;
   let oldHeadLeft = 0;
   let unknownLeft = 0;
+  const closed = new Set<number>();
   let checkedOut = 0;
   const rebase = () => {
     heads[B] = "shaB1";
@@ -150,7 +151,7 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
       if (!api[1]) {
         const state = unknownLeft > 0 ? "unknown" : "clean";
         if (unknownLeft > 0) unknownLeft--;
-        return http(200, { base: { ref: bases[n] }, mergeable_state: state, stack: members.includes(n) ? { number: 4 } : null });
+        return http(200, { state: closed.has(n) ? "closed" : "open", merged: false, base: { ref: bases[n] }, mergeable_state: state, stack: members.includes(n) ? { number: 4 } : null });
       }
       if (api[1] === "POST" && api[2]!.endsWith("/unstack")) {
         rest.push("unstack");
@@ -166,6 +167,8 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
       }
       if (api[1] === "PATCH" && input.state) {
         events.push(`${input.state === "closed" ? "close" : "reopen"} ${n}`);
+        if (input.state === "closed") closed.add(n);
+        else closed.delete(n);
         if (input.state === "open" && o.reopenClearsDirty) dirtyLeft = 0;
         return http(200, {});
       }
