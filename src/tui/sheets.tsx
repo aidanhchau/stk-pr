@@ -1127,7 +1127,7 @@ function StateSheet() {
       {actions.map((a, i) => {
         const c = COMMANDS.find((x) => x.id === a.id)!;
         return (
-          <box key={a.id} flexShrink={0} onMouseDown={() => (at === i ? run(a) : setCursor(i))}>
+          <box key={a.id} flexShrink={0}>
             <Line selected={i === at}>
               <box width={18} flexShrink={0}>
                 <Txt bold>{a.label}</Txt>

@@ -110,11 +110,17 @@ test("zM closes a bot fold even while the cursor is on one of its members, leavi
   let f = await frame();
   const fold = rowOf(f, "2 bot comments");
   expect(f[fold]!.trimStart().startsWith("▸")).toBe(true);
-  await s.mockMouse.click(4, fold);
-  await s.mockMouse.click(4, fold);
+  // The cursor starts on alice's comment: j moves to the fold, Enter opens it, j j reaches the second bot note.
+  s.mockInput.pressKey("j");
+  await frame();
+  s.mockInput.pressEnter();
+  await Bun.sleep(300);
   f = await frame();
-  expect(f[fold]!.trimStart().startsWith("▾")).toBe(true);
-  await s.mockMouse.click(4, rowOf(f, "second bot note"));
+  expect(f[rowOf(f, "2 bot comments")]!.trimStart().startsWith("▾")).toBe(true);
+  s.mockInput.pressKey("j");
+  s.mockInput.pressKey("j");
+  await Bun.sleep(300);
+  await frame();
   await s.mockInput.typeText("zM");
   f = await frame();
   // zM also collapses alice's comment above, so find the fold row again.
@@ -128,10 +134,11 @@ test("zM closes a bot fold even while the cursor is on one of its members, leavi
 
 const capped = (f: string[]) => rowOf(f, "more lines") >= 0;
 
-// With no description or stack, the cursor starts on alice's comment, so clicks on it act at once.
-test("in a comment body, a drag selects text without toggling and a plain click toggles at once", async () => {
+// With no description or stack, the cursor starts on alice's comment. The mouse never moves it, never opens or folds anything, and never scrolls.
+test("in a comment body, a drag selects text and a plain click does nothing", async () => {
   const { s, frame } = await renderPr();
   let f = await frame();
+  const before = f.join("\n");
   const y = rowOf(f, "human hello");
 
   await s.mockMouse.drag(4, y, 30, y + 2);
@@ -140,49 +147,71 @@ test("in a comment body, a drag selects text without toggling and a plain click 
   expect(s.renderer.getSelection()?.getSelectedText()).toContain("line 2 of the review");
 
   await s.mockMouse.click(6, y);
-  f = await frame();
-  expect(capped(f)).toBe(false);
-});
-
-test("a click that slips one cell still toggles the header, and the stray selection is cleared", async () => {
-  const { s, frame } = await renderPr();
-  let f = await frame();
-  const y = rowOf(f, "▾ alice");
-  await s.mockMouse.pressDown(4, y);
-  await s.mockMouse.emitMouseEvent("drag", 5, y);
-  await s.mockMouse.release(5, y);
-  f = await frame();
-  expect(capped(f)).toBe(false);
-  expect(s.renderer.getSelection()?.getSelectedText() ?? "").toBe("");
-});
-
-test("a drag that goes out and comes back to the press point does not toggle", async () => {
-  const { s, frame } = await renderPr();
-  let f = await frame();
-  const y = rowOf(f, "▾ alice");
-  // Along the header row and back.
-  await s.mockMouse.pressDown(4, y);
-  await s.mockMouse.emitMouseEvent("drag", 12, y);
-  await s.mockMouse.emitMouseEvent("drag", 4, y);
-  await s.mockMouse.release(4, y);
+  await s.mockMouse.click(4, rowOf(f, "▾ alice"));
   f = await frame();
   expect(capped(f)).toBe(true);
-  // Down into the body (the header stops getting drag events) and back.
-  await s.mockMouse.pressDown(4, y);
-  await s.mockMouse.emitMouseEvent("drag", 4, y + 3);
-  await s.mockMouse.emitMouseEvent("drag", 4, y);
-  await s.mockMouse.release(4, y);
-  f = await frame();
-  expect(capped(f)).toBe(true);
+  expect(f.join("\n")).toBe(before);
 });
 
-test("the first click on an item only moves the cursor to it", async () => {
+test("mouse presses on another block, a fold or a header never move the cursor", async () => {
   const { s, frame } = await renderPr();
   let f = await frame();
   const fold = rowOf(f, "2 bot comments");
   await s.mockMouse.click(4, fold);
+  await s.mockMouse.click(4, fold);
+  await s.mockMouse.click(6, rowOf(f, "bob one"));
   f = await frame();
+  // The fold stayed closed and the cursor is still on alice's comment: Enter expands it in full.
   expect(f[fold]!.trimStart().startsWith("▸")).toBe(true);
+  s.mockInput.pressEnter();
+  f = await frame();
+  expect(capped(f)).toBe(false);
+});
+
+test("dragging to the edge of the page while selecting does not scroll it or move the cursor", async () => {
+  const { s, frame } = await renderPr(20);
+  await frame();
+  // Move the cursor to the bot fold by key (the view follows it), so alice's comment, the block pressed below, is not under the cursor.
+  s.mockInput.pressKey("j");
+  await Bun.sleep(300);
+  let f = await frame();
+  const before = f.join("\n");
+  const y = rowOf(f, "line 3 of the review");
+  expect(y).toBeGreaterThanOrEqual(0);
+  // Press on a block the cursor is not on, then drag below the page's bottom edge and hold there, where ScrollBox would auto-scroll.
+  await s.mockMouse.pressDown(4, y);
+  for (let i = 0; i < 6; i++) {
+    await s.mockMouse.emitMouseEvent("drag", 40, 18 + (i % 2));
+    await Bun.sleep(60);
+    await s.renderOnce();
+  }
+  await s.mockMouse.emitMouseEvent("drag", 40, 19);
+  await Bun.sleep(300);
+  f = await frame();
+  await s.mockMouse.release(40, 19);
+  f = await frame();
+  expect(f.join("\n")).toBe(before);
+  // The cursor is still on the bot fold: Enter opens it.
+  s.mockInput.pressEnter();
+  await Bun.sleep(300);
+  f = await frame();
+  expect(rowOf(f, "first bot note")).toBeGreaterThanOrEqual(0);
+});
+
+test("a click on a Pill button fires on release, and a drag across it does not", async () => {
+  const { s, frame, store } = await renderPr();
+  let f = await frame();
+  const y = rowOf(f, "Comment C");
+  expect(y).toBeGreaterThanOrEqual(0);
+  const x = f[y]!.indexOf("Comment C") + 2;
+  await s.mockMouse.pressDown(x, y);
+  await s.mockMouse.emitMouseEvent("drag", x + 6, y);
+  await s.mockMouse.release(x + 6, y);
+  await frame();
+  expect(store.getState().sheet).toBeNull();
+  await s.mockMouse.click(x, y);
+  await frame();
+  expect(store.getState().sheet).toMatchObject({ kind: "review", event: "COMMENT" });
 });
 
 test("↑/↓ scroll the page and never change the selection, even off screen; j moves it", async () => {
@@ -468,22 +497,10 @@ test("history errors offer a focusable Enter retry rather than a dead fold", asy
   expect(rowOf(f, "Preserve results before rebase")).toBeGreaterThanOrEqual(0);
 });
 
-test("mouse folds expose commits and check results using the existing select-then-open behavior", async () => {
+test("clicking the commits header or a commit does not expand it", async () => {
   const { s, frame } = await renderPr(40, quietDetail, [historyCommit]);
   let f = await frame();
   const header = rowOf(f, "COMMITS");
-  await s.mockMouse.click(4, header);
-  f = await frame();
-  const commit = rowOf(f, "Preserve results before rebase");
-  expect(commit).toBeGreaterThanOrEqual(0);
-  // First click selects the commit; second opens its results.
-  await s.mockMouse.click(4, commit);
-  f = await frame();
-  expect(rowOf(f, "Depot PR tests / test")).toBe(-1);
-  await s.mockMouse.click(4, commit);
-  f = await frame();
-  expect(rowOf(f, "Depot PR tests / test")).toBeGreaterThanOrEqual(0);
-  // First click selects the parent section; the next closes it.
   await s.mockMouse.click(4, header);
   await s.mockMouse.click(4, header);
   f = await frame();
