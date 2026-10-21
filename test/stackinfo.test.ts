@@ -36,8 +36,8 @@ describe("stackInfo on a native stack", () => {
     clearRulesCache();
     const { exec, calls } = recordingGithub();
     const info = await stackInfo(slugCtx(exec, { owner: "o", name: "r" }), 106, { method: "squash", force: false });
-    // one GraphQL call for the whole stack, plus the cached branch-rules lookup
-    expect(calls.length).toBe(2);
+    // one GraphQL call for the whole stack, plus the cached branch-rules and repo-settings lookups the method is settled with
+    expect(calls.length).toBe(3);
     expect(calls[0]!.slice(0, 3)).toEqual(["gh", "api", "graphql"]);
     expect(info.stack.native).toBe(true);
     expect(info.stack.prs.map((p) => p.number)).toEqual(CHAIN);

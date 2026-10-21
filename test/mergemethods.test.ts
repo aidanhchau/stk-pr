@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { branchRules, repoMergeMethods } from "../src/github";
 import { effectiveMethod, fallbackNote, nextMethod } from "../src/methods";
-import { allowedMethodsFor, clearRulesCache, merge, slugCtx, stackMerge } from "../src/service";
+import { allowedMethodsFor, clearRulesCache, merge, settleMethod, slugCtx, stackInfo, stackMerge } from "../src/service";
 import { planStackMerge } from "../src/stack";
+import { mergeOutcomeText } from "../src/types";
 import { Store, mergeMethodNote, mergeMethodOf } from "../src/tui/store";
 import type { Exec, MergeMethod, PlanStep, PullRequest, Stack } from "../src/types";
 
@@ -88,10 +89,16 @@ describe("effective method", () => {
 
 describe("Store with a restricted trunk", () => {
   const repo = { owner: "Acme", name: "Web" };
+  type Poke = { set(p: object): void; prefetchBudget: number; prefetchWindowAt: number; loadMergeMethods(r: unknown, b: string): Promise<void> };
+  const detail = (baseRef: string) => ({ status: "ready", refreshing: false, at: Date.now(), data: { pr: { baseRef, number: 5 }, stack: null } });
+  const board = (trunk: string) => ({ status: "ready", refreshing: false, data: { repo, trunk, prs: [] } });
   function restricted() {
     const store = new Store("/nonexistent", { gh: repo, prefsFile: null });
     store.setMergeMethod(repo, "merge");
-    (store as unknown as { set(p: object): void }).set({ mergeMethods: { "acme/web": { branch: "dev", allowed: ["squash", "rebase"] } } });
+    (store as unknown as Poke).set({
+      boards: { mine: board("dev") },
+      mergeMethods: { "acme/web@dev": { branch: "dev", allowed: ["squash", "rebase"] } },
+    });
     return store;
   }
 
@@ -108,6 +115,53 @@ describe("Store with a restricted trunk", () => {
     store.cycleMergeMethod();
     expect(mergeMethodOf(store.getState())).toBe("squash");
     expect(mergeMethodNote(store.getState())).toBeNull();
+  });
+
+  test("allowed methods are kept per branch: the open PR's base picks its own entry and one read never overwrites another", () => {
+    const store = restricted();
+    const poke = store as unknown as Poke;
+    poke.set({
+      mergeMethods: { ...store.getState().mergeMethods, "acme/web@release": { branch: "release", allowed: ["squash", "merge", "rebase"] } },
+      screen: { kind: "pr", n: 5, repo, scope: "mine" },
+      prCache: { "Acme/Web#5": detail("release") },
+    });
+    expect(mergeMethodOf(store.getState())).toBe("merge");
+    poke.set({ prCache: { "Acme/Web#5": detail("dev") } });
+    expect(mergeMethodOf(store.getState())).toBe("squash");
+    expect(Object.keys(store.getState().mergeMethods).sort()).toEqual(["acme/web@dev", "acme/web@release"]);
+  });
+
+  test("a board row's base picks the entry too (workspace and session boards)", () => {
+    const store = restricted();
+    const row = { number: 9, baseRef: "release", repo, state: "OPEN" };
+    (store as unknown as Poke).set({
+      boards: { mine: { status: "ready", refreshing: false, data: { prs: [row] } } },
+      mergeMethods: { "acme/web@release": { branch: "release", allowed: ["squash", "merge"] }, "acme/web@dev": { branch: "dev", allowed: ["rebase"] } },
+      boardCursor: "Acme/Web#9",
+    });
+    expect(mergeMethodOf(store.getState())).toBe("merge");
+  });
+
+  test("allowed methods are read for every distinct (repo, base) of a loaded board, and for a PR page served from cache", async () => {
+    const store = new Store("/nonexistent", { gh: repo, prefsFile: null });
+    const poke = store as unknown as Poke;
+    poke.prefetchBudget = 0; // no detail warming here
+    poke.prefetchWindowAt = Date.now();
+    const loads: string[] = [];
+    poke.loadMergeMethods = async (r, b) => void loads.push(`${(r as { owner: string; name: string }).name}@${b}`);
+    const rows = [
+      { number: 1, state: "OPEN", baseRef: "main", updatedAt: "", headRef: "a", repo: { owner: "o", name: "x" } },
+      { number: 2, state: "OPEN", baseRef: "main", updatedAt: "", headRef: "b", repo: { owner: "o", name: "x" } },
+      { number: 3, state: "OPEN", baseRef: "dev", updatedAt: "", headRef: "c", repo: { owner: "o", name: "y" } },
+      { number: 4, state: "MERGED", baseRef: "gone", updatedAt: "", headRef: "d", repo: { owner: "o", name: "y" } },
+    ];
+    (store as unknown as { prefetchBoard(r: null, p: unknown[]): void }).prefetchBoard(null, rows);
+    expect(loads).toEqual(["x@main", "y@dev"]);
+
+    loads.length = 0;
+    poke.set({ prCache: { "Acme/Web#5": detail("release") } });
+    await store.loadPr(5, { repo });
+    expect(loads).toEqual(["Web@release"]);
   });
 
   test("a stack plans with the effective method", () => {
@@ -224,5 +278,57 @@ describe("a stack settles its method against the stack trunk", () => {
     const { ctx, puts } = stackWorld();
     await expect(stackMerge(ctx, 101, { method: "merge", explicitMethod: true, force: false, upTo: 102 })).rejects.toThrow("allowed: squash, rebase");
     expect(puts).toEqual([]);
+  });
+
+  test("the preview (stackInfo) settles the method like --merge does and carries the note", async () => {
+    const { ctx, puts } = stackWorld();
+    const info = await stackInfo(ctx, 101, { method: "merge", force: false, upTo: 102 });
+    expect(info.method).toBe("squash");
+    expect(info.methodNote).toBe("merge commits not allowed on main; merged with squash instead");
+    expect(info.plan.every((s) => s.kind !== "merge" || s.method === "squash")).toBe(true);
+    expect(puts).toEqual([]);
+  });
+
+  test("the preview honours an explicit method: a disallowed one fails, an allowed one is kept", async () => {
+    const { ctx } = stackWorld();
+    await expect(stackInfo(ctx, 101, { method: "merge", explicitMethod: true, force: false, upTo: 102 })).rejects.toThrow("allowed: squash, rebase");
+    const info = await stackInfo(ctx, 101, { method: "rebase", explicitMethod: true, force: false, upTo: 102 });
+    expect(info.method).toBe("rebase");
+    expect(info.methodNote).toBeUndefined();
+  });
+});
+
+describe("settling reports what it did", () => {
+  test("a dry run returns the settled method and the note", async () => {
+    const { ctx, puts } = mergeWorld({ base: "main", rules: { main: SQUASH_REBASE_RULE } });
+    const d = await merge(ctx, 7, { method: "merge", force: false, dryRun: true });
+    expect(d.method).toBe("squash");
+    expect(d.methodNote).toBe("merge commits not allowed on main; merged with squash instead");
+    expect(puts).toEqual([]);
+    const plain = await merge(ctx, 7, { method: "rebase", force: false, dryRun: true });
+    expect(plain.method).toBe("rebase");
+    expect(plain.methodNote).toBeUndefined();
+  });
+
+  test("the outcome text carries the job note", () => {
+    const note = "merge commits not allowed on main; merged with squash instead";
+    expect(mergeOutcomeText({ kind: "merge", pr: 7, outcome: "merged", merged: [7], note })).toBe(`Merged #7 · ${note}`);
+    expect(mergeOutcomeText({ kind: "stack-merge", pr: 7, outcome: "merged", merged: [6, 7], note })).toBe(`Stack merged · #6, #7 · ${note}`);
+    expect(mergeOutcomeText({ kind: "merge", pr: 7, outcome: "merged", merged: [7] })).toBe("Merged #7");
+  });
+});
+
+describe("rate limits while settling", () => {
+  const limited: Exec = async () => ({ code: 1, stdout: `HTTP/2.0 403 Forbidden\r\n\r\n{"message":"API rate limit exceeded"}`, stderr: "" });
+
+  test("a rate limit escapes instead of being read as an unreadable set", async () => {
+    await expect(settleMethod(slugCtx(limited, SLUG), "merge", "main", false)).rejects.toMatchObject({ code: "rate-limited" });
+    clearRulesCache();
+    await expect(settleMethod(slugCtx(limited, SLUG), "merge", "main", true)).rejects.toMatchObject({ code: "rate-limited" });
+  });
+
+  test("any other failure keeps the requested method", async () => {
+    const down: Exec = async () => fail;
+    expect(await settleMethod(slugCtx(down, SLUG), "merge", "main", false)).toEqual({ method: "merge" });
   });
 });

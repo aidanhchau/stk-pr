@@ -142,6 +142,9 @@ export interface ThreadResult {
 }
 export interface MergeDryRun {
   wouldMerge: boolean;
+  /** The method the merge would send: the requested one, or the allowed one that replaces it. */
+  method: MergeMethod;
+  methodNote?: string;
   admin: boolean;
   bypass: Blocker[];
   blockers: Blocker[];
@@ -170,6 +173,10 @@ export interface StackInfo {
   /** Set when a PR at or below `target` is not in the plan: which one, and why, in words. */
   stop: { pr: number; reason: string } | null;
   notes: StackNote[];
+  /** The method the plan was made for: the requested one, or the allowed one that replaced it. */
+  method: MergeMethod;
+  /** Why the requested method was replaced (e.g. "merge commits not allowed on dev; merged with squash instead"). */
+  methodNote?: string;
 }
 
 export interface StackMergeResult {
@@ -304,7 +311,11 @@ export const clearRulesCache = () => {
  * (CLI `--method`) throws instead, listing the allowed methods. An unreadable allowed set changes nothing.
  */
 export async function settleMethod(ctx: Ctx, requested: MergeMethod, branch: string, explicit: boolean): Promise<{ method: MergeMethod; note?: string }> {
-  const allowed = await allowedMethodsFor(ctx.exec, at(ctx), branch).catch(() => null);
+  const allowed = await allowedMethodsFor(ctx.exec, at(ctx), branch).catch((e) => {
+    // a rate limit must surface (the merge would fail on it anyway); any other unreadable set keeps the requested method
+    if (e instanceof StkError && e.code === "rate-limited") throw e;
+    return null;
+  });
   if (explicit) {
     assertMethodAllowed(requested, allowed, branch);
     return { method: requested };
@@ -525,6 +536,8 @@ export async function merge(
   if (opts.dryRun) {
     return {
       wouldMerge: mayMerge,
+      method,
+      ...(settled.note ? { methodNote: settled.note } : {}),
       admin: force && mayMerge,
       bypass: force && mayMerge ? bs : [],
       blockers: bs,
@@ -599,9 +612,25 @@ export interface PlanForResult {
   notes: StackNote[];
   rules: RepoRules | null;
   plan: PlanStep[];
+  /** The method the plan was made for: the requested one, or the allowed one that replaced it. */
+  method: MergeMethod;
+  /** Why the requested method was replaced, when it was. */
+  methodNote?: string;
 }
 
+/**
+ * Reads and plans a stack merge with the method settled against its trunk (the same rule `merge` and `stackMerge`
+ * apply when they run), so a preview shows what `--merge` would do. The plan is made again when the method changes,
+ * since a merge-commit stack plans without restacks.
+ */
 async function planFor(ctx: Ctx, n: number, opts: PlanOpts): Promise<PlanForResult> {
+  const first = await planForMethod(ctx, n, opts);
+  const settled = await settleMethod(ctx, opts.method, first.trunk, opts.explicitMethod === true);
+  if (settled.method === opts.method) return { ...first, method: opts.method };
+  return { ...(await planForMethod(ctx, n, { ...opts, method: settled.method })), method: settled.method, ...(settled.note ? { methodNote: settled.note } : {}) };
+}
+
+async function planForMethod(ctx: Ctx, n: number, opts: PlanOpts): Promise<Omit<PlanForResult, "method" | "methodNote">> {
   // A native stack plans from ONE GraphQL call: members' fields, thread counts and the trunk all come back together.
   let detail: NativeStackDetail | null = null;
   try {
@@ -667,10 +696,10 @@ export async function stackInfo(
   n: number,
   opts: PlanOpts,
 ): Promise<StackInfo> {
-  const { trunk, stack, forks, plan, target, notes, rules } = await planFor(ctx, n, opts);
+  const { trunk, stack, forks, plan, target, notes, rules, method, methodNote } = await planFor(ctx, n, opts);
   const perPr = blockersByPr(stack, trunk, rules);
   // the sheet's own rebase (stale base) is the bottom PR; nothing there needs a checkout
-  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes };
+  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes, method, ...(methodNote ? { methodNote } : {}) };
 }
 
 /** Per-member blockers of a stack: a native stack lands on the trunk, so no member is judged by its own base. */
@@ -771,12 +800,10 @@ export async function stackMerge(
   n: number,
   given: PlanOpts & { onStep?: (r: StepResult) => void; onProgress?: (p: MergeProgress) => void; onPlan?: (plan: PlanStep[]) => void; replan?: ReplanPolicy },
 ): Promise<StackMergeResult> {
-  let first = await planFor(ctx, n, given);
-  // the method is settled against the stack's trunk right before anything merges: a remembered one it rejects is swapped
-  // for an allowed one (and the plan made again, since a merge-commit stack plans differently); an explicit one fails
-  const settled = await settleMethod(ctx, given.method, first.trunk, given.explicitMethod === true);
-  const opts = { ...given, method: settled.method };
-  if (settled.method !== given.method) first = await planFor(ctx, n, opts);
+  // planFor settles the method against the stack's trunk before anything merges: a remembered one it rejects is swapped
+  // for an allowed one (and the plan made for that), an explicit one fails
+  const first = await planFor(ctx, n, given);
+  const opts = { ...given, method: first.method };
   const { stack } = first;
   let expectedHeads: Record<number, string> = {};
   // the PR stk itself re-linked as the last one of the stack (it is in no stack any more); only it may be planned as a plain PR
@@ -960,7 +987,7 @@ export async function stackMerge(
     total,
     merged: total.filter((x) => mergedSet.has(x)),
     remaining: total.filter((x) => !mergedSet.has(x)),
-    ...(settled.note ? { note: settled.note } : {}),
+    ...(first.methodNote ? { note: first.methodNote } : {}),
   };
 }
 

@@ -195,12 +195,10 @@ async function cmdMerge(ctx: Ctx, o: Opts, args: string[]): Promise<Result> {
   if (o["dry-run"]) {
     const d = await merge(ctx, n, { method, explicitMethod, force, dryRun: true });
     const unbypassable = d.blockers.filter((b) => b.kind === "conflict" || b.kind === "draft");
-    return {
-      data: d,
-      text: d.wouldMerge
-        ? `would ${force ? "force-merge" : "merge"} #${n} (${method})${d.bypass.length ? `, bypassing ${describeBlockers(d.bypass)}` : ""}`
-        : `would NOT merge #${n}: ${describeBlockers(force ? unbypassable : d.blockers)}`,
-    };
+    const text = d.wouldMerge
+      ? `would ${force ? "force-merge" : "merge"} #${n} (${d.method})${d.bypass.length ? `, bypassing ${describeBlockers(d.bypass)}` : ""}`
+      : `would NOT merge #${n}: ${describeBlockers(force ? unbypassable : d.blockers)}`;
+    return { data: d, text: d.methodNote ? `${text}\n${d.methodNote}` : text };
   }
   const d = await merge(ctx, n, { method, explicitMethod, force });
   const verb = d.status === "enqueued" ? "queued" : force ? "force-merged" : "merged";
@@ -222,7 +220,8 @@ async function cmdStack(ctx: Ctx, o: Opts, args: string[], deps: CliDeps, json: 
     for (const f of forks) lines.push(`fork: #${f.parent} has children ${f.children.map((c) => `#${c}`).join(", ")}`);
     for (const s of plan) lines.push(`  ${s.kind} ${"pr" in s ? `#${s.pr}` : s.branch}`);
     if (plan.length === 0) lines.push("  (nothing mergeable)");
-    return { data: d, text: lines.join("\n") };
+    const head = d.methodNote ? [`${d.methodNote}`] : [];
+    return { data: d, text: [...lines, ...head].join("\n") };
   }
 
   const r = await stackMerge(ctx, n, {

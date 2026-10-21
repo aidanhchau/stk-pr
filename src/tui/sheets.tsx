@@ -360,7 +360,7 @@ function MergeSheet({ n, force }: { n: number; force: boolean }) {
           <Txt tone="error">{err}</Txt>
         </>
       )}
-      <Footer left={`t ${method}${methodNote ? ` (${methodNote})` : ""}${waitable ? " · w merge when ready" : ""}`}>
+      <Footer left={`t ${dry?.ok ? dry.value.method : method}${methodNote ?? (dry?.ok ? dry.value.methodNote : undefined) ? ` (${methodNote ?? (dry?.ok ? dry.value.methodNote : undefined)})` : ""}${waitable ? " · w merge when ready" : ""}`}>
         {waitable && <Pill label="Merge when ready" hint="w" variant="secondary" onPress={() => void whenReady()} />}
         <Pill
           label={working ? "Starting…" : force ? "Force merge" : "Merge"}
@@ -589,7 +589,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const trunk = ok?.stack.trunk ?? null;
   // once a job exists the sheet shows the job's own plan (the one it computed at start), not the earlier preview
   const viewPlan = phase === "plan" ? withExpectedRebases(plan, ok?.stack.native === true) : (job?.plan ?? results.map((r) => r.step));
-  const items = planItems(viewPlan, trunk ?? "the trunk", method);
+  const items = planItems(viewPlan, trunk ?? "the trunk", ok?.method ?? method);
   const landedPrs = phase === "plan" ? new Set<number>() : mergedPrs(results, job?.merged);
   const can = phase === "plan" && !planning && !!ok && plan.length > 0;
   const tidx = Math.max(0, members.findIndex((m) => m.number === targetNum));
@@ -761,7 +761,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
     // Optimistic first paint (no plan yet): members the store already knows, status filling in once the plan lands.
     if (trunk) text([trunk, ...members.map((m) => `#${m.number}`)].join(` ${G.arrow === "->" ? "<-" : "←"} `), "ink", true);
     if (ok) {
-      const summary = stackSummary({ trunk: ok.stack.trunk, method, plan, stop: ok.stop, above: members.slice(tidx + 1).map((m) => m.number) });
+      const summary = stackSummary({ trunk: ok.stack.trunk, method: ok.method, plan, stop: ok.stop, above: members.slice(tidx + 1).map((m) => m.number) });
       wrapped(summary, planning ? "faint" : "ink");
     }
     push(<Gap />);
@@ -851,7 +851,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const title = phase === "done" ? `Stack #${job?.pr ?? topNum} finished` : `${force || forced ? "Force merge stack" : "Merge stack"} #${topNum}`;
   const keys =
     phase === "plan"
-      ? `↑↓ pick · ⏎ merge up to here · f force · t ${method}${methodNote ? ` (${methodNote})` : ""}${canWait ? " · w when ready" : ""}`
+      ? `↑↓ pick · ⏎ merge up to here · f force · t ${ok?.method ?? method}${methodNote || ok?.methodNote ? ` (${methodNote ?? ok?.methodNote})` : ""}${canWait ? " · w when ready" : ""}`
       : phase === "failed"
         ? "r plan again"
         : "";
