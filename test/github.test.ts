@@ -263,6 +263,68 @@ describe("merge-async", () => {
     expect(err.data).toEqual({ uuid: "u-1", pr: 5 });
     expect(err.message).toContain("u-1");
   });
+
+  const POLL = ["gh", "api", "-i", "repos/o/r/pulls/5/merge-async/u-1"];
+  const PULL = ["gh", "api", "-i", "repos/o/r/pulls/5"];
+  const tls = { code: 1, stderr: 'Get "https://api.github.com/repos/o/r/pulls/5/merge-async/u-1": net/http: TLS handshake timeout' };
+
+  test("mergeAsync: a poll that hits a TLS timeout once is retried and the merge is reported", async () => {
+    const polls = [tls, http(200, { status: "merged", details: { sha: "m9" } })];
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, () => polls.shift()!],
+    ]);
+    const sleeps: number[] = [];
+    const out = await mergeAsync(exec, SLUG, 5, { method: "squash", pollMs: 10, sleep: async (ms) => void sleeps.push(ms) });
+    expect(out).toMatchObject({ status: "merged", sha: "m9" });
+    expect(sleeps).toEqual([10, 10]);
+    expect(calls.filter((c) => c.argv.includes("PUT"))).toHaveLength(1);
+    expect(calls.some((c) => c.argv.join(" ") === PULL.join(" "))).toBe(false);
+  });
+
+  test("mergeAsync: a poll that keeps failing falls back to the PR; merged means success with its merge sha", async () => {
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, tls],
+      [PULL, http(200, { state: "closed", merged: true, merge_commit_sha: "abc123" })],
+    ]);
+    const seen: string[] = [];
+    const sleeps: number[] = [];
+    const out = await mergeAsync(exec, SLUG, 5, { method: "squash", pollMs: 10, onProgress: (p) => seen.push(p.phase), sleep: async (ms) => void sleeps.push(ms) });
+    expect(out).toMatchObject({ status: "merged", uuid: "u-1", sha: "abc123" });
+    expect(seen).toEqual(["requested", "merged"]);
+    // bounded: 4 poll attempts with doubling backoff, and the merge request is sent once
+    expect(calls.filter((c) => c.argv.join(" ") === POLL.join(" "))).toHaveLength(4);
+    expect(sleeps).toEqual([10, 10, 20, 40]);
+    expect(calls.filter((c) => c.argv.includes("PUT"))).toHaveLength(1);
+  });
+
+  test("mergeAsync: a poll that keeps failing while the PR is still open is an unknown-outcome error, not a failed merge", async () => {
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, tls],
+      [PULL, http(200, { state: "open", merged: false, merge_commit_sha: null })],
+    ]);
+    const err = await mergeAsync(exec, SLUG, 5, { method: "squash", sleep: async () => {} }).catch((e) => e);
+    expect(err).toBeInstanceOf(StkError);
+    expect(err.code).toBe("gh-failed");
+    expect(err.message).toContain("outcome of the merge of #5 is unknown");
+    expect(err.message).toContain("TLS handshake timeout");
+    expect(err.message).toContain("still open");
+    expect(err.message).not.toContain("failed:");
+    expect(calls.filter((c) => c.argv.includes("PUT"))).toHaveLength(1);
+  });
+
+  test("mergeAsync: a definite 4xx answer to the poll is not retried, but the PR is still re-read", async () => {
+    const { exec, calls } = fake([
+      [PUT, http(202, pending)],
+      [POLL, http(404, { message: "Not Found" })],
+      [PULL, http(200, { state: "closed", merged: true, merge_commit_sha: "zz" })],
+    ]);
+    const out = await mergeAsync(exec, SLUG, 5, { method: "squash", sleep: async () => {} });
+    expect(out).toMatchObject({ status: "merged", sha: "zz" });
+    expect(calls.filter((c) => c.argv.join(" ") === POLL.join(" "))).toHaveLength(1);
+  });
 });
 
 describe("nativeStack", () => {

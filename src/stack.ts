@@ -315,6 +315,8 @@ export interface GhOps {
   waitChecks(pr: number): Promise<void>;
   /** Native stack: rebase every open PR from `pr` up onto the trunk in a temporary checkout and push with leases. Resolves to a note for the step output (local checkouts left behind), if any. */
   rebaseStack(pr: number): Promise<string | void>;
+  /** Close and reopen `pr` so GitHub recomputes its (stale) mergeability. */
+  refreshMergeability(pr: number): Promise<void>;
 }
 
 export interface ExecuteDeps {
@@ -370,6 +372,9 @@ async function runStep(step: PlanStep, deps: ExecuteDeps, git: GitOps): Promise<
       const note = await gh.rebaseStack(step.pr);
       return { ok: true, detail: `rebased the stack from #${step.pr} onto the trunk in a temporary checkout and pushed with leases${note ? `; ${note}` : ""}` };
     }
+    case "refresh-mergeability":
+      await gh.refreshMergeability(step.pr);
+      return { ok: true, detail: `GitHub's conflict flag on #${step.pr} was stale (its head already contains its base); closed and reopened #${step.pr} to make GitHub recompute it` };
   }
 }
 

@@ -23,6 +23,7 @@ import {
   reopenPr,
   rerunFailedChecks,
   updateBranch,
+  setPrState,
   behindBy,
   branchRules,
   fetchSessionPrs,
@@ -740,6 +741,14 @@ export async function stackMerge(
         const failing = checks.filter((c) => c.state === "fail").map((c) => c.name);
         if (failing.length) throw new StkError(`checks failed on #${pr}: ${failing.join(", ")}`, "gh-failed");
       },
+      refreshMergeability: async (pr) => {
+        await setPrState(ctx.exec, at(ctx), pr, "closed");
+        try {
+          await setPrState(ctx.exec, at(ctx), pr, "open");
+        } catch (e) {
+          throw new StkError(`closed #${pr} to refresh its mergeability but could not reopen it (${e instanceof Error ? e.message : String(e)}); reopen it by hand`, "gh-failed");
+        }
+      },
       rebaseStack: async (pr) => {
         const rebased = await rebaseStack(ctx, pr, { knownHeads, ...(opts.replan ? { replan: opts.replan } : {}) });
         for (const n of rebased.prs) {
@@ -847,8 +856,30 @@ export async function stackMerge(
       if (staleHead !== null) stopped(`GitHub has not reflected the pushed head of #${staleHead} (${expectedHeads[staleHead]}); refusing to merge a stale head`, staleHead);
       // a member still shown as conflicting after the re-link would silently cut the plan short: say so instead
       const targetAt = fresh.stack.prs.findIndex((p) => p.number === fresh.target);
-      const conflicted = fresh.stack.prs.find((p, i) => i <= targetAt && memberBlockers(p, fresh.trunk, i > 0, fresh.rules).some((b) => b.kind === "conflict"));
-      if (conflicted) stopped(`GitHub still reports #${conflicted.number} as conflicting after the stack was re-linked; its mergeability may be stale (closing and reopening it makes GitHub recompute), merge again once it clears`, conflicted.number);
+      const conflictedIn = (f: PlanForResult) => f.stack.prs.find((p, i) => i <= targetAt && memberBlockers(p, f.trunk, i > 0, f.rules).some((b) => b.kind === "conflict"));
+      const conflicted = conflictedIn(fresh);
+      if (conflicted) {
+        // a head that already contains its base cannot conflict with it: then GitHub's flag is stale and closing and reopening the PR makes it recompute
+        let behind: number | string;
+        try {
+          behind = await behindBy(ctx.exec, at(ctx), conflicted.baseRef, conflicted.headSha);
+        } catch (e) {
+          behind = e instanceof Error ? e.message : String(e);
+        }
+        const still = `GitHub still reports #${conflicted.number} as conflicting after the stack was re-linked`;
+        if (typeof behind === "string") return stopped(`${still}, and checking whether that is stale failed (${behind}); merge again once it clears`, conflicted.number);
+        if (behind > 0) return stopped(`${still}, and its head is ${behind} commit${behind === 1 ? "" : "s"} behind ${conflicted.baseRef}, so the conflict looks real; resolve it and merge again`, conflicted.number);
+        const refresh: PlanStep = { kind: "refresh-mergeability", pr: conflicted.number };
+        opts.onPlan?.([...results.map((r) => r.step), refresh, ...fresh.plan]);
+        const refreshed = await executePlan([refresh], deps);
+        results.push(...refreshed);
+        if (refreshed.some((r) => !r.ok)) break;
+        ({ fresh, stale, staleHead, checking } = await replanNative(ctx, first.target, opts, landed, opts.replan ?? {}, expectedHeads, undefined, true));
+        validateReplan(fresh, stale);
+        if (staleHead !== null) stopped(`GitHub has not reflected the pushed head of #${staleHead} (${expectedHeads[staleHead]}); refusing to merge a stale head`, staleHead);
+        const again = conflictedIn(fresh);
+        if (again) stopped(`GitHub still reports #${again.number} as conflicting after the stack was re-linked, even after closing and reopening #${conflicted.number} to make it recompute; merge again once it clears`, again.number);
+      }
     }
     if (checking !== null) stopped(`GitHub is still checking it for conflicts after #${[...landed].at(-1)} landed; merge again once that settles`, checking);
     opts.onPlan?.([...results.map((r) => r.step), ...fresh.plan]);

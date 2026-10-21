@@ -35,6 +35,10 @@ interface FakeOptions {
   unexpectedDownstack?: boolean;
   /** After the push, #203 shows as conflicting (DIRTY, stale from before its base was recomputed) for this many reads. */
   dirtyReads?: number;
+  /** Closing and reopening #203 makes GitHub recompute: its stale conflict flag clears. */
+  reopenClearsDirty?: boolean;
+  /** What the compare API reports for a member's head against its base (default 0: the head contains the base). */
+  behindBy?: number;
   staleMerged?: boolean;
   oldHeadReads?: number;
   divergedLocal?: boolean;
@@ -135,9 +139,11 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
       return ok(`HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ status: "merged", details: {} })}`);
     }
     if (a.startsWith("gh repo view")) return ok(JSON.stringify({ owner: { login: "o" }, name: "r", defaultBranchRef: { name: "main" } }));
+    const compare = /^gh api -i repos\/o\/r\/compare\/(.+)\.\.\.(.+)$/.exec(a);
+    if (compare) return http(200, { behind_by: o.behindBy ?? 0, ahead_by: 14 });
     const api = /^gh api -i (?:-X (\w+) )?repos\/o\/r\/(pulls\/(\d+)|stacks(?:\/\d+\/unstack)?)(?: |$)/.exec(a);
     if (api) {
-      const input = opts?.stdin ? (JSON.parse(opts.stdin) as { base?: string; pull_requests?: number[] }) : {};
+      const input = opts?.stdin ? (JSON.parse(opts.stdin) as { base?: string; state?: string; pull_requests?: number[] }) : {};
       const n = Number(api[3]);
       if (!api[1]) {
         const state = unknownLeft > 0 ? "unknown" : "clean";
@@ -155,6 +161,11 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
         events.push(`create ${input.pull_requests!.join(",")}`);
         members = input.pull_requests!;
         return http(201, { number: 5, pull_requests: members });
+      }
+      if (api[1] === "PATCH" && input.state) {
+        events.push(`${input.state === "closed" ? "close" : "reopen"} ${n}`);
+        if (input.state === "open" && o.reopenClearsDirty) dirtyLeft = 0;
+        return http(200, {});
       }
       if (members.includes(n)) return http(422, { message: "Cannot change the base branch because the pull request is part of a stack." });
       rest.push(`base ${n} ${input.base}`);
@@ -297,10 +308,40 @@ describe("stackMerge on a native stack", () => {
 
   test("a member that keeps showing as conflicting after the re-link stops the run with that reason instead of a silent partial merge", async () => {
     clearRulesCache();
-    const { ctx, puts } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 999 });
+    const { ctx, puts, events } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 999 });
     const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, replan: noSleep }).catch((e: Error) => e)) as Error;
     expect(err.message).toContain("stack merge stopped at #203: GitHub still reports #203 as conflicting after the stack was re-linked");
+    expect(err.message).toContain("even after closing and reopening #203");
     expect(puts.map((p) => p.pr)).toEqual([A]);
+    // closed and reopened once, never twice
+    expect(events.filter((e) => e.startsWith("close") || e.startsWith("reopen"))).toEqual(["close 203", "reopen 203"]);
+  });
+
+  test("a conflict flag that GitHub never recomputed (the head already contains its base) is cleared by closing and reopening the PR once, then the merge continues", async () => {
+    clearRulesCache();
+    const { ctx, puts, events } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 999, reopenClearsDirty: true });
+    const seen: StepResult[] = [];
+    const plans: PlanStep[][] = [];
+    const r = await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, onStep: (s) => seen.push(s), onPlan: (p) => plans.push(p), replan: noSleep });
+    expect(r.merged).toEqual([A, B, C]);
+    expect(puts.map((p) => p.sha)).toEqual(["shaA", "new203"]);
+    expect(events).toEqual(["merge 201", "push", "unstack", "base 202 main", "create 202,203", "close 203", "reopen 203", "merge 203"]);
+    const refresh = r.results.find((x) => x.step.kind === "refresh-mergeability")!;
+    expect(refresh).toMatchObject({ ok: true, step: { kind: "refresh-mergeability", pr: C } });
+    expect(refresh.detail).toContain("conflict flag on #203 was stale");
+    expect(refresh.detail).toContain("closed and reopened #203");
+    expect(seen).toContain(refresh);
+    expect(plans.some((p) => p.some((s) => s.kind === "refresh-mergeability"))).toBe(true);
+  });
+
+  test("a conflicting member whose head is behind its base is a real conflict: stop without closing or reopening anything", async () => {
+    clearRulesCache();
+    const { ctx, puts, events } = fakeGithub({ review: "required", cleanGroup: true, dirtyReads: 999, behindBy: 2 });
+    const err = (await stackMerge(ctx, A, { method: "squash", force: true, upTo: C, replan: noSleep }).catch((e: Error) => e)) as Error;
+    expect(err.message).toContain("stack merge stopped at #203: GitHub still reports #203 as conflicting after the stack was re-linked");
+    expect(err.message).toContain("2 commits behind");
+    expect(puts.map((p) => p.pr)).toEqual([A]);
+    expect(events.some((e) => e.startsWith("close") || e.startsWith("reopen"))).toBe(false);
   });
 
   test("right after the push GitHub still computes mergeability: the re-plan waits instead of stopping", async () => {
