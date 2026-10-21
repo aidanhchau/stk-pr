@@ -26,6 +26,7 @@ import {
   closeAndReopenPr,
   behindBy,
   branchRules,
+  repoMergeMethods,
   fetchSessionPrs,
   getPr,
   listPrs,
@@ -60,6 +61,7 @@ import {
   type ReviewThread,
 } from "./github";
 import { blockers, chainThrough, executePlan, findForks, isHardBlocker, memberBlockers, planNativeStackMerge, planStackMerge, stackFor, treeOf, type ExecuteDeps, type Fork } from "./stack";
+import { assertMethodAllowed, effectiveMethod, fallbackNote, intersectMethods } from "./methods";
 import { resolveRepo } from "./repos";
 import { roleRank, sessionPrRefs } from "./session";
 import {
@@ -140,6 +142,9 @@ export interface ThreadResult {
 }
 export interface MergeDryRun {
   wouldMerge: boolean;
+  /** The method the merge would send: the requested one, or the allowed one that replaces it. */
+  method: MergeMethod;
+  methodNote?: string;
   admin: boolean;
   bypass: Blocker[];
   blockers: Blocker[];
@@ -168,6 +173,10 @@ export interface StackInfo {
   /** Set when a PR at or below `target` is not in the plan: which one, and why, in words. */
   stop: { pr: number; reason: string } | null;
   notes: StackNote[];
+  /** The method the plan was made for: the requested one, or the allowed one that replaced it. */
+  method: MergeMethod;
+  /** Why the requested method was replaced (e.g. "merge commits not allowed on dev; merged with squash instead"). */
+  methodNote?: string;
 }
 
 export interface StackMergeResult {
@@ -176,6 +185,8 @@ export interface StackMergeResult {
   total: number[];
   merged: number[];
   remaining: number[];
+  /** Set when the remembered merge method was not allowed on the trunk and another was used. */
+  note?: string;
 }
 
 // ---------- helpers ----------
@@ -262,8 +273,57 @@ export async function rulesFor(exec: Exec, where: string | RepoSlug, branch: str
   return rules;
 }
 
-/** Test hook: forget cached rules. */
-export const clearRulesCache = () => rulesCache.clear();
+const settingsCache = new Map<string, { at: number; methods: Promise<MergeMethod[] | null> }>();
+
+/**
+ * The merge methods allowed into `branch`: the repo settings intersected with the branch rules' pull_request
+ * `allowed_merge_methods`. Repo settings cached like the rules (~10 min); null when they cannot be read (rate limits
+ * surface), in which case callers keep their current behaviour.
+ */
+export async function allowedMethodsFor(exec: Exec, where: string | RepoSlug, branch: string): Promise<MergeMethod[] | null> {
+  const slug = typeof where === "string" ? await repoSlug(exec, where) : where;
+  const key = `${slug.owner}/${slug.name}`.toLowerCase();
+  let hit = settingsCache.get(key);
+  if (!hit || Date.now() - hit.at >= RULES_TTL_MS) {
+    const methods = repoMergeMethods(exec, slug).catch((e) => {
+      if (!(e instanceof StkError) || e.code === "rate-limited") {
+        settingsCache.delete(key);
+        throw e;
+      }
+      return null;
+    });
+    hit = { at: Date.now(), methods };
+    settingsCache.set(key, hit);
+  }
+  const [repoWide, rules] = await Promise.all([hit.methods, rulesFor(exec, slug, branch)]);
+  return intersectMethods(repoWide, rules?.allowedMergeMethods ?? null);
+}
+
+/** Test hook: forget cached rules and repo settings. */
+export const clearRulesCache = () => {
+  rulesCache.clear();
+  settingsCache.clear();
+};
+
+/**
+ * The method to send for a merge into `branch`, decided at execution time (the TUI's allowed-set read may not have
+ * landed yet). A requested method the base rejects is swapped for the effective one with a note; an `explicit` one
+ * (CLI `--method`) throws instead, listing the allowed methods. An unreadable allowed set changes nothing.
+ */
+export async function settleMethod(ctx: Ctx, requested: MergeMethod, branch: string, explicit: boolean): Promise<{ method: MergeMethod; note?: string }> {
+  const allowed = await allowedMethodsFor(ctx.exec, at(ctx), branch).catch((e) => {
+    // a rate limit must surface (the merge would fail on it anyway); any other unreadable set keeps the requested method
+    if (e instanceof StkError && e.code === "rate-limited") throw e;
+    return null;
+  });
+  if (explicit) {
+    assertMethodAllowed(requested, allowed, branch);
+    return { method: requested };
+  }
+  const method = effectiveMethod(requested, allowed);
+  if (method === requested) return { method };
+  return { method, note: `${fallbackNote(requested, allowed, branch)}; merged with ${method} instead` };
+}
 
 export function at(ctx: Ctx): string | RepoSlug {
   const where = ctx.root ?? ctx.slug;
@@ -429,7 +489,7 @@ export async function resolve(ctx: Ctx, threadId: string): Promise<ThreadResult>
   return { threadId };
 }
 
-type MergeOpts = { method: MergeMethod; force: boolean; onProgress?: (p: MergeProgress) => void };
+type MergeOpts = { method: MergeMethod; /** The method was chosen on purpose (CLI `--method`): a base that rejects it is an error, not a fallback. */ explicitMethod?: boolean; force: boolean; onProgress?: (p: MergeProgress) => void };
 export function merge(ctx: Ctx, n: number, opts: MergeOpts & { dryRun: true }): Promise<MergeDryRun>;
 export function merge(ctx: Ctx, n: number, opts: MergeOpts & { dryRun?: false }): Promise<MergeResult>;
 export function merge(ctx: Ctx, n: number, opts: MergeOpts & { dryRun?: boolean }): Promise<MergeDryRun | MergeResult>;
@@ -443,10 +503,13 @@ export async function merge(
   n: number,
   opts: MergeOpts & { dryRun?: boolean },
 ): Promise<MergeDryRun | MergeResult> {
-  const { method, force } = opts;
+  const { force } = opts;
   const trunk = await trunkFor(ctx.exec, at(ctx));
   const [pr, rules] = await Promise.all([getPr(ctx.exec, at(ctx), n), rulesFor(ctx.exec, at(ctx), trunk)]);
   if (pr.state !== "OPEN") throw new StkError(`PR #${n} is ${pr.state.toLowerCase()}, not open`, "usage");
+  // against the PR's own base, right before anything is sent: a remembered method it rejects is swapped, an explicit one fails
+  const settled = await settleMethod(ctx, opts.method, pr.baseRef, opts.explicitMethod === true);
+  const method = settled.method;
 
   let bs = blockers(pr, trunk, rules);
   let note: string | undefined;
@@ -473,6 +536,8 @@ export async function merge(
   if (opts.dryRun) {
     return {
       wouldMerge: mayMerge,
+      method,
+      ...(settled.note ? { methodNote: settled.note } : {}),
       admin: force && mayMerge,
       bypass: force && mayMerge ? bs : [],
       blockers: bs,
@@ -496,6 +561,7 @@ export async function merge(
     sha: pr.headSha,
     ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
   });
+  const fullNote = [note, settled.note].filter(Boolean).join("; ");
   return {
     number: n,
     method,
@@ -504,7 +570,7 @@ export async function merge(
     status: out.status,
     ...(out.sha ? { sha: out.sha } : {}),
     ...(out.uuid ? { uuid: out.uuid } : {}),
-    ...(note ? { note } : {}),
+    ...(fullNote ? { note: fullNote } : {}),
   };
 }
 
@@ -520,6 +586,8 @@ async function nativeStackOrNull(ctx: Ctx, n: number) {
 
 interface PlanOpts {
   method: MergeMethod;
+  /** As `MergeOpts.explicitMethod`. */
+  explicitMethod?: boolean;
   force: boolean;
   /** Highest PR to land (the stack's open PRs up to and including it); "top" = the whole stack. Default: `n` for a native stack, the whole chain for a classic one. */
   upTo?: number | "top";
@@ -544,9 +612,25 @@ export interface PlanForResult {
   notes: StackNote[];
   rules: RepoRules | null;
   plan: PlanStep[];
+  /** The method the plan was made for: the requested one, or the allowed one that replaced it. */
+  method: MergeMethod;
+  /** Why the requested method was replaced, when it was. */
+  methodNote?: string;
 }
 
+/**
+ * Reads and plans a stack merge with the method settled against its trunk (the same rule `merge` and `stackMerge`
+ * apply when they run), so a preview shows what `--merge` would do. The plan is made again when the method changes,
+ * since a merge-commit stack plans without restacks.
+ */
 async function planFor(ctx: Ctx, n: number, opts: PlanOpts): Promise<PlanForResult> {
+  const first = await planForMethod(ctx, n, opts);
+  const settled = await settleMethod(ctx, opts.method, first.trunk, opts.explicitMethod === true);
+  if (settled.method === opts.method) return { ...first, method: opts.method };
+  return { ...(await planForMethod(ctx, n, { ...opts, method: settled.method })), method: settled.method, ...(settled.note ? { methodNote: settled.note } : {}) };
+}
+
+async function planForMethod(ctx: Ctx, n: number, opts: PlanOpts): Promise<Omit<PlanForResult, "method" | "methodNote">> {
   // A native stack plans from ONE GraphQL call: members' fields, thread counts and the trunk all come back together.
   let detail: NativeStackDetail | null = null;
   try {
@@ -612,10 +696,10 @@ export async function stackInfo(
   n: number,
   opts: PlanOpts,
 ): Promise<StackInfo> {
-  const { trunk, stack, forks, plan, target, notes, rules } = await planFor(ctx, n, opts);
+  const { trunk, stack, forks, plan, target, notes, rules, method, methodNote } = await planFor(ctx, n, opts);
   const perPr = blockersByPr(stack, trunk, rules);
   // the sheet's own rebase (stale base) is the bottom PR; nothing there needs a checkout
-  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes };
+  return { stack, forks, plan, blockers: perPr, target, stop: stopReason(stack, plan, target, perPr, opts.force), notes, method, ...(methodNote ? { methodNote } : {}) };
 }
 
 /** Per-member blockers of a stack: a native stack lands on the trunk, so no member is judged by its own base. */
@@ -714,9 +798,12 @@ async function replanNative(
 export async function stackMerge(
   ctx: Ctx,
   n: number,
-  opts: PlanOpts & { onStep?: (r: StepResult) => void; onProgress?: (p: MergeProgress) => void; onPlan?: (plan: PlanStep[]) => void; replan?: ReplanPolicy },
+  given: PlanOpts & { onStep?: (r: StepResult) => void; onProgress?: (p: MergeProgress) => void; onPlan?: (plan: PlanStep[]) => void; replan?: ReplanPolicy },
 ): Promise<StackMergeResult> {
-  const first = await planFor(ctx, n, opts);
+  // planFor settles the method against the stack's trunk before anything merges: a remembered one it rejects is swapped
+  // for an allowed one (and the plan made for that), an explicit one fails
+  const first = await planFor(ctx, n, given);
+  const opts = { ...given, method: first.method };
   const { stack } = first;
   let expectedHeads: Record<number, string> = {};
   // the PR stk itself re-linked as the last one of the stack (it is in no stack any more); only it may be planned as a plain PR
@@ -900,6 +987,7 @@ export async function stackMerge(
     total,
     merged: total.filter((x) => mergedSet.has(x)),
     remaining: total.filter((x) => !mergedSet.has(x)),
+    ...(first.methodNote ? { note: first.methodNote } : {}),
   };
 }
 

@@ -7,6 +7,7 @@ import { createContext, useContext, useRef, useSyncExternalStore } from "react";
 import { startFix, type FixPr, type FixTarget } from "../agentfix";
 import { exec } from "../exec";
 import { agentPanes } from "../session";
+import { effectiveMethod, fallbackNote, nextMethod } from "../methods";
 import type { SearchLine } from "./ui";
 import type { GhResult } from "../ghproxy";
 import { dedupeItems, toItem, type PaletteItem } from "../fuzzy";
@@ -14,6 +15,8 @@ import { rateLimitReset, repoSlug, type FileDiff } from "../github";
 import { discoverWorkspace, emptyWorkspaceMessage, homeLabel, type WorkspaceRepo } from "../repos";
 import { listWorkspaceBoard, openWorkspaceCtx, type WorkspaceBoard } from "../workspace";
 import {
+  allowedMethodsFor,
+  at,
   listBoard,
   merge,
   openCtx,
@@ -75,11 +78,14 @@ export type TuiScope = BoardScope | "session";
 export type RepoKey = string;
 export const repoKey = (r: RepoSlug): RepoKey => `${r.owner}/${r.name}`;
 const prKey = (r: RepoKey, n: number) => `${r}#${n}`;
+const methodsKey = (r: RepoKey, branch: string) => `${r.toLowerCase()}@${branch}`;
 const PREFETCH_CONCURRENCY = 3;
 const PREFETCH_FRESH_MS = 60_000;
 const STACK_INFO_TTL_MS = 30_000;
 const STACK_RECHECK_MS = 3_000;
 const PREFETCH_BOARD_LIMIT = 12;
+/** Most distinct (repo, base) pairs of a board whose allowed merge methods are read. */
+const METHOD_BASES_LIMIT = 12;
 /** Max background prefetches per hour per process (GitHub rate). */
 const PREFETCH_BUDGET = 60;
 const PREFETCH_WINDOW_MS = 3_600_000;
@@ -192,6 +198,8 @@ export interface AppState {
   jobs: Record<string, Job>;
   /** Saved preferences (`prefs.json`): per-repo board tab and merge method, notification mode, reduced motion. */
   prefs: Prefs;
+  /** Merge methods a branch allows (repo settings ∩ ruleset), by lower-cased `owner/name@branch`; absent until read or when unreadable. */
+  mergeMethods: Record<string, { branch: string; allowed: MergeMethod[] }>;
 }
 
 export const diffKey = (n: number, file: string) => `${n}:${file}`;
@@ -226,12 +234,52 @@ export function activeRepoKey(s: Pick<AppState, "screen" | "boardCursor" | "repo
   return s.repo ? repoKey(s.repo) : null;
 }
 
-export const MERGE_METHODS: readonly MergeMethod[] = ["squash", "merge", "rebase"];
+type MethodState = Pick<AppState, "prefs" | "screen" | "boardCursor" | "repo" | "mergeMethods" | "prCache" | "boards" | "session">;
 
-/** The remembered merge method of the active repo (default squash). */
-export function mergeMethodOf(s: Pick<AppState, "prefs" | "screen" | "boardCursor" | "repo">): MergeMethod {
+const rememberedMethod = (s: MethodState): MergeMethod | undefined => {
   const key = activeRepoKey(s);
-  return (key && s.prefs.repos[key.toLowerCase()]?.mergeMethod) || "squash";
+  return key ? s.prefs.repos[key.toLowerCase()]?.mergeMethod : undefined;
+};
+
+/** The branch the active context merges into: the open PR's base (a stack's trunk), else the cursor row's base, else the repo board's default branch. */
+function methodBranch(s: MethodState, key: RepoKey): string | null {
+  if (s.screen.kind === "pr") {
+    const d = s.prCache[prKey(key, s.screen.n)]?.data;
+    if (d) return d.stack?.trunk ?? d.pr.baseRef;
+  }
+  const lc = key.toLowerCase();
+  const hash = s.boardCursor?.lastIndexOf("#") ?? -1;
+  if (s.boardCursor && hash > 0 && s.boardCursor.slice(0, hash).toLowerCase() === lc) {
+    const n = Number(s.boardCursor.slice(hash + 1));
+    const rows: { repo?: RepoSlug; number: number; baseRef: string }[] = [
+      ...Object.values(s.boards).flatMap((b) => b.data?.prs ?? []),
+      ...(s.session?.data ? [...s.session.data.groups.open, ...s.session.data.groups.merged, ...s.session.data.groups.closed] : []),
+    ];
+    const row = rows.find((p) => p.number === n && (!p.repo || repoKey(p.repo).toLowerCase() === lc));
+    if (row) return row.baseRef;
+  }
+  for (const b of Object.values(s.boards)) {
+    const d = b.data;
+    if (d && "trunk" in d && repoKey(d.repo).toLowerCase() === lc) return d.trunk;
+  }
+  return null;
+}
+
+const allowedFor = (s: MethodState) => {
+  const key = activeRepoKey(s);
+  const branch = key ? methodBranch(s, key) : null;
+  return key && branch ? s.mergeMethods[methodsKey(key, branch)] : undefined;
+};
+
+/** The merge method to use here: the remembered one when the branch allows it, else the first allowed (squash, rebase, merge). */
+export function mergeMethodOf(s: MethodState): MergeMethod {
+  return effectiveMethod(rememberedMethod(s), allowedFor(s)?.allowed);
+}
+
+/** Brief reason the remembered method is not the one in use (e.g. "merge commits not allowed on dev"), else null. */
+export function mergeMethodNote(s: MethodState): string | null {
+  const a = allowedFor(s);
+  return a ? fallbackNote(rememberedMethod(s), a.allowed, a.branch) : null;
 }
 
 /** Every PR the store has loaded (all boards, session, cached details), deduped by repo+number. No network. */
@@ -283,6 +331,8 @@ export class Store {
     screenPr: () => (this.state.screen.kind === "pr" ? { repo: this.state.screen.repo, n: this.state.screen.n } : null),
   });
   private inflight = new Map<string, Promise<PrDetail>>();
+  /** `repo@branch` keys whose allowed-methods read is running. */
+  private methodLoads = new Set<string>();
   private commitInflight = new Map<string, Promise<void>>();
   /** Only expanded, mounted PR views opt into automatic history refreshes. */
   private visibleCommits = new Set<string>();
@@ -325,6 +375,7 @@ export class Store {
       busy: null,
       jobs: {},
       prefs: this.prefsFile ? loadPrefs(this.prefsFile) : { repos: {} },
+      mergeMethods: {},
     };
     setReducedMotionPref(this.state.prefs.reducedMotion ?? false);
   }
@@ -667,6 +718,7 @@ export class Store {
         if (r.status === "ready" && !r.refreshing && r.data) {
           this.observeBoard(scope, r.data.prs, r.data.repo, [r.data.repo]);
           this.prefetchBoard(r.data.repo, r.data.prs);
+          void this.loadMergeMethods(r.data.repo, r.data.trunk);
         }
       },
       () => listBoard(ctx, scope),
@@ -708,6 +760,7 @@ export class Store {
     if (cur?.data && !opts.force) {
       if (cur.refreshing || this.inflight.has(key) || Date.now() - (cur.at ?? 0) < PREFETCH_FRESH_MS) {
         this.prefetchStack(repo, cur.data);
+        this.loadDetailMethods(repo, cur.data);
         return;
       }
     }
@@ -739,6 +792,7 @@ export class Store {
           this.watcher.observeDetail(repo, n, r.data);
           this.prefetchStack(repo, r.data);
           this.recheckMergeability(repo, n, r.data);
+          this.loadDetailMethods(repo, r.data);
         }
       },
       () => prDetail(ctx, n),
@@ -861,6 +915,7 @@ export class Store {
       this.set((s) => ({ prCache: { ...s.prCache, [key]: { status: "ready", data, at: Date.now(), refreshing: false } } }));
       this.watcher.observeDetail(repo, n, data);
       this.prefetchStack(repo, data);
+      this.loadDetailMethods(repo, data);
       if (this.visibleCommits.has(key) && !this.rateLimited() && this.state.commitCache[key]?.status === "idle") void this.loadCommits(n, { repo, force: true });
     } catch (e) {
       this.noteRateLimit(e); // other failures are silent: a user open will load (and report errors) itself
@@ -871,10 +926,15 @@ export class Store {
 
   /** After the board loads: record each row's `updatedAt`, then warm open PRs in display order (up to PREFETCH_BOARD_LIMIT) whose detail is missing or older than their row. Never resets the budget. */
   private prefetchBoard(repo: RepoSlug | null, prs: (BoardPr & { repo?: RepoSlug })[]): void {
+    const bases = new Map<string, { repo: RepoSlug; branch: string }>();
     for (const p of prs) {
       const r = p.repo ?? repo;
-      if (r) this.boardStamp.set(prKey(repoKey(r), p.number), p.updatedAt);
+      if (!r) continue;
+      this.boardStamp.set(prKey(repoKey(r), p.number), p.updatedAt);
+      // workspace and session rows carry no default branch: read what each distinct (repo, base) allows
+      if (p.state === "OPEN") bases.set(methodsKey(repoKey(r), p.baseRef), { repo: r, branch: p.baseRef });
     }
+    for (const b of [...bases.values()].slice(0, METHOD_BASES_LIMIT)) void this.loadMergeMethods(b.repo, b.branch);
     // Display order approximation: stack trees (root first, then children), newest tree first.
     const open = prs.filter((p) => p.state === "OPEN");
     const heads = new Map(open.map((p) => [p.headRef, p]));
@@ -988,15 +1048,40 @@ export class Store {
     this.updatePrefs({ ...this.state.prefs, reducedMotion: on });
   }
 
+  /**
+   * Read which merge methods `branch` of `repo` allows (cached ~10 min by the service) so `t` and the merge sheets only
+   * offer those. Kept per repo and branch. An unreadable set (API error) leaves every method on offer; rate limits wait
+   * for the next load.
+   */
+  async loadMergeMethods(repo: RepoSlug, branch: string): Promise<void> {
+    const key = methodsKey(repoKey(repo), branch);
+    if (this.state.mergeMethods[key] || this.methodLoads.has(key)) return;
+    this.methodLoads.add(key);
+    try {
+      const ctx = await this.ctxFor(repo);
+      const allowed = await allowedMethodsFor(ctx.exec, at(ctx), branch);
+      if (allowed && allowed.length > 0) this.set((s) => ({ mergeMethods: { ...s.mergeMethods, [key]: { branch, allowed } } }));
+    } catch (e) {
+      this.noteRateLimit(e);
+    } finally {
+      this.methodLoads.delete(key);
+    }
+  }
+
+  /** Wherever a PR's detail lands (user load or prefetch): read the methods its base, or its stack's trunk, allows. */
+  private loadDetailMethods(repo: RepoSlug, d: PrDetail): void {
+    void this.loadMergeMethods(repo, d.stack?.trunk ?? d.pr.baseRef);
+  }
+
   /** Remember a merge method for a repo. */
   setMergeMethod(repo: RepoSlug, mergeMethod: MergeMethod): void {
     this.updatePrefs(withRepoPrefs(this.state.prefs, repo, { mergeMethod }));
   }
 
-  /** Next merge method (squash, merge, rebase) for the active repo; remembered. */
+  /** Next allowed merge method (squash, merge, rebase) for the active repo; remembered. */
   cycleMergeMethod(): void {
     const repo = this.activeRepo();
-    if (repo) this.setMergeMethod(repo, MERGE_METHODS[(MERGE_METHODS.indexOf(mergeMethodOf(this.state)) + 1) % MERGE_METHODS.length]!);
+    if (repo) this.setMergeMethod(repo, nextMethod(mergeMethodOf(this.state), allowedFor(this.state)?.allowed));
   }
 
   /** The remembered board tab of a repo, when it can be shown (Session needs a session pane). */

@@ -69,8 +69,8 @@ function parseNumber(s: string | undefined, what: string): number {
   return Number(s);
 }
 
-function parseMethod(s: string | undefined): MergeMethod {
-  if (s === undefined) return "squash";
+function parseMethod(s: string | undefined): MergeMethod | undefined {
+  if (s === undefined) return undefined;
   if (s === "squash" || s === "merge" || s === "rebase") return s;
   return usage(`--method must be squash, merge or rebase (got ${s})`);
 }
@@ -187,53 +187,56 @@ async function cmdResolve(ctx: Ctx, args: string[]): Promise<Result> {
 
 async function cmdMerge(ctx: Ctx, o: Opts, args: string[]): Promise<Result> {
   const n = parseNumber(args[0], "merge");
-  const method = parseMethod(o.method);
+  const given = parseMethod(o.method);
+  const method = given ?? "squash";
+  const explicitMethod = given !== undefined;
   const force = !!o.force;
 
   if (o["dry-run"]) {
-    const d = await merge(ctx, n, { method, force, dryRun: true });
+    const d = await merge(ctx, n, { method, explicitMethod, force, dryRun: true });
     const unbypassable = d.blockers.filter((b) => b.kind === "conflict" || b.kind === "draft");
-    return {
-      data: d,
-      text: d.wouldMerge
-        ? `would ${force ? "force-merge" : "merge"} #${n} (${method})${d.bypass.length ? `, bypassing ${describeBlockers(d.bypass)}` : ""}`
-        : `would NOT merge #${n}: ${describeBlockers(force ? unbypassable : d.blockers)}`,
-    };
+    const text = d.wouldMerge
+      ? `would ${force ? "force-merge" : "merge"} #${n} (${d.method})${d.bypass.length ? `, bypassing ${describeBlockers(d.bypass)}` : ""}`
+      : `would NOT merge #${n}: ${describeBlockers(force ? unbypassable : d.blockers)}`;
+    return { data: d, text: d.methodNote ? `${text}\n${d.methodNote}` : text };
   }
-  const d = await merge(ctx, n, { method, force });
+  const d = await merge(ctx, n, { method, explicitMethod, force });
   const verb = d.status === "enqueued" ? "queued" : force ? "force-merged" : "merged";
-  const text = `${verb} #${n} (${method}${force ? ", bypass rules" : ""})${force && d.bypassed.length ? `, bypassed: ${describeBlockers(d.bypassed)}` : ""}`;
+  const text = `${verb} #${n} (${d.method}${force ? ", bypass rules" : ""})${force && d.bypassed.length ? `, bypassed: ${describeBlockers(d.bypassed)}` : ""}`;
   return { data: d, text: d.note ? `${text}\n${d.note}` : text };
 }
 
 async function cmdStack(ctx: Ctx, o: Opts, args: string[], deps: CliDeps, json: boolean): Promise<Result> {
   const n = parseNumber(args[0], "stack");
-  const method = parseMethod(o.method);
+  const given = parseMethod(o.method);
+  const method = given ?? "squash";
+  const explicitMethod = given !== undefined;
   const force = !!o.force;
 
   if (!o.merge) {
-    const d = await stackInfo(ctx, n, { method, force });
+    const d = await stackInfo(ctx, n, { method, explicitMethod, force });
     const { stack, forks, plan } = d;
     const lines = [`stack onto ${stack.trunk}: ${stack.prs.map((p) => `#${p.number}`).join(" <- ")}`];
     for (const f of forks) lines.push(`fork: #${f.parent} has children ${f.children.map((c) => `#${c}`).join(", ")}`);
     for (const s of plan) lines.push(`  ${s.kind} ${"pr" in s ? `#${s.pr}` : s.branch}`);
     if (plan.length === 0) lines.push("  (nothing mergeable)");
-    return { data: d, text: lines.join("\n") };
+    const head = d.methodNote ? [`${d.methodNote}`] : [];
+    return { data: d, text: [...lines, ...head].join("\n") };
   }
 
   const r = await stackMerge(ctx, n, {
     method,
+    explicitMethod,
     force,
     onStep: (s) => {
       if (!json) deps.stdout(`${s.ok ? "ok  " : "FAIL"} ${s.detail}\n`);
     },
   });
   const count = `merged ${r.merged.length}/${r.total.length}`;
+  const text = r.remaining.length ? `${count}; stopped before ${r.remaining.map((p) => `#${p}`).join(", ")} (blocked)` : count;
   return {
     data: { results: r.results },
-    text: r.remaining.length
-      ? `${count}; stopped before ${r.remaining.map((p) => `#${p}`).join(", ")} (blocked)`
-      : count,
+    text: r.note ? `${text}\n${r.note}` : text,
   };
 }
 

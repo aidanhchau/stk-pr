@@ -34,6 +34,7 @@ function infoFor(prs: PullRequest[], target: number): StackInfo {
     target,
     stop: null,
     notes: [],
+    method: "squash",
   };
 }
 

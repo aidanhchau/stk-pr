@@ -98,6 +98,8 @@ export interface RepoRules {
   requiredChecks: string[];
   /** The pull_request rule requires code owner review. */
   codeOwnerReview: boolean;
+  /** Merge methods the pull_request rule(s) allow (their `allowed_merge_methods`, intersected); absent when no rule restricts them. */
+  allowedMergeMethods?: MergeMethod[];
 }
 
 export type MergeMethod = "squash" | "merge" | "rebase";
@@ -163,15 +165,16 @@ export type MergeOutcome = "merged" | "enqueued" | "partial" | "none";
 export function mergeOutcomeText(job: { kind: "merge" | "stack-merge" | "rebase-stack" | "merge-when-ready"; stack?: boolean; pr: number; outcome?: MergeOutcome; merged?: number[]; prs?: number[]; note?: string }): string {
   if (job.kind === "rebase-stack") return `Stack rebased · ${(job.prs ?? [job.pr]).map((n) => `#${n}`).join(", ")}${job.note ? ` · ${job.note}` : ""}`;
   const merged = (job.merged ?? []).map((n) => `#${n}`).join(", ");
+  const withNote = (text: string) => (job.note ? `${text} · ${job.note}` : text);
   switch (job.outcome) {
     case "enqueued":
-      return `Queued · #${job.pr} (not merged yet)${merged ? `; merged ${merged}` : ""}`;
+      return withNote(`Queued · #${job.pr} (not merged yet)${merged ? `; merged ${merged}` : ""}`);
     case "partial":
-      return `Merged ${merged} · #${job.pr} still open`;
+      return withNote(`Merged ${merged} · #${job.pr} still open`);
     case "none":
-      return `Nothing merged · #${job.prs?.[0] ?? job.pr} is blocked`;
+      return withNote(`Nothing merged · #${job.prs?.[0] ?? job.pr} is blocked`);
     default:
-      return (job.kind === "stack-merge" || job.stack) && (job.merged?.length ?? 0) > 1 ? `Stack merged · ${merged}` : `Merged ${merged || `#${job.pr}`}`;
+      return withNote((job.kind === "stack-merge" || job.stack) && (job.merged?.length ?? 0) > 1 ? `Stack merged · ${merged}` : `Merged ${merged || `#${job.pr}`}`);
   }
 }
 

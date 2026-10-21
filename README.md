@@ -110,7 +110,7 @@ PR:
 | `e` | Resolve thread |
 | `m` | Merge |
 | `M` | Force merge |
-| `t` | Cycle merge method |
+| `t` | Cycle merge method. Only methods the base branch allows are offered (repo settings intersected with the branch ruleset's allowed merge methods); a remembered method it rejects falls back to squash, rebase or merge, in that order, and the sheets say so. |
 | `S` | Merge stack |
 | `p` | PR state: mark ready for review, convert to draft, close, reopen. On a draft, `⏎` on the Draft row under Blocking merge marks it ready. |
 | `w` | Worktree sheet |
@@ -185,8 +185,8 @@ stk [--repo DIR] [--json] <command>
 | `review <n> (--approve\|--request-changes\|--comment) [-m BODY]` | Submit a review. |
 | `reply <threadId> -m BODY` | Reply to a review thread. |
 | `resolve <threadId>` | Resolve a review thread. |
-| `merge <n> [--method squash\|merge\|rebase] [--force] [--dry-run]` | Merge a PR. Default method is squash. `--dry-run` reports what would happen. |
-| `stack <n> [--merge] [--force] [--method M]` | Show the stack merge plan, or run it with `--merge`. |
+| `merge <n> [--method squash\|merge\|rebase] [--force] [--dry-run]` | Merge a PR. Default method is squash (or the first the trunk allows). A `--method` the trunk does not allow fails before anything is merged, listing the allowed methods. `--dry-run` reports what would happen. |
+| `stack <n> [--merge] [--force] [--method M]` | Show the stack merge plan, or run it with `--merge`. `--method` is checked like `merge`'s. |
 | `rebase-stack <n>` | Rebase a native stack onto its trunk in a temporary checkout and, when its bottom PR is still based on a merged branch, re-link it (unstack, retarget, re-create). Repairs a stack a bypass merge left stuck. |
 | `jobs [--gh OWNER/NAME]` | Recent merge jobs. |
 | `session [--pane ID]` | PRs mentioned in a Tern pane's agent session. |
