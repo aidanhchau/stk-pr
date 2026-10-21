@@ -14,7 +14,7 @@ import { mergedPrs, stepStatuses } from "../jobview";
 import { ConfirmSheet, OutputSheet } from "./confirm";
 import { ImageSheet } from "./image-sheet";
 import { PaletteSheet } from "./palette";
-import { activeRepoKey, mergeMethodOf, useStore, useStoreInstance, type Outcome, type Sheet as SheetState } from "./store";
+import { activeRepoKey, mergeMethodNote, mergeMethodOf, useStore, useStoreInstance, type Outcome, type Sheet as SheetState } from "./store";
 import { G, reducedMotion, useTermSize, useTheme, type GlyphName } from "./theme";
 import { Pill, RowContext, Segmented, SectionLabel, Sheet, Txt, VIM_HELP, useVimNav, type Tone } from "./ui";
 
@@ -236,6 +236,7 @@ function MergeSheet({ n, force }: { n: number; force: boolean }) {
   const meta = useRepoMeta();
   const p = useTheme();
   const method = useStore(mergeMethodOf);
+  const methodNote = useStore(mergeMethodNote);
   const [dry, setDry] = useState<Outcome<MergeDryRun> | null>(null);
   const [working, setWorking] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -359,7 +360,7 @@ function MergeSheet({ n, force }: { n: number; force: boolean }) {
           <Txt tone="error">{err}</Txt>
         </>
       )}
-      <Footer left={`t ${method}${waitable ? " · w merge when ready" : ""}`}>
+      <Footer left={`t ${method}${methodNote ? ` (${methodNote})` : ""}${waitable ? " · w merge when ready" : ""}`}>
         {waitable && <Pill label="Merge when ready" hint="w" variant="secondary" onPress={() => void whenReady()} />}
         <Pill
           label={working ? "Starting…" : force ? "Force merge" : "Merge"}
@@ -517,6 +518,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const meta = useRepoMeta();
   const scroll = useRef<ScrollBoxRenderable>(null);
   const method = useStore(mergeMethodOf);
+  const methodNote = useStore(mergeMethodNote);
   const [force, setForce] = useState(false);
   const [info, setInfo] = useState<Outcome<StackInfo> | null>(null);
   const [planning, setPlanning] = useState(true);
@@ -849,7 +851,7 @@ export function StackSheet({ n, upTo }: { n: number; upTo?: number | "top" }) {
   const title = phase === "done" ? `Stack #${job?.pr ?? topNum} finished` : `${force || forced ? "Force merge stack" : "Merge stack"} #${topNum}`;
   const keys =
     phase === "plan"
-      ? `↑↓ pick · ⏎ merge up to here · f force · t ${method}${canWait ? " · w when ready" : ""}`
+      ? `↑↓ pick · ⏎ merge up to here · f force · t ${method}${methodNote ? ` (${methodNote})` : ""}${canWait ? " · w when ready" : ""}`
       : phase === "failed"
         ? "r plan again"
         : "";

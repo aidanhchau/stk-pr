@@ -98,6 +98,8 @@ export interface RepoRules {
   requiredChecks: string[];
   /** The pull_request rule requires code owner review. */
   codeOwnerReview: boolean;
+  /** Merge methods the pull_request rule(s) allow (their `allowed_merge_methods`, intersected); absent when no rule restricts them. */
+  allowedMergeMethods?: MergeMethod[];
 }
 
 export type MergeMethod = "squash" | "merge" | "rebase";

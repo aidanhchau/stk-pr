@@ -26,6 +26,7 @@ import {
   closeAndReopenPr,
   behindBy,
   branchRules,
+  repoMergeMethods,
   fetchSessionPrs,
   getPr,
   listPrs,
@@ -60,6 +61,7 @@ import {
   type ReviewThread,
 } from "./github";
 import { blockers, chainThrough, executePlan, findForks, isHardBlocker, memberBlockers, planNativeStackMerge, planStackMerge, stackFor, treeOf, type ExecuteDeps, type Fork } from "./stack";
+import { assertMethodAllowed, effectiveMethod, intersectMethods } from "./methods";
 import { resolveRepo } from "./repos";
 import { roleRank, sessionPrRefs } from "./session";
 import {
@@ -262,8 +264,53 @@ export async function rulesFor(exec: Exec, where: string | RepoSlug, branch: str
   return rules;
 }
 
-/** Test hook: forget cached rules. */
-export const clearRulesCache = () => rulesCache.clear();
+const settingsCache = new Map<string, { at: number; methods: Promise<MergeMethod[] | null> }>();
+
+/**
+ * The merge methods allowed into `branch`: the repo settings intersected with the branch rules' pull_request
+ * `allowed_merge_methods`. Repo settings cached like the rules (~10 min); null when they cannot be read (rate limits
+ * surface), in which case callers keep their current behaviour.
+ */
+export async function allowedMethodsFor(exec: Exec, where: string | RepoSlug, branch: string): Promise<MergeMethod[] | null> {
+  const slug = typeof where === "string" ? await repoSlug(exec, where) : where;
+  const key = `${slug.owner}/${slug.name}`.toLowerCase();
+  let hit = settingsCache.get(key);
+  if (!hit || Date.now() - hit.at >= RULES_TTL_MS) {
+    const methods = repoMergeMethods(exec, slug).catch((e) => {
+      if (!(e instanceof StkError) || e.code === "rate-limited") {
+        settingsCache.delete(key);
+        throw e;
+      }
+      return null;
+    });
+    hit = { at: Date.now(), methods };
+    settingsCache.set(key, hit);
+  }
+  const [repoWide, rules] = await Promise.all([hit.methods, rulesFor(exec, slug, branch)]);
+  return intersectMethods(repoWide, rules?.allowedMergeMethods ?? null);
+}
+
+/** Test hook: forget cached rules and repo settings. */
+export const clearRulesCache = () => {
+  rulesCache.clear();
+  settingsCache.clear();
+};
+
+/** Pre-flight for an explicitly chosen method: throws a usage error listing the allowed ones when the trunk rejects it. */
+export async function assertMergeMethod(ctx: Ctx, method: MergeMethod): Promise<void> {
+  const trunk = await trunkFor(ctx.exec, at(ctx));
+  assertMethodAllowed(method, await allowedMethodsFor(ctx.exec, at(ctx), trunk), trunk);
+}
+
+/** The CLI's method: an explicit `--method` is checked up front (fail fast); without one, squash unless the trunk rejects it. */
+export async function resolveMergeMethod(ctx: Ctx, explicit: MergeMethod | undefined): Promise<MergeMethod> {
+  if (explicit) {
+    await assertMergeMethod(ctx, explicit);
+    return explicit;
+  }
+  const trunk = await trunkFor(ctx.exec, at(ctx));
+  return effectiveMethod(undefined, await allowedMethodsFor(ctx.exec, at(ctx), trunk));
+}
 
 export function at(ctx: Ctx): string | RepoSlug {
   const where = ctx.root ?? ctx.slug;

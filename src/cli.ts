@@ -14,6 +14,7 @@ import {
   rebaseStack,
   resolve,
   review,
+  resolveMergeMethod,
   stackInfo,
   stackMerge,
   type BoardPr,
@@ -69,8 +70,8 @@ function parseNumber(s: string | undefined, what: string): number {
   return Number(s);
 }
 
-function parseMethod(s: string | undefined): MergeMethod {
-  if (s === undefined) return "squash";
+function parseMethod(s: string | undefined): MergeMethod | undefined {
+  if (s === undefined) return undefined;
   if (s === "squash" || s === "merge" || s === "rebase") return s;
   return usage(`--method must be squash, merge or rebase (got ${s})`);
 }
@@ -187,7 +188,7 @@ async function cmdResolve(ctx: Ctx, args: string[]): Promise<Result> {
 
 async function cmdMerge(ctx: Ctx, o: Opts, args: string[]): Promise<Result> {
   const n = parseNumber(args[0], "merge");
-  const method = parseMethod(o.method);
+  const method = await resolveMergeMethod(ctx, parseMethod(o.method));
   const force = !!o.force;
 
   if (o["dry-run"]) {
@@ -208,7 +209,7 @@ async function cmdMerge(ctx: Ctx, o: Opts, args: string[]): Promise<Result> {
 
 async function cmdStack(ctx: Ctx, o: Opts, args: string[], deps: CliDeps, json: boolean): Promise<Result> {
   const n = parseNumber(args[0], "stack");
-  const method = parseMethod(o.method);
+  const method = await resolveMergeMethod(ctx, parseMethod(o.method));
   const force = !!o.force;
 
   if (!o.merge) {

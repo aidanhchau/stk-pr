@@ -7,6 +7,7 @@ import { createContext, useContext, useRef, useSyncExternalStore } from "react";
 import { startFix, type FixPr, type FixTarget } from "../agentfix";
 import { exec } from "../exec";
 import { agentPanes } from "../session";
+import { effectiveMethod, fallbackNote, nextMethod } from "../methods";
 import type { SearchLine } from "./ui";
 import type { GhResult } from "../ghproxy";
 import { dedupeItems, toItem, type PaletteItem } from "../fuzzy";
@@ -14,6 +15,8 @@ import { rateLimitReset, repoSlug, type FileDiff } from "../github";
 import { discoverWorkspace, emptyWorkspaceMessage, homeLabel, type WorkspaceRepo } from "../repos";
 import { listWorkspaceBoard, openWorkspaceCtx, type WorkspaceBoard } from "../workspace";
 import {
+  allowedMethodsFor,
+  at,
   listBoard,
   merge,
   openCtx,
@@ -192,6 +195,8 @@ export interface AppState {
   jobs: Record<string, Job>;
   /** Saved preferences (`prefs.json`): per-repo board tab and merge method, notification mode, reduced motion. */
   prefs: Prefs;
+  /** Merge methods the repo's trunk allows (repo settings ∩ ruleset), by lower-cased `owner/name`; absent until read or when unreadable. */
+  mergeMethods: Record<RepoKey, { branch: string; allowed: MergeMethod[] }>;
 }
 
 export const diffKey = (n: number, file: string) => `${n}:${file}`;
@@ -226,12 +231,27 @@ export function activeRepoKey(s: Pick<AppState, "screen" | "boardCursor" | "repo
   return s.repo ? repoKey(s.repo) : null;
 }
 
-export const MERGE_METHODS: readonly MergeMethod[] = ["squash", "merge", "rebase"];
+type MethodState = Pick<AppState, "prefs" | "screen" | "boardCursor" | "repo" | "mergeMethods">;
 
-/** The remembered merge method of the active repo (default squash). */
-export function mergeMethodOf(s: Pick<AppState, "prefs" | "screen" | "boardCursor" | "repo">): MergeMethod {
+const rememberedMethod = (s: MethodState): MergeMethod | undefined => {
   const key = activeRepoKey(s);
-  return (key && s.prefs.repos[key.toLowerCase()]?.mergeMethod) || "squash";
+  return key ? s.prefs.repos[key.toLowerCase()]?.mergeMethod : undefined;
+};
+
+const allowedFor = (s: MethodState) => {
+  const key = activeRepoKey(s);
+  return key ? s.mergeMethods[key.toLowerCase()] : undefined;
+};
+
+/** The merge method to use for the active repo: the remembered one when its trunk allows it, else the first allowed (squash, rebase, merge). */
+export function mergeMethodOf(s: MethodState): MergeMethod {
+  return effectiveMethod(rememberedMethod(s), allowedFor(s)?.allowed);
+}
+
+/** Brief reason the remembered method is not the one in use (e.g. "merge commits not allowed on dev"), else null. */
+export function mergeMethodNote(s: MethodState): string | null {
+  const a = allowedFor(s);
+  return a ? fallbackNote(rememberedMethod(s), a.allowed, a.branch) : null;
 }
 
 /** Every PR the store has loaded (all boards, session, cached details), deduped by repo+number. No network. */
@@ -325,6 +345,7 @@ export class Store {
       busy: null,
       jobs: {},
       prefs: this.prefsFile ? loadPrefs(this.prefsFile) : { repos: {} },
+      mergeMethods: {},
     };
     setReducedMotionPref(this.state.prefs.reducedMotion ?? false);
   }
@@ -667,6 +688,7 @@ export class Store {
         if (r.status === "ready" && !r.refreshing && r.data) {
           this.observeBoard(scope, r.data.prs, r.data.repo, [r.data.repo]);
           this.prefetchBoard(r.data.repo, r.data.prs);
+          void this.loadMergeMethods(r.data.repo, r.data.trunk);
         }
       },
       () => listBoard(ctx, scope),
@@ -739,6 +761,7 @@ export class Store {
           this.watcher.observeDetail(repo, n, r.data);
           this.prefetchStack(repo, r.data);
           this.recheckMergeability(repo, n, r.data);
+          void this.loadMergeMethods(repo, r.data.stack?.trunk ?? r.data.pr.baseRef);
         }
       },
       () => prDetail(ctx, n),
@@ -988,15 +1011,31 @@ export class Store {
     this.updatePrefs({ ...this.state.prefs, reducedMotion: on });
   }
 
+  /**
+   * Read which merge methods `branch` of `repo` allows (cached ~10 min by the service) so `t` and the merge sheets only
+   * offer those. An unreadable set (API error) leaves every method on offer; rate limits wait for the next load.
+   */
+  async loadMergeMethods(repo: RepoSlug, branch: string): Promise<void> {
+    const key = repoKey(repo).toLowerCase();
+    if (this.state.mergeMethods[key]?.branch === branch) return;
+    try {
+      const ctx = await this.ctxFor(repo);
+      const allowed = await allowedMethodsFor(ctx.exec, at(ctx), branch);
+      if (allowed && allowed.length > 0) this.set((s) => ({ mergeMethods: { ...s.mergeMethods, [key]: { branch, allowed } } }));
+    } catch (e) {
+      this.noteRateLimit(e);
+    }
+  }
+
   /** Remember a merge method for a repo. */
   setMergeMethod(repo: RepoSlug, mergeMethod: MergeMethod): void {
     this.updatePrefs(withRepoPrefs(this.state.prefs, repo, { mergeMethod }));
   }
 
-  /** Next merge method (squash, merge, rebase) for the active repo; remembered. */
+  /** Next allowed merge method (squash, merge, rebase) for the active repo; remembered. */
   cycleMergeMethod(): void {
     const repo = this.activeRepo();
-    if (repo) this.setMergeMethod(repo, MERGE_METHODS[(MERGE_METHODS.indexOf(mergeMethodOf(this.state)) + 1) % MERGE_METHODS.length]!);
+    if (repo) this.setMergeMethod(repo, nextMethod(mergeMethodOf(this.state), allowedFor(this.state)?.allowed));
   }
 
   /** The remembered board tab of a repo, when it can be shown (Session needs a session pane). */

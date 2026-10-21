@@ -1218,14 +1218,39 @@ export async function branchRules(exec: Exec, where: Where, branch: string): Pro
   const { owner, name } = await slugOf(exec, where);
   const res = await ghApiRaw(exec, where, [`repos/${owner}/${name}/rules/branches/${encodeURIComponent(branch)}`]);
   if (res.status !== 200) throw apiError(res, `rules of ${branch}`);
-  type Rule = { type?: string; parameters?: { require_code_owner_review?: boolean; required_status_checks?: { context?: string }[] } };
+  type Rule = { type?: string; parameters?: { require_code_owner_review?: boolean; allowed_merge_methods?: string[]; required_status_checks?: { context?: string }[] } };
   const rules = Array.isArray(res.body) ? (res.body as Rule[]) : [];
   const requiredChecks: string[] = [];
   for (const r of rules) {
     if (r.type !== "required_status_checks") continue;
     for (const c of r.parameters?.required_status_checks ?? []) if (c.context && !requiredChecks.includes(c.context)) requiredChecks.push(c.context);
   }
-  return { requiredChecks, codeOwnerReview: rules.some((r) => r.type === "pull_request" && r.parameters?.require_code_owner_review === true) };
+  // every pull_request rule that lists methods narrows the set
+  let allowed: MergeMethod[] | null = null;
+  for (const r of rules) {
+    const list = r.type === "pull_request" ? r.parameters?.allowed_merge_methods : undefined;
+    if (!Array.isArray(list)) continue;
+    const known = list.filter((m): m is MergeMethod => m === "squash" || m === "merge" || m === "rebase");
+    allowed = allowed ? allowed.filter((m) => known.includes(m)) : known;
+  }
+  return {
+    requiredChecks,
+    codeOwnerReview: rules.some((r) => r.type === "pull_request" && r.parameters?.require_code_owner_review === true),
+    ...(allowed ? { allowedMergeMethods: allowed } : {}),
+  };
+}
+
+/** Merge methods the repository settings enable (REST `repos/{o}/{r}`: allow_squash_merge, allow_merge_commit, allow_rebase_merge). */
+export async function repoMergeMethods(exec: Exec, where: Where): Promise<MergeMethod[]> {
+  const { owner, name } = await slugOf(exec, where);
+  const res = await ghApiRaw(exec, where, [`repos/${owner}/${name}`]);
+  if (res.status !== 200) throw apiError(res, `settings of ${owner}/${name}`);
+  const b = (res.body ?? {}) as { allow_squash_merge?: boolean; allow_merge_commit?: boolean; allow_rebase_merge?: boolean };
+  const out: MergeMethod[] = [];
+  if (b.allow_squash_merge !== false) out.push("squash");
+  if (b.allow_merge_commit !== false) out.push("merge");
+  if (b.allow_rebase_merge !== false) out.push("rebase");
+  return out;
 }
 
 /**
