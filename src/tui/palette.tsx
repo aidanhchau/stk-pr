@@ -5,7 +5,7 @@ import { baseCandidates, commandHint, rankBases, rankCommands, rankRepos, rankSe
 import { ageOf, itemKey, parseTarget, rankPrs, type PaletteItem, type Ranked } from "../fuzzy";
 import { commandFacts, commandTarget, confirmBase, ghPreview, runCommand, runGh, trunkOf } from "./commands";
 import { PALETTE_LINE, paletteItems, useStore, useStoreInstance } from "./store";
-import { SectionLabel } from "./ui";
+import { OpenBox, SectionLabel } from "./ui";
 import { G, clip, reducedMotion, useLayout, useTheme, type Palette } from "./theme";
 
 const ROWS = 10;
@@ -330,9 +330,22 @@ export function PaletteSheet() {
       );
     }
     return (
-      <box key={row.kind === "pr" ? itemKey(row.r.item) : row.kind === "cmd" ? `cmd:${row.c.def.id}` : row.kind === "base" ? `base:${row.b.name}` : row.kind === "repo" ? `repo:${row.r.slug ?? "*"}` : row.kind === "session" ? `session:${row.r.id}` : row.kind} height={1} flexShrink={0} backgroundColor={bg} paddingLeft={1} paddingRight={1} marginLeft={-1} marginRight={-1}>
+      <OpenBox
+        key={row.kind === "pr" ? itemKey(row.r.item) : row.kind === "cmd" ? `cmd:${row.c.def.id}` : row.kind === "base" ? `base:${row.b.name}` : row.kind === "repo" ? `repo:${row.r.slug ?? "*"}` : row.kind === "session" ? `session:${row.r.id}` : row.kind}
+        height={1}
+        flexShrink={0}
+        backgroundColor={bg}
+        paddingLeft={1}
+        paddingRight={1}
+        marginLeft={-1}
+        marginRight={-1}
+        onOpen={() => {
+          setCursor(i);
+          activate(i);
+        }}
+      >
         {body}
-      </box>
+      </OpenBox>
     );
   };
 

@@ -242,6 +242,8 @@ export interface RowCtx {
   age: (iso: string) => string;
   /** Draws images in bodies; without it they are one `▣ alt` line. */
   images?: ImageEnv;
+  /** The repo's page (`https://github.com/owner/name`): where a thread's `fix <sha>` link goes. Without it the token is plain. */
+  repoUrl?: string;
 }
 
 const pad = (n: number): Span[] => (n ? [{ text: " ".repeat(n), style: "plain" }] : []);
@@ -304,7 +306,7 @@ function threadHead(th: ReviewThread, level: Level, x: RowCtx, nested: boolean):
 function trailRow(th: ReviewThread, x: RowCtx, ind: number): RL {
   const fix = threadFix(th);
   const spans: Span[] = [{ text: threadTrail(th, x.prAuthor), style: "muted" }];
-  if (fix) spans.push({ text: ` ${SEP} `, style: "muted" }, { text: `fix ${fix.slice(0, 7)}`, style: "link" });
+  if (fix) spans.push({ text: ` ${SEP} `, style: "muted" }, { text: `fix ${fix.slice(0, 7)}`, style: "link", ...(x.repoUrl ? { url: `${x.repoUrl}/commit/${fix}` } : {}) });
   return { t: "text", spans: clipSpans([...pad(ind), ...spans], x.w - NEST) };
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { clipSpans, findingsSpan, findFixRef, isNoise, suggestionTarget, threadFix, threadTrail, layoutBlocks, parseComment, plain, preview, shortAuthor, shortPath, wrapSpans } from "../src/tui/markdown";
+import { clipSpans, findingsSpan, findFixRef, isNoise, linkAt, resolveLink, suggestionTarget, threadFix, threadTrail, layoutBlocks, parseComment, plain, preview, shortAuthor, shortPath, wrapSpans } from "../src/tui/markdown";
 
 const fx = async () =>
   JSON.parse(await Bun.file(new URL("./fixtures/discussion-multi-bot.json", import.meta.url)).text()).data.repository.pullRequest as {
@@ -231,5 +231,73 @@ describe("diff blocks, autofix previews, findings status", () => {
     expect(f(1, 1, 0)).toEqual({ text: "2 findings · 1 open", style: "del" });
     expect(f(0, 0, 2)).toEqual({ text: "outdated", style: "muted" });
     expect(f(0, 0, 0)).toBeNull();
+  });
+});
+
+describe("link spans", () => {
+  const spansOf = (body: string, w = 80) => layoutBlocks(parseComment(body).blocks, w, { details: true });
+  const links = (body: string, w = 80) => spansOf(body, w).flat().filter((s) => s.url).map((s) => [s.text, s.url]);
+
+  test("[text](url) keeps the destination on the link text", () => {
+    expect(links("see [the docs](https://docs.example.com/a?b=1) now")).toEqual([["the docs", "https://docs.example.com/a?b=1"]]);
+    expect(links("[`code`](https://x.test/y) and [rel](/o/r/pull/3)")).toEqual([["code", "https://x.test/y"], ["rel", "/o/r/pull/3"]]);
+    const [line] = spansOf("see [the docs](https://docs.example.com) now");
+    expect(line!.filter((s) => s.style === "link").map((s) => [s.text, s.url])).toEqual([["the docs", "https://docs.example.com"]]);
+    expect(plain(line!)).toBe("see the docs now");
+  });
+
+  test("<url> autolinks and bare URLs link themselves, without the sentence's punctuation", () => {
+    expect(links("go <https://a.test/x> ok")).toEqual([["https://a.test/x", "https://a.test/x"]]);
+    expect(links("See https://a.test/x.")).toEqual([["https://a.test/x", "https://a.test/x"]]);
+    expect(links("(see https://a.test/x), or https://b.test/y?q=1; done!")).toEqual([["https://a.test/x", "https://a.test/x"], ["https://b.test/y?q=1", "https://b.test/y?q=1"]]);
+    expect(links("wiki https://en.wikipedia.org/wiki/Foo_(bar) end")).toEqual([["https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)"]]);
+    expect(plain(spansOf("See https://a.test/x.")[0]!)).toBe("See https://a.test/x.");
+  });
+
+  test("a URL inside code, or the text of a link, is not linked a second time", () => {
+    expect(links("run `curl https://a.test/x` first")).toEqual([]);
+    expect(links("[https://a.test/shown](https://b.test/real)")).toEqual([["https://a.test/shown", "https://b.test/real"]]);
+  });
+
+  test("a wrapped link keeps its url on every line it spans, and neighbouring links stay separate", () => {
+    const wrapped = spansOf("aaa bbb [one two three four five](https://a.test/x) tail [six](https://b.test/y)", 14);
+    expect(wrapped.length).toBeGreaterThan(2);
+    const found = wrapped.flat().filter((s) => s.url);
+    expect(found.map((s) => s.url)).toContain("https://b.test/y");
+    expect(found.filter((s) => s.url === "https://a.test/x").map((s) => s.text).join(" ").replace(/\s+/g, " ")).toBe("one two three four five");
+    expect(wrapped.flat().filter((s) => s.style === "link" && !s.url)).toEqual([]);
+    // a long URL cut across lines still carries the whole url
+    const long = spansOf("https://a.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 20).flat().filter((s) => s.url);
+    expect(long.length).toBeGreaterThan(1);
+    expect(new Set(long.map((s) => s.url))).toEqual(new Set(["https://a.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]));
+  });
+
+  test("clipping keeps the url on the surviving part of a link", () => {
+    const [line] = spansOf("[a long link title](https://a.test/x)");
+    const clipped = clipSpans(line!, 8);
+    expect(plain(clipped)).toBe("a long …");
+    expect(clipped.filter((s) => s.url).map((s) => [s.text, s.url])).toEqual([["a long ", "https://a.test/x"]]);
+  });
+
+  test("linkAt maps a column to the link under it, counting wide characters", () => {
+    const [line] = spansOf("日本 [site](https://a.test) end");
+    // "日本 " is 5 cells, then "site" at cells 5-8
+    expect(linkAt(line!, 4)).toBeUndefined();
+    expect(linkAt(line!, 5)).toBe("https://a.test");
+    expect(linkAt(line!, 8)).toBe("https://a.test");
+    expect(linkAt(line!, 9)).toBeUndefined();
+    expect(linkAt(line!, 99)).toBeUndefined();
+  });
+
+  test("resolveLink: absolute http(s) as is, relative against the repo, nothing else", () => {
+    const base = "https://github.com/o/r/";
+    expect(resolveLink("https://x.test/a", base)).toBe("https://x.test/a");
+    expect(resolveLink("/o/r/pull/3", base)).toBe("https://github.com/o/r/pull/3");
+    expect(resolveLink("../issues/4", base)).toBe("https://github.com/o/issues/4");
+    expect(resolveLink("/o/r/pull/3", null)).toBeNull();
+    expect(resolveLink("#section", base)).toBeNull();
+    expect(resolveLink("javascript:alert(1)", base)).toBeNull();
+    expect(resolveLink("mailto:a@b.test", base)).toBeNull();
+    expect(resolveLink("file:///etc/passwd", base)).toBeNull();
   });
 });

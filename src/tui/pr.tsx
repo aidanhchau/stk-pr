@@ -6,7 +6,7 @@
  * a/x/C review, m/M merge, t method, S stack, w worktree. Keys (diff open): j/k/gg/G/ctrl-* scroll, ]c [c hunks, ]f [f files,
  * s split, za/zo/zc fold, Esc/h close.
  */
-import type { DiffRenderable, ScrollBoxRenderable } from "@opentui/core";
+import type { DiffRenderable, MouseEvent as TuiMouseEvent, ScrollBoxRenderable } from "@opentui/core";
 import { useKeyboard } from "@opentui/react";
 import { Fragment, createContext, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { ReviewThread } from "../github";
@@ -17,7 +17,7 @@ import { activityId, activityLayout, activityMeta, bodyRows, defaultLevel, foldB
 import { imagesVersion, imageState, requestImage, setPrHost, subscribeImages } from "../images";
 import { useImageCell } from "./image-density";
 import { useImageSource } from "./use-image";
-import { layoutBlocks, parseComment, preview, threadFix, type ImageEnv, type Span } from "./markdown";
+import { layoutBlocks, linkAt, parseComment, preview, resolveLink, threadFix, type ImageEnv, type Span } from "./markdown";
 import { jobDockText, type Job } from "../jobs";
 import { diffKey, mergeMethodOf, runningJobOf, useStore, useStoreInstance, type Store } from "./store";
 import { checkSummary, currentChecks, type CurrentCheck } from "./pr-checks";
@@ -26,7 +26,7 @@ import { commandFacts, openStateSheet, runCommand } from "./commands";
 import { stateActions } from "../commands";
 import { CommitCheckRow, CommitRow, commitColumns, useCommitHistory, type HistoryItem } from "./pr-history";
 import { G, SPACE, clip, lerpHex, personColor, useLayout, useTheme, type Palette } from "./theme";
-import { Clipped, ErrorState, Loading, Pill, Rule, Scroll, StatusGlyph, Txt, toneColor, useScreenKeys, useScrollFollow, useTap, useVimNav, useVimSearch, type Chrome, type Tone } from "./ui";
+import { Clipped, ErrorState, Loading, OpenBox, Pill, Rule, Scroll, StatusGlyph, Txt, toneColor, DOUBLE_TAP_MS, useDoubleTap, useScreenKeys, useScrollFollow, useTap, useVimNav, useVimSearch, type Chrome, type Tone } from "./ui";
 
 /** True while the PR page owns Esc / h (an open diff or reply input); app.tsx must not navigate back then. */
 let captures = false;
@@ -306,21 +306,26 @@ function T({ tone = "ink", bold, sel, children }: { tone?: Tone; bold?: boolean;
 
 /**
  * Selectable block: selection = `sel` fill over all its lines, bleeding into the gutter (lives inside <Scroll>). `mark` draws an accent bar in the left bleed.
- * Pure display: the mouse never selects, opens or scrolls here (the cursor moves by key only), so dragging over a block just selects text.
+ * The mouse never selects or scrolls here, and one click does nothing, so dragging over a block just selects text. A double-click on a
+ * one-line row or a header line (`onOpen`) does what Enter does; a text body has no `onOpen`, so it never folds.
  * Single-line rows take the board's hover wash; multi-line blocks (comment bodies) stay plain so the page doesn't flash while the pointer crosses it.
  */
 function Sel({
   selected,
   h,
   mark,
+  onOpen,
   children,
 }: {
   selected: boolean;
   h: number;
   mark?: boolean;
+  /** Double-click: what Enter does here. Only for rows and header lines, never a text body. */
+  onOpen?: () => void;
   children: ReactNode;
 }) {
   const p = useTheme();
+  const tap = useDoubleTap(onOpen);
   const [hover, setHover] = useState(false);
   const hoverable = h === 1;
   return (
@@ -333,6 +338,7 @@ function Sel({
       marginRight={-SPACE.bleed}
       paddingLeft={SPACE.bleed}
       paddingRight={SPACE.bleed}
+      {...(onOpen ? tap : {})}
       onMouseOver={hoverable ? () => setHover(true) : undefined}
       onMouseOut={hoverable ? () => setHover(false) : undefined}
     >
@@ -420,6 +426,8 @@ function pillColor(p: Palette, label: string): string {
 
 /** Active search query; matching text is painted with a wash. */
 const QueryCtx = createContext("");
+/** The repo's page on its GitHub host (trailing slash): where a relative link in a PR text goes. Null: relative links stay dead. */
+const LinkBaseCtx = createContext<string | null>(null);
 
 /** Split spans so every case-insensitive occurrence of `q` becomes its own highlighted span. */
 function markSpans(spans: Span[], q: string): (Span & { hl?: boolean })[] {
@@ -439,13 +447,34 @@ function markSpans(spans: Span[], q: string): (Span & { hl?: boolean })[] {
   return out;
 }
 
+/** The last link opened by a click, to tell a double-click on it from two separate clicks. */
+let lastLink: { owner: object; url: string; x: number; y: number; at: number } | null = null;
+
 /** `accent` colours `author` spans (a person's name); `rail` colours `rail` spans. */
 function SpanText({ spans, tone = "ink", sel, truncate, accent, rail }: { spans: Span[]; tone?: Tone; sel?: boolean; truncate?: boolean; accent?: string; rail?: string }) {
   const p = useTheme();
   const q = useContext(QueryCtx);
+  const base = useContext(LinkBaseCtx);
   const hlBg = lerpHex(p.ground, p.cobalt, 0.3);
+  // <span> takes no mouse handlers: the line is one <text>, so a click is matched to the link under its column. A press off any link is
+  // left to the rows above (and starts a text selection); a press on one is a tap of its own, so it never counts toward a row's double-click.
+  const linkUnder = (e: TuiMouseEvent): string | null => {
+    const left = e.target?.x;
+    const url = left === undefined ? undefined : linkAt(spans, e.x - left);
+    return url ? resolveLink(url, base) : null;
+  };
+  const me = useRef({});
+  const tap = useTap((e) => {
+    const url = linkUnder(e);
+    if (!url) return;
+    // The second click of a double-click on a link is not a second open.
+    const prev = lastLink;
+    lastLink = { owner: me.current, url, x: e.x, y: e.y, at: Date.now() };
+    if (prev && prev.owner === me.current && prev.url === url && Date.now() - prev.at <= DOUBLE_TAP_MS && Math.abs(prev.x - e.x) <= 1 && prev.y === e.y) return;
+    openUrl(url);
+  }, (e) => linkUnder(e) !== null);
   return (
-    <text fg={toneColor(p, tone, sel)} wrapMode="none" truncate={truncate}>
+    <text fg={toneColor(p, tone, sel)} wrapMode="none" truncate={truncate} {...(spans.some((s) => s.url) ? tap : {})}>
       {markSpans(spans, q).map((s, i) => {
         const bg = s.hl ? hlBg : undefined;
         switch (s.style) {
@@ -581,6 +610,7 @@ function RowsView({
   accent,
   reply,
   onInput,
+  onOpen,
 }: {
   rows: RL[];
   selected: boolean;
@@ -589,6 +619,8 @@ function RowsView({
   accent?: string;
   reply?: Reply | null;
   onInput?: (v: string) => void;
+  /** Double-click on the head line (not the body text): what Enter does for the block. */
+  onOpen?: () => void;
 }) {
   const p = useTheme();
   const bodySel = selected && !headOnly;
@@ -606,13 +638,13 @@ function RowsView({
               />
             );
             return headOnly ? (
-              <Sel key={i} selected={selected} h={1}>
+              <Sel key={i} selected={selected} h={1} onOpen={onOpen}>
                 {split}
               </Sel>
             ) : (
-              <box key={i} height={1} flexShrink={0}>
+              <OpenBox key={i} height={1} flexShrink={0} onOpen={onOpen}>
                 {split}
-              </box>
+              </OpenBox>
             );
           }
           case "text":
@@ -711,6 +743,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   const cell = useImageCell();
   // credentials for images go only to github.com and this PR's own GitHub host
   setPrHost(URL.canParse(pr.url) ? new URL(pr.url).hostname : null);
+  const repoUrl = URL.canParse(pr.url) ? `${new URL(pr.url).origin}/${d.repo.owner}/${d.repo.name}` : null;
   const images: ImageEnv = {
     lookup: (src) => imageState(src) ?? { status: "loading" },
     request: requestImage,
@@ -877,9 +910,10 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     endReply();
     if (id && body) void store.reply(n, id, body);
   };
-  const openCur = () => {
-    if (!cur) return;
-    follow.anchorItem();
+  /** What Enter does for `cur`. A double-click passes an item that isn't under the cursor yet (see `openAt`). */
+  const openItem = (cur: Item) => {
+    const at = ys.current.get(cur.id);
+    follow.anchorItem(cur.id === curKey || !at ? undefined : { key: cur.id, y: at.y });
     if (cur.kind === "file") openFile === cur.path ? closeDiff() : loadFile(cur.path);
     else if (cur.kind === "files") setFilesOpen((v) => !v);
     else if (cur.kind === "commits") history.setOpen(!history.open);
@@ -893,7 +927,6 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       if (cur.n === n) store.toast("You are here");
       else {
         // The opened page lands on this same row (its own stack entry) at the same terminal row.
-        const at = ys.current.get(cur.id);
         const sb = scrollRef.current;
         store.openPr(cur.n, d.repo, { key: cur.id, row: (sb?.viewport.screenY ?? 0) + (at?.y ?? 0) - (sb?.scrollTop ?? 0) });
       }
@@ -907,6 +940,15 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     } else if (cur.kind === "bots") setLevel(cur.id, (c) => (c > 0 ? 0 : 1), 0);
     else setLevel(cur.id, (c) => (c === 2 ? 0 : ((c + 1) as Level)), defaultLevel(cur));
   };
+  const openCur = () => cur && openItem(cur);
+  /** Double-click on an item: the cursor goes to it (the one mouse path that moves it), then it opens as Enter would. */
+  const openAt = (id: string) => {
+    const it = items.find((x) => x.id === id);
+    if (!it) return;
+    setCurId(it.id);
+    openItem(it);
+  };
+
   const fold = (how: "a" | "o" | "c") => {
     if (!cur) return;
     follow.anchorItem();
@@ -997,7 +1039,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     push(
       "ds",
       1,
-      <Sel selected={selected} h={1}>
+      <Sel selected={selected} h={1} onOpen={() => openAt("desc")}>
         <Label label="Description" meta={hasDesc && collapsed ? plural(lineCount, "line") : undefined} />
       </Sel>,
     );
@@ -1005,7 +1047,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     if (!hasDesc) push("ds-none", 1, <T tone="muted">No description</T>);
     else {
       const rows = bodyRows(pr.body, descLevel, bodyW, DESC_CAP, undefined, false, images);
-      push("desc", rowsHeight(rows), <RowsView rows={rows} selected={selected} headOnly />, { item: "desc", lead: 2 });
+      push("desc", rowsHeight(rows), <RowsView rows={rows} selected={selected} headOnly onOpen={() => openAt("desc")} />, { item: "desc", lead: 2 });
     }
     gap("ds-end", 2);
   }
@@ -1041,7 +1083,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         id,
         1,
-        <Sel selected={selected} h={1} mark={here}>
+        <Sel selected={selected} h={1} mark={here} onOpen={() => openAt(id)}>
           <Split
             left={
               <box flexDirection="row" height={1}>
@@ -1098,7 +1140,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         `bl${i}`,
         1,
-        <Sel selected={hlKey === "bl-draft"} h={1}>
+        <Sel selected={hlKey === "bl-draft"} h={1} onOpen={() => openAt("bl-draft")}>
           {row(hlKey === "bl-draft")}
         </Sel>,
         { item: "bl-draft", lead: 2 },
@@ -1113,7 +1155,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     push("act", 1, <Label label="Activity" meta={meta} />);
     gap("act-gap");
     if (!activity.length) push("act-none", 1, <T tone="muted">No activity</T>);
-    const blocksOf = activityLayout(actRows, { levelOf, isOpen: foldOpen, replyId: reply?.id ?? null, w: bodyW, prAuthor: pr.author, age, images });
+    const blocksOf = activityLayout(actRows, { levelOf, isOpen: foldOpen, replyId: reply?.id ?? null, w: bodyW, prAuthor: pr.author, age, images, ...(repoUrl ? { repoUrl } : {}) });
     blocksOf.forEach(({ id, item, rows, who }, i) => {
       const selected = hlKey === id;
       const level = item.kind === "bots" ? 0 : levelOf(item);
@@ -1129,6 +1171,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
           accent={who ? personColor(p, who, pr.author) : undefined}
           reply={replying ? reply : null}
           onInput={item.kind === "thread" ? (v) => setReply({ id: item.th.id, value: v }) : undefined}
+          onOpen={() => openAt(id)}
         />,
         { item: id, lead: i === 0 ? 2 : 0 },
       );
@@ -1139,7 +1182,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
   // Historical results are deliberately separate from the current head's required checks.
   push(
     "commits", 1,
-    <Sel selected={hlKey === "commits"} h={1}>
+    <Sel selected={hlKey === "commits"} h={1} onOpen={() => openAt("commits")}>
       <Label label={`${history.open ? G.open : G.closed} Commits`} meta={history.resource?.data ? `${history.commits.length} ${G.sep} historical checks${history.resource.refreshing ? ` ${G.sep} refreshing` : ""}` : "history · load on open"} />
     </Sel>,
     { item: "commits" },
@@ -1154,14 +1197,14 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       if (item.kind === "commits") continue;
       if (item.kind === "commit-retry") {
         push(item.id, 2,
-          <Sel selected={selected} h={2}>
+          <Sel selected={selected} h={2} onOpen={() => openAt(item.id)}>
             <T tone="error">{`Couldn’t load history: ${history.resource?.error ?? "unknown error"}`}</T>
             <T sel={selected}>Retry commit history · Enter</T>
           </Sel>, { item: item.id });
         continue;
       }
       push(item.id, 1,
-        <Sel selected={selected} h={1}>
+        <Sel selected={selected} h={1} onOpen={() => openAt(item.id)}>
           {item.kind === "commit"
             ? <CommitRow commit={item.commit} open={history.isOpen(item.commit.sha)} selected={selected} age={age(item.commit.committedAt)} cols={cols} />
             : <CommitCheckRow check={item.check} selected={selected} />}
@@ -1186,7 +1229,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         id,
         1,
-        <Sel selected={selected} h={1}>
+        <Sel selected={selected} h={1} onOpen={() => openAt(id)}>
           <Split
             left={
               <box flexDirection="row" height={1}>
@@ -1210,7 +1253,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         "passing",
         1,
-        <Sel selected={sel} h={1}>
+        <Sel selected={sel} h={1} onOpen={() => openAt("passing")}>
           <box flexDirection="row" height={1}>
             <CheckGlyph state={skipped.length ? "skipped" : "pass"} />
             <text>{"  "}</text>
@@ -1233,7 +1276,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
     push(
       "fl",
       1,
-      <Sel selected={fsel} h={1}>
+      <Sel selected={fsel} h={1} onOpen={() => openAt("files")}>
         <Label label={`${filesOpen ? G.open : G.closed} Files`} meta={<>{`${files.length} ${G.sep} `}<span fg={p.ok}>{`+${num(add)}`}</span>{" "}<span fg={p.error}>{`${MINUS}${num(del)}`}</span></>} />
       </Sel>,
       { item: "files", lead: 2 },
@@ -1255,7 +1298,7 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       push(
         id,
         1,
-        <Sel selected={selected} h={1}>
+        <Sel selected={selected} h={1} onOpen={() => openAt(id)}>
           <Split
             left={
               <T sel={selected} bold={active}>
@@ -1635,11 +1678,13 @@ function PrBody({ n, d }: { n: number; d: PrDetail }) {
       <box height={1} flexShrink={0} />
       <box flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} flexDirection="column">
         <QueryCtx.Provider value={search.query}>
-          <Scroll scrollRef={scrollRef} onWheel={follow.onWheel}>
-            {blocks.map((b) => (
-              <Fragment key={b.key}>{b.node}</Fragment>
-            ))}
-          </Scroll>
+          <LinkBaseCtx.Provider value={repoUrl && `${repoUrl}/`}>
+            <Scroll scrollRef={scrollRef} onWheel={follow.onWheel}>
+              {blocks.map((b) => (
+                <Fragment key={b.key}>{b.node}</Fragment>
+              ))}
+            </Scroll>
+          </LinkBaseCtx.Provider>
         </QueryCtx.Provider>
       </box>
     </>

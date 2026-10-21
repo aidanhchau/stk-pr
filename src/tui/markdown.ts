@@ -4,7 +4,7 @@
  *   parseComment(body) -> { title, badge, blocks }   strip HTML/comments/badges/footers, structure markdown
  *   layoutBlocks(blocks, width, opts) -> Span[][]    wrapped lines ([] = blank line)
  *
- * Supported: headings, **bold**, `code`, [text](url) -> text, fenced code, dash, star and numbered bullets (hanging indent),
+ * Supported: headings, **bold**, `code`, [text](url) / <url> / bare http(s) URLs -> link spans carrying `url`, fenced code, dash, star and numbered bullets (hanging indent),
  * <details><summary> -> foldable block, tables -> aligned columns, `![P1 Badge](..)` -> P1 pill, an image standing alone on its line -> image block
  * (badges, bot buttons and images inline in prose are dropped).
  */
@@ -14,6 +14,8 @@ export type SpanStyle = "plain" | "bold" | "subhead" | "code" | "pill" | "muted"
 export interface Span {
   text: string;
   style: SpanStyle;
+  /** Where a link span goes (`[text](url)`, `<url>`, a bare URL); as written, so it may be relative. Only link text carries it. */
+  url?: string;
 }
 
 export type Block =
@@ -171,30 +173,62 @@ const INLINE_RE = new RegExp(
     "__([^_]+?)__", // 5 bold
     "\\[([^\\]]*)\\]\\(((?:[^()\\s]|\\([^)]*\\))*)(?:\\s+\"[^\"]*\")?\\)", // 6,7 link
     "(?<![\\w*])\\*([^*\\s](?:[^*]*[^*\\s])?)\\*(?![\\w*])", // 8 em
+    "<(https?:\\/\\/[^\\s<>]+)>", // 9 autolink
   ].join("|"),
   "g",
 );
 
-function push(out: Span[], text: string, style: SpanStyle) {
+function push(out: Span[], text: string, style: SpanStyle, url?: string) {
   if (!text) return;
   const last = out[out.length - 1];
-  if (last && last.style === style && style !== "pill") last.text += text;
-  else out.push({ text, style });
+  if (last && last.style === style && last.url === url && style !== "pill") last.text += text;
+  else out.push(url ? { text, style, url } : { text, style });
 }
 
-function inline(text: string, base: SpanStyle = "plain", out: Span[] = []): Span[] {
+/** A bare http(s) URL in prose: runs to whitespace (or a stashed-marker character). */
+const BARE_URL_RE = /https?:\/\/[^\s<>\uE000-\uF8FF]+/g;
+
+/** Drop the punctuation a sentence puts after a URL: `.,;:!?'"*_`, and a closing bracket the URL never opened. */
+function trimUrl(u: string): string {
+  for (;;) {
+    const c = u[u.length - 1]!;
+    if (/[.,;:!?'"*_\]]/.test(c)) u = u.slice(0, -1);
+    else if (c === ")" && (u.match(/\(/g)?.length ?? 0) < (u.match(/\)/g)?.length ?? 0)) u = u.slice(0, -1);
+    else return u;
+  }
+}
+
+/** Plain text of one inline run; bare URLs in it become link spans. Inside a link (`url` set) the text is taken as written. */
+function pushText(out: Span[], text: string, base: SpanStyle, url?: string) {
+  if (url) return push(out, text, base === "plain" ? "link" : base, url);
+  let at = 0;
+  for (const m of text.matchAll(BARE_URL_RE)) {
+    const found = trimUrl(m[0]);
+    if (!/^https?:\/\/[^/?#]+/.test(found)) continue;
+    push(out, text.slice(at, m.index!), base);
+    push(out, found, base === "plain" ? "link" : base, found);
+    at = m.index! + found.length;
+  }
+  push(out, text.slice(at), base);
+}
+
+function inline(text: string, base: SpanStyle = "plain", out: Span[] = [], url?: string): Span[] {
   let at = 0;
   const re = new RegExp(INLINE_RE.source, "g"); // recursion below needs its own lastIndex
   for (let m: RegExpExecArray | null; (m = re.exec(text)); ) {
-    push(out, text.slice(at, m.index), base);
+    pushText(out, text.slice(at, m.index), base, url);
     at = m.index + m[0].length;
     if (m[1] !== undefined) push(out, m[1], "pill");
-    else if (m[3] !== undefined) push(out, m[3], "code");
-    else if (m[4] !== undefined || m[5] !== undefined) inline(m[4] ?? m[5]!, "bold", out);
-    else if (m[6] !== undefined) inline(m[6], base === "plain" ? "link" : base, out);
-    else if (m[8] !== undefined) inline(m[8], base, out);
+    else if (m[3] !== undefined) push(out, m[3], "code", url);
+    else if (m[4] !== undefined || m[5] !== undefined) inline(m[4] ?? m[5]!, "bold", out, url);
+    else if (m[6] !== undefined) inline(m[6], base, out, m[7] || url);
+    else if (m[8] !== undefined) inline(m[8], base, out, url);
+    else if (m[9] !== undefined) {
+      const u = trimUrl(m[9]);
+      push(out, u, base === "plain" ? "link" : base, u);
+    }
   }
-  push(out, text.slice(at), base);
+  pushText(out, text.slice(at), base, url);
   return out;
 }
 
@@ -411,8 +445,8 @@ export function preview(c: Comment): string {
 
 const width = (s: string): number => (typeof Bun !== "undefined" ? Bun.stringWidth(s) : s.length);
 
-function words(spans: Span[]): { text: string; style: SpanStyle; space: boolean }[] {
-  const out: { text: string; style: SpanStyle; space: boolean }[] = [];
+function words(spans: Span[]): { text: string; style: SpanStyle; space: boolean; url?: string }[] {
+  const out: { text: string; style: SpanStyle; space: boolean; url?: string }[] = [];
   let space = false;
   for (const s of spans) {
     if (s.style === "pill") {
@@ -425,7 +459,7 @@ function words(spans: Span[]): { text: string; style: SpanStyle; space: boolean 
       if (part === "") continue;
       if (part[0] === " ") space = true;
       else {
-        out.push({ text: part, style: s.style, space });
+        out.push(s.url ? { text: part, style: s.style, space, url: s.url } : { text: part, style: s.style, space });
         space = false;
       }
     }
@@ -446,16 +480,16 @@ export function wrapSpans(spans: Span[], w: number, first: string | Span[] = "",
     used = width(hang);
     fresh = true;
   };
-  const add = (text: string, style: SpanStyle, space: boolean) => {
+  const add = (text: string, style: SpanStyle, space: boolean, url?: string) => {
     const sep = !fresh && space ? " " : "";
     const last = line[line.length - 1];
     if (sep) {
-      if (last && last.style === style && style !== "pill") last.text += sep;
+      if (last && last.style === style && last.url === url && style !== "pill") last.text += sep;
       else line.push({ text: sep, style: "plain" });
     }
     const l2 = line[line.length - 1];
-    if (l2 && l2.style === style && style !== "pill") l2.text += text;
-    else line.push({ text, style });
+    if (l2 && l2.style === style && l2.url === url && style !== "pill") l2.text += text;
+    else line.push(url ? { text, style, url } : { text, style });
     used += width(sep) + width(text);
     fresh = false;
   };
@@ -463,7 +497,7 @@ export function wrapSpans(spans: Span[], w: number, first: string | Span[] = "",
     let { text } = wd;
     const gap = !fresh && wd.space ? 1 : 0;
     if (used + gap + width(text) <= w) {
-      add(text, wd.style, wd.space);
+      add(text, wd.style, wd.space, wd.url);
       continue;
     }
     if (!fresh) flush();
@@ -477,11 +511,11 @@ export function wrapSpans(spans: Span[], w: number, first: string | Span[] = "",
         cut += ch.length;
       }
       if (cut === 0) cut = text.codePointAt(0)! > 0xffff ? 2 : 1;
-      add(text.slice(0, cut), wd.style, false);
+      add(text.slice(0, cut), wd.style, false, wd.url);
       text = text.slice(cut);
       flush();
     }
-    if (text) add(text, wd.style, false);
+    if (text) add(text, wd.style, false, wd.url);
   }
   if (!fresh || !lines.length) lines.push(line);
   return lines;
@@ -504,6 +538,27 @@ export function clipSpans(spans: Span[], n: number): Span[] {
   }
   out.push({ text: "…", style: "muted" });
   return out;
+}
+
+/** The link under screen column `col` (0 = the line's left edge) of one laid-out line, or undefined. Wide characters count their cells. */
+export function linkAt(spans: Span[], col: number): string | undefined {
+  let x = 0;
+  for (const s of spans) {
+    const w = width(s.text);
+    if (col < x + w) return s.url;
+    x += w;
+  }
+  return undefined;
+}
+
+/**
+ * Where a link goes in a browser: an absolute http(s) URL as is, a relative one against `base` (the repo's page on its GitHub host,
+ * with a trailing slash). Anything else (`#anchor`, `mailto:`, `javascript:`, a relative link with no base) is not openable: null.
+ */
+export function resolveLink(url: string, base: string | null): string | null {
+  if (url.startsWith("#")) return null;
+  const abs = URL.canParse(url) ? new URL(url) : base && URL.canParse(url, base) ? new URL(url, base) : null;
+  return abs && (abs.protocol === "https:" || abs.protocol === "http:") ? abs.href : null;
 }
 
 /** Prose measure: paragraphs, headings and lists wrap here even in a wider pane (code and tables use the full width). */
