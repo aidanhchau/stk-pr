@@ -1,6 +1,6 @@
 /** Shared primitives for every screen (design v2 §4-§8). Colours come from the Palette; screens never hardcode hex. */
 import { MacOSScrollAccel, RGBA, type InputRenderable, type KeyEvent, type MouseEvent, type ScrollBoxRenderable } from "@opentui/core";
-import { useKeyboard, useRenderer } from "@opentui/react";
+import { useKeyboard, useRenderer, type BoxProps } from "@opentui/react";
 import { createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ComponentType, type ReactNode, type Ref, type RefObject } from "react";
 import { useStore, useStoreInstance, type Toast } from "./store";
 import { GLIDE_FRAME_MS, GLIDE_MIN, anchorRestore, clampTop, glideSteps, scrolloffTarget } from "./scrollmath";
@@ -136,9 +136,10 @@ export interface ScrollFollow {
   /**
    * Call right before a toggle / re-layout that changes content around the cursor (expand, collapse, fold):
    * records the cursor's screen row; after layout scrollTop is restored so that row stays put (no scrolloff jump).
-   * Cleared automatically if no layout change arrives.
+   * Cleared automatically if no layout change arrives. `at` names another item that is about to take the cursor (a double-click on it):
+   * its row is the one kept in place, so the view doesn't move to give it scrolloff.
    */
-  anchorItem(): void;
+  anchorItem(at?: { key: string; y: number }): void;
   /** Scroll the viewport by `dy` lines at once (any glide stops); the cursor is left where it is, even off screen. */
   nudge(dy: number): void;
   /** Pass to `<Scroll onWheel>`. */
@@ -266,9 +267,9 @@ export function useScrollFollow(scrollRef: RefObject<ScrollBoxRenderable | null>
   return {
     scrollTo: (y) => jump(y),
     scrollBy: (dy) => jump((glide.current?.goal ?? scrollRef.current?.scrollTop ?? 0) + dy),
-    anchorItem: () => {
+    anchorItem: (at) => {
       const sb = scrollRef.current;
-      const t = latest.current.target;
+      const t = at ?? latest.current.target;
       if (!sb || !t) return;
       clearTimeout(anchor.current?.timer);
       const timer = setTimeout(() => (anchor.current = null), 150);
@@ -360,8 +361,22 @@ export type PillVariant = "neutral" | "primary" | "secondary" | "danger-quiet";
 
 /** The tap in progress: one at a time, since there is one pointer. */
 let tapping: { x: number; y: number; dragged: boolean; owner: object } | null = null;
+/** The last finished tap of a `useDoubleTap` element, waiting for its second. A drag anywhere forgets it. */
+let lastTap: { owner: object; x: number; y: number; at: number } | null = null;
+/** Root drag handler. A drag that starts on a tap element is a drag once it is past one cell; one that starts anywhere else (body text) is one at once. */
 const cancelTap = (e: MouseEvent) => {
-  if (tapping && (Math.abs(tapping.x - e.x) > 1 || tapping.y !== e.y)) tapping.dragged = true;
+  if (!tapping) lastTap = null;
+  else if (Math.abs(tapping.x - e.x) > 1 || tapping.y !== e.y) {
+    tapping.dragged = true;
+    lastTap = null;
+  }
+};
+/**
+ * Root press handler. A press bubbles up to it after the pressed element's own handler has set `tapping`, so a press that isn't on the
+ * element waiting for its second tap (a plain-text press has no `tapping` at all) starts the count over.
+ */
+const forgetStrayTap = () => {
+  if (lastTap && tapping?.owner !== lastTap.owner) lastTap = null;
 };
 
 /**
@@ -369,23 +384,64 @@ const cancelTap = (e: MouseEvent) => {
  * and no drag went further than that (a drag is a text selection; one cell of jitter is allowed). A tap never moves the cursor or scrolls. OpenTUI sends a drag only to
  * the element under the pointer, so a drag that leaves the button and comes back never reaches it; drags bubble to the root, which cancels
  * the tap once one is more than a cell from the press (set at press), whichever element it passes over, and the cancel sticks.
+ * `onTap` gets the release event. With `hit`, only a press it accepts starts a tap, and that press goes no further up (so a link inside a
+ * double-tap row is not also a tap of the row); any other press is left to the elements above.
  */
-export function useTap(onTap?: () => void) {
+export function useTap(onTap?: (e: MouseEvent) => void, hit?: (e: MouseEvent) => boolean, waiting?: object) {
   const renderer = useRenderer();
-  const me = useRef({});
+  const own = useRef({});
+  const me = waiting ?? own.current;
   return {
     onMouseDown: (e: MouseEvent) => {
-      tapping = { x: e.x, y: e.y, dragged: false, owner: me.current };
       renderer.root.onMouseDrag = cancelTap;
+      renderer.root.onMouseDown = forgetStrayTap;
+      // A link press stops propagation below, so the root never sees it: forget another element's pending double-tap here.
+      if (lastTap && lastTap.owner !== me) lastTap = null;
+      if (hit) {
+        if (!hit(e)) {
+          tapping = null;
+          return;
+        }
+        e.stopPropagation();
+      }
+      tapping = { x: e.x, y: e.y, dragged: false, owner: me };
     },
     onMouseUp: (e: MouseEvent) => {
       const d = tapping;
-      if (!d || d.owner !== me.current) return;
+      if (!d || d.owner !== me) return;
       tapping = null;
       if (d.dragged || Math.abs(d.x - e.x) > 1 || d.y !== e.y) return;
-      onTap?.();
+      onTap?.(e);
     },
   };
+}
+
+/** Longest gap between the two taps of a double-click. */
+export const DOUBLE_TAP_MS = 400;
+
+/**
+ * Mouse handlers for an element that opens on a double-click and does nothing on a single one. Each tap follows `useTap` (no drag
+ * past one cell); the second must land on the same element, within `DOUBLE_TAP_MS` and one cell of the first. It fires on the second
+ * release, then clears the word selection the second press made. A tap on another element, or any drag, starts the count over.
+ */
+export function useDoubleTap(onOpen?: () => void) {
+  const renderer = useRenderer();
+  const me = useRef({});
+  return useTap((e) => {
+    const prev = lastTap;
+    const now = Date.now();
+    if (prev && prev.owner === me.current && now - prev.at <= DOUBLE_TAP_MS && Math.abs(prev.x - e.x) <= 1 && prev.y === e.y) {
+      lastTap = null;
+      if (renderer.getSelection()) renderer.clearSelection();
+      onOpen?.();
+    } else lastTap = { owner: me.current, x: e.x, y: e.y, at: now };
+  }, undefined, me.current);
+}
+
+/** A `<box>` that runs `onOpen` on a double-click (see `useDoubleTap`). */
+export function OpenBox({ onOpen, ...box }: BoxProps & { onOpen?: () => void }) {
+  const tap = useDoubleTap(onOpen);
+  return <box {...box} {...(onOpen ? tap : {})} />;
 }
 
 /**
@@ -513,6 +569,8 @@ export interface RowProps {
   right?: ReactNode;
   /** Draw the hairline row after this row. */
   hairline?: boolean;
+  /** Double-click: what Enter does for this row. A single click does nothing. */
+  onOpen?: () => void;
 }
 
 /**
@@ -520,8 +578,9 @@ export interface RowProps {
  * into the gutter (needs to be inside `<Scroll>`). Hover = wash. Descendant `<Txt tone="muted">` automatically
  * switches to mutedOnSel while selected.
  */
-export function Row({ selected, depth = 0, glyph, title, titleTone, truncate, titleRight, meta, right, hairline }: RowProps) {
+export function Row({ selected, depth = 0, glyph, title, titleTone, truncate, titleRight, meta, right, hairline, onOpen }: RowProps) {
   const p = useTheme();
+  const tap = useDoubleTap(onOpen);
   const [hover, setHover] = useState(false);
   const bg = selected ? p.sel : hover ? p.wash : p.ground;
   const prefix = depth > 0 ? `${" ".repeat(3 * depth - 2)}${G.child} ` : "";
@@ -536,6 +595,7 @@ export function Row({ selected, depth = 0, glyph, title, titleTone, truncate, ti
           marginRight={-SPACE.bleed}
           paddingLeft={SPACE.bleed}
           paddingRight={SPACE.bleed}
+          {...(onOpen ? tap : {})}
           onMouseOver={() => setHover(true)}
           onMouseOut={() => setHover(false)}
         >

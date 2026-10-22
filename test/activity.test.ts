@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ReviewThread } from "../src/github";
 import type { ConversationEntry } from "../src/types";
-import { activityId, activityLayout, activityMeta, defaultLevel, foldBots, groupActivity, parseSeverity, type ActivityItem, type ActivityRow, type Level, type RL } from "../src/tui/activity";
+import { threadRows, activityId, activityLayout, activityMeta, defaultLevel, foldBots, groupActivity, parseSeverity, type ActivityItem, type ActivityRow, type Level, type RL } from "../src/tui/activity";
 import { parseComment } from "../src/tui/markdown";
 
 const t0 = Date.parse("2026-01-01T00:00:00Z");
@@ -203,5 +203,28 @@ describe("foldBots", () => {
       expect(text(q.rows[0]!).startsWith("  ▸ ")).toBe(true);
       expect(text(q.rows[0]!).length).toBeLessThanOrEqual(x.w);
     }
+  });
+});
+
+describe("thread trail fix link", () => {
+  const fixed = thread("t", 1, "**Bug** here", {
+    comments: [
+      { author: "devin[bot]", isBot: true, body: "**Bug** here", createdAt: iso(1), url: "https://x/t", mine: false },
+      { author: "bob", isBot: false, body: "Fixed in abc1234def", createdAt: iso(2), url: "https://x/t2", mine: false },
+    ],
+  });
+  const ctx = { w: 80, prAuthor: "alice", age: () => "1h" };
+  const fixSpan = (x: typeof ctx & { repoUrl?: string }) => {
+    const rows = threadRows(fixed, 1, x, { nested: false, replying: false });
+    const last = rows[rows.length - 1]!;
+    return last.t === "text" ? last.spans.find((sp) => sp.style === "link") : undefined;
+  };
+
+  test("the `fix <sha>` token links to the commit when the repo is known", () => {
+    expect(fixSpan({ ...ctx, repoUrl: "https://github.com/o/r" })).toMatchObject({ text: "fix abc1234", url: "https://github.com/o/r/commit/abc1234def" });
+  });
+
+  test("without a repo the token carries no url", () => {
+    expect(fixSpan(ctx)?.url).toBeUndefined();
   });
 });

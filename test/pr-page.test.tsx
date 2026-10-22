@@ -1,4 +1,7 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { TestRendererSetup } from "@opentui/core/testing";
 import { testRender } from "@opentui/react/test-utils";
 import { slugCtx, type Ctx, type PrDetail } from "../src/service";
@@ -6,13 +9,34 @@ import type { ConversationEntry, Exec, PrCommit } from "../src/types";
 import { Pr } from "../src/tui/pr";
 import { Store, StoreContext, useStore, type AppState } from "../src/tui/store";
 import { ThemeContext, dark } from "../src/tui/theme";
-import { DockInput } from "../src/tui/ui";
+import { DOUBLE_TAP_MS, DockInput } from "../src/tui/ui";
 
 let setup: TestRendererSetup | null = null;
 afterEach(() => {
   setup?.renderer.destroy();
   setup = null;
+  delete process.env.STK_OPEN;
 });
+
+/** Point `openUrl` at a script that records the URLs it is given, so a test can see what the page tried to open. */
+function fakeOpener() {
+  const dir = mkdtempSync(join(tmpdir(), "stk-open-"));
+  const log = join(dir, "opened");
+  const bin = join(dir, "open.sh");
+  writeFileSync(bin, `#!/bin/sh\necho "$1" >> "${log}"\n`);
+  chmodSync(bin, 0o755);
+  process.env.STK_OPEN = bin;
+  /** The URLs opened so far: waits for `n` of them (the opener is a child process), or a moment to be sure none came. */
+  return async (n = 0) => {
+    for (let i = 0; i < 60 && (n ? readLog().length < n : i < 10); i++) await Bun.sleep(50);
+    return readLog();
+  };
+  function readLog() {
+    return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
+  }
+}
+/** Wait out the double-click window, so the next click starts a new pair. */
+const pause = () => Bun.sleep(DOUBLE_TAP_MS + 80);
 
 const repo = { owner: "o", name: "r" };
 const at = (min: number) => new Date(Date.parse("2026-01-01T00:00:00Z") + min * 60_000).toISOString();
@@ -153,12 +177,14 @@ test("in a comment body, a drag selects text and a plain click does nothing", as
   expect(f.join("\n")).toBe(before);
 });
 
-test("mouse presses on another block, a fold or a header never move the cursor", async () => {
+test("a single click on another block, a fold or a header does nothing, even repeated slowly", async () => {
   const { s, frame } = await renderPr();
   let f = await frame();
   const fold = rowOf(f, "2 bot comments");
   await s.mockMouse.click(4, fold);
+  await pause();
   await s.mockMouse.click(4, fold);
+  await pause();
   await s.mockMouse.click(6, rowOf(f, "bob one"));
   f = await frame();
   // The fold stayed closed and the cursor is still on alice's comment: Enter expands it in full.
@@ -166,6 +192,260 @@ test("mouse presses on another block, a fold or a header never move the cursor",
   s.mockInput.pressEnter();
   f = await frame();
   expect(capped(f)).toBe(false);
+});
+
+test("a double-click on a fold opens it and puts the cursor there, so Enter then closes it", async () => {
+  const { s, frame } = await renderPr();
+  let f = await frame();
+  const fold = rowOf(f, "2 bot comments");
+  await s.mockMouse.click(4, fold);
+  await s.mockMouse.click(4, fold);
+  await Bun.sleep(300);
+  f = await frame();
+  expect(f[rowOf(f, "2 bot comments")]!.trimStart().startsWith("▾")).toBe(true);
+  expect(capped(f)).toBe(true);
+  s.mockInput.pressEnter();
+  await Bun.sleep(300);
+  f = await frame();
+  expect(f[rowOf(f, "2 bot comments")]!.trimStart().startsWith("▸")).toBe(true);
+});
+
+test("a double-click on a comment's header expands it; on its body text nothing folds", async () => {
+  const { s, frame } = await renderPr();
+  let f = await frame();
+  const before = f.join("\n");
+  const body = rowOf(f, "line 3 of the review");
+  await s.mockMouse.click(6, body);
+  await s.mockMouse.click(6, body);
+  f = await frame();
+  expect(capped(f)).toBe(true);
+  expect(f.join("\n")).toBe(before);
+  // bob's body is short and uncapped; its header (collapsed to a line or not) is the only place a double-click acts
+  const head = rowOf(f, "▾ alice");
+  await s.mockMouse.click(4, head);
+  await s.mockMouse.click(4, head);
+  f = await frame();
+  expect(capped(f)).toBe(false);
+});
+
+test("two clicks too far apart, on different rows, or with a drag between them do not open", async () => {
+  const { s, frame } = await renderPr();
+  let f = await frame();
+  const fold = rowOf(f, "2 bot comments");
+  const bob = rowOf(f, "bob one") - 1;
+  // too slow
+  await s.mockMouse.click(4, fold);
+  await pause();
+  await s.mockMouse.click(4, fold);
+  // two rows
+  await pause();
+  await s.mockMouse.click(4, fold);
+  await s.mockMouse.click(4, bob);
+  // a drag between them
+  await pause();
+  await s.mockMouse.click(4, fold);
+  await s.mockMouse.drag(4, fold + 1, 30, fold + 2);
+  await s.mockMouse.click(4, fold);
+  // the second tap is a drag
+  await pause();
+  await s.mockMouse.click(4, fold);
+  await s.mockMouse.drag(4, fold, 30, fold);
+  f = await frame();
+  expect(f[fold]!.trimStart().startsWith("▸")).toBe(true);
+});
+
+test("a drag that starts on body text, or a press on plain text, between two clicks on a row starts the double-click over", async () => {
+  const { s, frame } = await renderPr();
+  const f = await frame();
+  const fold = rowOf(f, "2 bot comments");
+  const body = rowOf(f, "line 3 of the review");
+  // A frozen clock, so the gestures below are always inside the double-click window however long the mock mouse takes.
+  const real = Date.now();
+  let clock = real;
+  const spy = spyOn(Date, "now").mockImplementation(() => clock);
+  try {
+    clock += 1000;
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.pressDown(4, body);
+    await s.mockMouse.emitMouseEvent("drag", 30, body + 1);
+    await s.mockMouse.release(30, body + 1);
+    await s.mockMouse.click(4, fold);
+    let after = await frame();
+    expect(after[fold]!.trimStart().startsWith("▸")).toBe(true);
+    clock += 1000;
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.click(6, body);
+    await s.mockMouse.click(4, fold);
+    after = await frame();
+    expect(after[fold]!.trimStart().startsWith("▸")).toBe(true);
+    // control: the same two clicks with nothing between them do open it
+    clock += 1000;
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.click(4, fold);
+    await Bun.sleep(300);
+    const opened = await frame();
+    expect(opened[rowOf(opened, "2 bot comments")]!.trimStart().startsWith("▾")).toBe(true);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+const linked: PrDetail = {
+  ...detail,
+  conversation: [
+    ...detail.conversation.slice(0, 3),
+    comment("h2", 4, "bob", false, "bob one see [the guide](https://guide.test/x?y=1) or [rel](/o/r/pull/3)\n\nbob two https://bare.test/p.\n\n| Check | Result |\n| --- | --- |\n| lint | [log](https://ci.test/lint) |"),
+    detail.conversation[4]!,
+  ],
+};
+
+test("a click on a link in a comment opens it, and moves nothing; a click beside it does nothing", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, linked);
+  let f = await frame();
+  const before = f.join("\n");
+  const y = rowOf(f, "bob one see");
+  const col = (text: string, row = y) => f[row]!.indexOf(text);
+  await s.mockMouse.click(col("the guide") + 3, y);
+  expect(await opened(1)).toEqual(["https://guide.test/x?y=1"]);
+  await s.mockMouse.click(col("rel") + 1, y);
+  const bare = rowOf(f, "bob two");
+  await s.mockMouse.click(col("https://bare.test/p") + 5, bare);
+  // beside the link, on plain words, and on the very cell after the URL's trailing "."
+  await s.mockMouse.click(col("bob one") + 2, y);
+  await s.mockMouse.click(col("https://bare.test/p.") + "https://bare.test/p.".length - 1, bare);
+  expect(await opened(3)).toEqual(["https://guide.test/x?y=1", "https://x/o/r/pull/3", "https://bare.test/p"]);
+  f = await frame();
+  expect(f.join("\n")).toBe(before);
+  // the cursor never left alice's comment: Enter expands her comment in full
+  expect(capped(f)).toBe(true);
+  s.mockInput.pressEnter();
+  f = await frame();
+  expect(capped(f)).toBe(false);
+});
+
+test("a link inside a table cell opens on a click", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, linked);
+  const f = await frame();
+  const y = rowOf(f, "lint");
+  expect(y).toBeGreaterThanOrEqual(0);
+  const x = f[y]!.indexOf("log");
+  await s.mockMouse.click(x + 1, y);
+  await s.mockMouse.click(f[y]!.indexOf("lint"), y);
+  expect(await opened(1)).toEqual(["https://ci.test/lint"]);
+});
+
+test("a link click between two clicks on a row starts the double-click over", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, linked);
+  const f = await frame();
+  const fold = rowOf(f, "2 bot comments");
+  const y = rowOf(f, "bob one see");
+  expect(fold).toBeGreaterThanOrEqual(0);
+  // A frozen clock, so the three clicks are always inside the double-click window however long the mock mouse takes.
+  let clock = Date.now() + 1000;
+  const spy = spyOn(Date, "now").mockImplementation(() => clock);
+  try {
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.click(f[y]!.indexOf("the guide") + 3, y);
+    await s.mockMouse.click(4, fold);
+    expect(await opened(1)).toEqual(["https://guide.test/x?y=1"]);
+    const after = await frame();
+    expect(after[fold]!.trimStart().startsWith("▸")).toBe(true);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("dragging across a link selects text and opens nothing", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, linked);
+  let f = await frame();
+  const y = rowOf(f, "bob one see");
+  const x = f[y]!.indexOf("the guide");
+  // press on the link, release past it
+  await s.mockMouse.drag(x + 1, y, x + 20, y);
+  // press before it, release on it
+  await s.mockMouse.drag(x - 6, y, x + 3, y);
+  // press on it, leave and come back
+  await s.mockMouse.pressDown(x + 3, y);
+  await s.mockMouse.emitMouseEvent("drag", x + 30, y);
+  await s.mockMouse.emitMouseEvent("drag", x + 3, y);
+  await s.mockMouse.release(x + 3, y);
+  f = await frame();
+  expect(await opened()).toEqual([]);
+  await s.mockMouse.drag(x - 6, y, x + 12, y);
+  expect(s.renderer.getSelection()?.getSelectedText()).toContain("the guide");
+  // a plain click right after still opens it
+  await s.mockMouse.click(x + 3, y);
+  expect(await opened(1)).toEqual(["https://guide.test/x?y=1"]);
+});
+
+test("a double-click on a link opens it once and folds nothing", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, linked);
+  let f = await frame();
+  const before = f.join("\n");
+  const y = rowOf(f, "bob one see");
+  const x = f[y]!.indexOf("the guide") + 3;
+  await s.mockMouse.click(x, y);
+  await s.mockMouse.click(x, y);
+  expect(await opened(1)).toEqual(["https://guide.test/x?y=1"]);
+  f = await frame();
+  expect(f.join("\n")).toBe(before);
+  // a later, separate click opens it again
+  await pause();
+  await s.mockMouse.click(x, y);
+  expect(await opened(2)).toEqual(["https://guide.test/x?y=1", "https://guide.test/x?y=1"]);
+});
+
+const checkDetail: PrDetail = { ...detail, conversation: [], threads: [], pr: { ...detail.pr, checks: [{ name: "Lint", state: "fail", url: "https://ci.test/lint" }, { name: "Unit", state: "fail", url: "https://ci.test/unit" }] } };
+
+test("a check row opens its URL on a double-click only, and the double-click takes the cursor there", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, checkDetail);
+  let f = await frame();
+  const lint = rowOf(f, "Lint");
+  const unit = rowOf(f, "Unit");
+  expect(lint).toBeGreaterThanOrEqual(0);
+  await s.mockMouse.click(6, lint);
+  await pause();
+  await s.mockMouse.click(6, lint);
+  expect(await opened()).toEqual([]);
+  await pause();
+  await s.mockMouse.click(6, lint);
+  await s.mockMouse.click(6, lint);
+  expect(await opened(1)).toEqual(["https://ci.test/lint"]);
+  // a double-click on the other check opens that one, and Enter then repeats it (the cursor is there now)
+  await pause();
+  await s.mockMouse.click(6, unit);
+  await s.mockMouse.click(6, unit);
+  expect(await opened(2)).toEqual(["https://ci.test/lint", "https://ci.test/unit"]);
+  s.mockInput.pressEnter();
+  expect(await opened(3)).toEqual(["https://ci.test/lint", "https://ci.test/unit", "https://ci.test/unit"]);
+  f = await frame();
+});
+
+test("single clicks, slow pairs, a pair across rows and a click-then-drag never open a check", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, checkDetail);
+  const f = await frame();
+  const lint = rowOf(f, "Lint");
+  const unit = rowOf(f, "Unit");
+  await s.mockMouse.click(6, lint);
+  await pause();
+  await s.mockMouse.click(6, lint);
+  await pause();
+  await s.mockMouse.click(6, lint);
+  await s.mockMouse.click(6, unit);
+  await pause();
+  await s.mockMouse.click(6, lint);
+  await s.mockMouse.drag(6, lint, 40, lint);
+  await pause();
+  await s.mockMouse.drag(6, lint, 40, lint);
+  await s.mockMouse.click(6, lint);
+  expect(await opened()).toEqual([]);
 });
 
 test("dragging to the edge of the page while selecting does not scroll it or move the cursor", async () => {
@@ -526,10 +806,36 @@ test("history errors offer a focusable Enter retry rather than a dead fold", asy
   expect(rowOf(f, "Preserve results before rebase")).toBeGreaterThanOrEqual(0);
 });
 
-test("clicking the commits header or a commit does not expand it", async () => {
+test("the commits header and its rows open on a double-click, not on a single click", async () => {
+  const opened = fakeOpener();
   const { s, frame } = await renderPr(40, quietDetail, [historyCommit]);
   let f = await frame();
   const header = rowOf(f, "COMMITS");
+  await s.mockMouse.click(4, header);
+  await pause();
+  await s.mockMouse.click(4, header);
+  f = await frame();
+  expect(rowOf(f, "Preserve results before rebase")).toBe(-1);
+  await pause();
+  await s.mockMouse.click(4, header);
+  await s.mockMouse.click(4, header);
+  f = await frame();
+  const commit = rowOf(f, "Preserve results before rebase");
+  expect(commit).toBeGreaterThanOrEqual(0);
+  // a double-click on a commit (the cursor is on the header, not on it) opens its checks
+  await pause();
+  await s.mockMouse.click(4, commit);
+  await s.mockMouse.click(4, commit);
+  f = await frame();
+  const check = rowOf(f, "Depot PR tests / test");
+  expect(check).toBeGreaterThanOrEqual(0);
+  // and a double-click on a check row opens its logs
+  await pause();
+  await s.mockMouse.click(6, check);
+  await s.mockMouse.click(6, check);
+  expect(await opened(1)).toEqual(["https://x/log/1"]);
+  // the header closes the section again
+  await pause();
   await s.mockMouse.click(4, header);
   await s.mockMouse.click(4, header);
   f = await frame();

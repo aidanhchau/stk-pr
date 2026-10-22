@@ -16,7 +16,7 @@ import { ImageSheet } from "./image-sheet";
 import { PaletteSheet } from "./palette";
 import { activeRepoKey, mergeMethodNote, mergeMethodOf, useStore, useStoreInstance, type Outcome, type Sheet as SheetState } from "./store";
 import { G, reducedMotion, useTermSize, useTheme, type GlyphName } from "./theme";
-import { Pill, RowContext, Segmented, SectionLabel, Sheet, Txt, VIM_HELP, useVimNav, type Tone } from "./ui";
+import { OpenBox, Pill, RowContext, Segmented, SectionLabel, Sheet, Txt, VIM_HELP, useVimNav, type Tone } from "./ui";
 
 type Active = Exclude<SheetState, null>;
 
@@ -1133,7 +1133,7 @@ function StateSheet() {
       {actions.map((a, i) => {
         const c = COMMANDS.find((x) => x.id === a.id)!;
         return (
-          <box key={a.id} flexShrink={0}>
+          <OpenBox key={a.id} flexShrink={0} onOpen={() => run(a)}>
             <Line selected={i === at}>
               <box width={18} flexShrink={0}>
                 <Txt bold>{a.label}</Txt>
@@ -1147,7 +1147,7 @@ function StateSheet() {
                 <Txt tone="muted">{a.key}</Txt>
               </box>
             </Line>
-          </box>
+          </OpenBox>
         );
       })}
       <Footer left="j/k move" cancel="Close" />

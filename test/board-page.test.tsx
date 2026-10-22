@@ -5,7 +5,7 @@ import type { BoardPr, PrDetail, RepoSlug } from "../src/service";
 import { Board } from "../src/tui/board";
 import { Store, StoreContext, useStore, type AppState } from "../src/tui/store";
 import { ThemeContext, dark, reducedMotion, setReducedMotionPref } from "../src/tui/theme";
-import { Dock, DockCommands, DockCount, DockInput, DockModeHint, Page } from "../src/tui/ui";
+import { DOUBLE_TAP_MS, Dock, DockCommands, DockCount, DockInput, DockModeHint, Page } from "../src/tui/ui";
 
 let setup: TestRendererSetup | null = null;
 let cleanup: (() => void) | null = null;
@@ -160,21 +160,56 @@ test("keyboard search filters a large board to a distant PR and Enter opens its 
   expect(store.getState().boardCursor).toBe(keyOf(target));
 });
 
-test("clicking a row neither selects nor opens it", async () => {
+const pause = () => Bun.sleep(DOUBLE_TAP_MS + 80);
+
+test("a single click on a row neither selects nor opens it, however it is repeated", async () => {
   const { s, store, frame, prs } = await renderBoard();
   const target = prs[4]!;
+  const other = prs[5]!;
   let f = await frame();
   const y = rowOf(f, target.title);
+  const y2 = rowOf(f, other.title);
   expect(y).toBeGreaterThanOrEqual(0);
   const cursor = store.getState().boardCursor;
 
   await s.mockMouse.click(8, y);
+  // too slow to be a double-click
+  await pause();
+  await s.mockMouse.click(8, y);
+  // two different rows
+  await pause();
+  await s.mockMouse.click(8, y);
+  await s.mockMouse.click(8, y2);
+  // a click, then a drag where the second click would be
+  await pause();
   await s.mockMouse.click(8, y);
   await s.mockMouse.drag(8, y, 30, y + 3);
+  await pause();
+  await s.mockMouse.drag(8, y, 30, y + 3);
+  await s.mockMouse.click(8, y);
+  // a drag between two clicks forgets the first
+  await pause();
+  await s.mockMouse.click(8, y);
+  await s.mockMouse.drag(8, y2, 30, y2 + 3);
+  await s.mockMouse.click(8, y);
   f = await frame();
   expect(store.getState().screen.kind).toBe("board");
   expect(store.getState().boardCursor).toBe(cursor);
   expect(rowOf(f, target.title)).toBe(y);
+});
+
+test("a double-click on a row opens that PR, not the one under the cursor", async () => {
+  const { s, store, frame, prs } = await renderBoard();
+  const target = prs[4]!;
+  const f = await frame();
+  const y = rowOf(f, target.title);
+  expect(y).toBeGreaterThanOrEqual(0);
+
+  await s.mockMouse.click(8, y);
+  await s.mockMouse.click(9, y);
+  await frame();
+  expect(store.getState().screen).toMatchObject({ kind: "pr", n: target.number, repo: target.repo, scope: "mine" });
+  expect(store.getState().boardCursor).toBe(keyOf(target));
 });
 
 test("refresh updates a selected row's title, readiness and blocker without moving selection", async () => {

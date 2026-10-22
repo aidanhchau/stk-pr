@@ -4,7 +4,7 @@
  * groups Open / Merged / Closed and tags rows with their repo when more than one is involved.
  */
 import type { ScrollBoxRenderable } from "@opentui/core";
-import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { prReadiness, type BoardPr, type RepoSlug, type SessionPr } from "../service";
 import type { Blocker } from "../types";
 import { openInBrowser } from "./browser";
@@ -25,6 +25,7 @@ import {
   StatusGlyph,
   Txt,
   toneColor,
+  useDoubleTap,
   useScreenKeys,
   useScrollFollow,
   useVimNav,
@@ -436,10 +437,13 @@ interface BoardRowProps {
   showRepo: boolean;
   hasWt: boolean;
   compact: boolean;
+  /** Double-click: put the cursor on the row, then do what Enter does (open the PR, or toggle a fold). */
+  onActivate(it: Item): void;
 }
 
-const BoardRow = memo(function BoardRow({ it, selected, busy, titleW, wide, narrow, now, mode, showRepo, hasWt, compact }: BoardRowProps) {
+const BoardRow = memo(function BoardRow({ it, selected, busy, titleW, wide, narrow, now, mode, showRepo, hasWt, compact, onActivate }: BoardRowProps) {
   const p = useTheme();
+  const tap = useDoubleTap(() => onActivate(it));
   if (it.fold) {
     const f = it.fold;
     const parts = [f.merged ? `${f.merged} merged` : "", f.closed ? `${f.closed} closed` : ""].filter(Boolean);
@@ -452,6 +456,7 @@ const BoardRow = memo(function BoardRow({ it, selected, busy, titleW, wide, narr
         marginRight={-SPACE.bleed}
         paddingLeft={SPACE.bleed}
         paddingRight={SPACE.bleed}
+        {...tap}
       >
         <text fg={toneColor(p, "muted", selected)} wrapMode="none" truncate>{`${f.open ? "▾" : "▸"} ${parts.join(` ${G.sep} `)}`}</text>
       </box>
@@ -512,6 +517,7 @@ const BoardRow = memo(function BoardRow({ it, selected, busy, titleW, wide, narr
       meta={meta}
       right={right}
       hairline={!compact && !it.last}
+      onOpen={() => onActivate(it)}
     />
   );
 });
@@ -665,6 +671,19 @@ export function Board({ scope }: { scope: TuiScope }) {
     return job ? (job.kind === "merge-when-ready" && job.waiting !== undefined ? "auto-merge" : "merging") : null;
   };
   // Rows are memoized and get stable callbacks, so a cursor move re-renders the two rows whose selection changed, not the whole board.
+  const openRef = useRef(open);
+  openRef.current = open;
+  const followRef = useRef(follow);
+  followRef.current = follow;
+  const activate = useCallback(
+    (it: Item) => {
+      // The one mouse path that moves the cursor: the view stays where it is instead of following the row.
+      followRef.current.anchorItem({ key: it.key, y: it.y });
+      store.setBoardCursor(it.key);
+      openRef.current(it);
+    },
+    [store],
+  );
   const renderRow = (it: Item) => (
     <BoardRow
       key={it.key}
@@ -679,6 +698,7 @@ export function Board({ scope }: { scope: TuiScope }) {
       showRepo={showRepo}
       hasWt={hasWt}
       compact={compact}
+      onActivate={activate}
     />
   );
 
