@@ -23,7 +23,8 @@ export type Block =
   | { t: "code"; text: string; diff?: boolean }
   | { t: "suggestion"; lines: string[] }
   /** `images[row][col]`: the images of each cell (same shape as `rows`); only present when some cell has one. */
-  | { t: "table"; rows: string[][]; images?: ImageRef[][][] }
+  /** `links[row][col]`: a cell's spans, only present when some cell holds a link (`rows` is their plain text). */
+  | { t: "table"; rows: string[][]; links?: Span[][][]; images?: ImageRef[][][] }
   | { t: "details"; summary: Span[]; body: Block[] }
   | { t: "image"; src: string; alt: string }
   | { t: "blank" };
@@ -174,6 +175,7 @@ const INLINE_RE = new RegExp(
     "\\[([^\\]]*)\\]\\(((?:[^()\\s]|\\([^)]*\\))*)(?:\\s+\"[^\"]*\")?\\)", // 6,7 link
     "(?<![\\w*])\\*([^*\\s](?:[^*]*[^*\\s])?)\\*(?![\\w*])", // 8 em
     "<(https?:\\/\\/[^\\s<>]+)>", // 9 autolink
+    "(https?:\\/\\/[^\\s<>\\uE000-\\uF8FF]+)", // 10 bare URL
   ].join("|"),
   "g",
 );
@@ -185,50 +187,45 @@ function push(out: Span[], text: string, style: SpanStyle, url?: string) {
   else out.push(url ? { text, style, url } : { text, style });
 }
 
-/** A bare http(s) URL in prose: runs to whitespace (or a stashed-marker character). */
-const BARE_URL_RE = /https?:\/\/[^\s<>\uE000-\uF8FF]+/g;
-
-/** Drop the punctuation a sentence puts after a URL: `.,;:!?'"*_`, and a closing bracket the URL never opened. */
+/** Drop the punctuation a sentence puts after a bare URL: `.,;:!?'"`, and a closing bracket the URL never opened. */
 function trimUrl(u: string): string {
   for (;;) {
     const c = u[u.length - 1]!;
-    if (/[.,;:!?'"*_\]]/.test(c)) u = u.slice(0, -1);
+    if (/[.,;:!?'"\]]/.test(c)) u = u.slice(0, -1);
     else if (c === ")" && (u.match(/\(/g)?.length ?? 0) < (u.match(/\)/g)?.length ?? 0)) u = u.slice(0, -1);
     else return u;
   }
 }
 
-/** Plain text of one inline run; bare URLs in it become link spans. Inside a link (`url` set) the text is taken as written. */
-function pushText(out: Span[], text: string, base: SpanStyle, url?: string) {
-  if (url) return push(out, text, base === "plain" ? "link" : base, url);
-  let at = 0;
-  for (const m of text.matchAll(BARE_URL_RE)) {
-    const found = trimUrl(m[0]);
-    if (!/^https?:\/\/[^/?#]+/.test(found)) continue;
-    push(out, text.slice(at, m.index!), base);
-    push(out, found, base === "plain" ? "link" : base, found);
-    at = m.index! + found.length;
-  }
-  push(out, text.slice(at), base);
-}
+const linkStyle = (base: SpanStyle): SpanStyle => (base === "plain" ? "link" : base);
 
 function inline(text: string, base: SpanStyle = "plain", out: Span[] = [], url?: string): Span[] {
   let at = 0;
   const re = new RegExp(INLINE_RE.source, "g"); // recursion below needs its own lastIndex
   for (let m: RegExpExecArray | null; (m = re.exec(text)); ) {
-    pushText(out, text.slice(at, m.index), base, url);
+    // text between matches: the link text of an enclosing `[..](url)` keeps its destination
+    if (url) push(out, text.slice(at, m.index), linkStyle(base), url);
+    else push(out, text.slice(at, m.index), base);
     at = m.index + m[0].length;
+    const lstyle = url ? linkStyle(base) : base;
     if (m[1] !== undefined) push(out, m[1], "pill");
     else if (m[3] !== undefined) push(out, m[3], "code", url);
     else if (m[4] !== undefined || m[5] !== undefined) inline(m[4] ?? m[5]!, "bold", out, url);
-    else if (m[6] !== undefined) inline(m[6], base, out, m[7] || url);
+    else if (m[6] !== undefined) inline(m[6], base, out, (m[7] || "").replace(/^<(.*)>$/, "$1") || url);
     else if (m[8] !== undefined) inline(m[8], base, out, url);
-    else if (m[9] !== undefined) {
-      const u = trimUrl(m[9]);
-      push(out, u, base === "plain" ? "link" : base, u);
+    else if (m[9] !== undefined) push(out, m[9], linkStyle(base), m[9]); // `<url>`: the whole destination
+    else if (m[10] !== undefined) {
+      // a bare URL is matched before emphasis, so `__init__` or `*z*` inside one never starts a span
+      const found = trimUrl(m[10]);
+      if (/^https?:\/\/[^/?#]+/.test(found)) {
+        push(out, found, linkStyle(base), url ?? found);
+        at = m.index + found.length;
+        re.lastIndex = at;
+      } else push(out, m[0], lstyle, url);
     }
   }
-  pushText(out, text.slice(at), base, url);
+  if (url) push(out, text.slice(at), linkStyle(base), url);
+  else push(out, text.slice(at), base);
   return out;
 }
 
@@ -322,6 +319,7 @@ function parseLines(lines: string[], fences: string[], images: ImageRef[]): Bloc
     if (/^\s*\|.*\|\s*$/.test(line)) {
       const rows: string[][] = [];
       const grid: ImageRef[][][] = [];
+      const linkRows: Span[][][] = [];
       i--;
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]!.replace(/^\s*(?:>\s?)+/, ""))) {
         // a `\|` is a pipe inside the cell, not a column break; it is unescaped in the cell's text and in its images' src and alt
@@ -330,12 +328,15 @@ function parseLines(lines: string[], fences: string[], images: ImageRef[]): Bloc
         const unpipe = (s: string) => s.replace(/\\\|/g, "|");
         // images in a cell are content: kept per cell, apart from the cell's text
         const imgs = raw.map((c) => [...c.matchAll(IMG_RE)].map((m) => ({ src: unpipe(images[Number(m[1])]!.src), alt: unpipe(images[Number(m[1])]!.alt) })));
-        const cells = raw.map((c) => plain(tidy(inline(unpipe(c.replace(IMG_RE, ""))))));
+        const cellSpans = raw.map((c) => tidy(inline(unpipe(c.replace(IMG_RE, "")))));
+        const cells = cellSpans.map(plain);
         if (!imgs.some((c) => c.length) && cells.every((c) => /^:?-{2,}:?$/.test(c) || c === "")) continue;
         rows.push(cells);
         grid.push(imgs);
+        linkRows.push(cellSpans);
       }
-      if (rows.length) add({ t: "table", rows, ...(grid.some((r) => r.some((c) => c.length)) ? { images: grid } : {}) });
+      const hasLink = linkRows.some((r) => r.some((c) => c.some((x) => x.url)));
+      if (rows.length) add({ t: "table", rows, ...(hasLink ? { links: linkRows } : {}), ...(grid.some((r) => r.some((c) => c.length)) ? { images: grid } : {}) });
       continue;
     }
     const h = /^\s*(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
@@ -561,6 +562,17 @@ export function resolveLink(url: string, base: string | null): string | null {
   return abs && (abs.protocol === "https:" || abs.protocol === "http:") ? abs.href : null;
 }
 
+/** A `<details>` summary line: muted, its links kept. */
+const summaryLine = (mark: string, summary: Span[]): Span[] => [{ text: mark, style: "muted" }, ...summary.map((x): Span => (x.style === "plain" ? { ...x, style: "muted" } : x))];
+
+/** One table cell as spans: its link spans when the table has links (plain text takes `base`), else its text in `base`. */
+function cellSpans(rows: string[][], links: Span[][][] | undefined, ri: number, ci: number, base: SpanStyle): Span[] {
+  const sp = links?.[ri]?.[ci];
+  if (sp) return sp.map((x) => (x.style === "plain" ? { ...x, style: base } : x));
+  const text = rows[ri]?.[ci] ?? "";
+  return text ? [{ text, style: base }] : [];
+}
+
 /** Prose measure: paragraphs, headings and lists wrap here even in a wider pane (code and tables use the full width). */
 export const PROSE_MEASURE = 84;
 
@@ -691,7 +703,7 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
    * A table with images in its cells: per body row, its text cells as one line (labelled by the header), then its images with the
    * header text as caption. The header row itself is not drawn.
    */
-  const imageTable = (rows: string[][], grid: ImageRef[][][]) => {
+  const imageTable = (rows: string[][], grid: ImageRef[][][], links?: Span[][][]) => {
     const head = rows.length > 1 && !grid[0]!.some((c) => c.length) ? rows[0]! : null;
     rows.forEach((cells, ri) => {
       if (head && ri === 0) return;
@@ -701,7 +713,7 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
         if (!text) return;
         if (spans.length) spans.push({ text: " · ", style: "muted" });
         if (head?.[ci]) spans.push({ text: `${head[ci]}: `, style: "bold" });
-        spans.push({ text, style: "plain" });
+        spans.push(...cellSpans(rows, links, ri, ci, "plain"));
       });
       if (spans.length) emit(wrapSpans(spans, w, "", "  "));
       const items = grid[ri]!.flatMap((imgs, ci) => imgs.map((img) => ({ img, caption: head?.[ci] || null })));
@@ -745,7 +757,7 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
       }
       case "table": {
         if (b.images) {
-          imageTable(b.rows, b.images);
+          imageTable(b.rows, b.images, b.links);
           break;
         }
         const cols = Math.max(...b.rows.map((r) => r.length));
@@ -754,15 +766,31 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
         if (total > w) {
           // too wide for aligned columns: one wrapped entry per row, first cell bold
           for (const r of b.rows.slice(b.rows.length > 1 ? 1 : 0)) {
-            const spans: Span[] = [{ text: r[0] ?? "", style: "bold" }];
-            if (r.length > 1) spans.push({ text: ` ${r.slice(1).join(" · ")}`, style: "plain" });
+            const ri = b.rows.indexOf(r);
+            const spans: Span[] = [];
+            r.forEach((c, ci) => {
+              if (ci === 0) spans.push(...(r[0] ? cellSpans(b.rows, b.links, ri, 0, "bold") : [{ text: "", style: "bold" as const }]));
+              else {
+                push(spans, ci === 1 ? " " : " · ", "plain");
+                spans.push(...cellSpans(b.rows, b.links, ri, ci, "plain"));
+              }
+            });
             emit(wrapSpans(spans, w, "", "  "));
           }
           break;
         }
         b.rows.forEach((r, ri) => {
-          const text = r.map((c, ci) => c + " ".repeat(ws[ci]! - width(c))).join("  ").trimEnd();
-          emit([[{ text, style: ri === 0 && b.rows.length > 1 ? "bold" : "plain" }]]);
+          const style = ri === 0 && b.rows.length > 1 ? "bold" : "plain";
+          const spans: Span[] = [];
+          r.forEach((c, ci) => {
+            if (ci) push(spans, "  ", "plain");
+            for (const x of cellSpans(b.rows, b.links, ri, ci, style)) push(spans, x.text, x.style, x.url);
+            if (ci < r.length - 1) push(spans, " ".repeat(ws[ci]! - width(c)), "plain");
+          });
+          const last = spans[spans.length - 1];
+          if (last) last.text = last.text.trimEnd();
+          while (spans.length && !spans[spans.length - 1]!.text) spans.pop();
+          emit([spans]);
         });
         break;
       }
@@ -775,9 +803,9 @@ export function layoutRows(blocks: Block[], w: number, opts: LayoutOpts): Row[] 
       case "details": {
         const preview = /^Preview\b/i.test(plain(b.summary)) && b.body.some((x) => x.t === "code" && x.diff);
         if (!opts.details || (preview && !opts.previews)) {
-          emit(wrapSpans([{ text: `▸ ${plain(b.summary)}`, style: "muted" }], w));
+          emit(wrapSpans(summaryLine("▸ ", b.summary), w));
         } else {
-          emit(wrapSpans([{ text: `▾ ${plain(b.summary)}`, style: "muted" }], w));
+          emit(wrapSpans(summaryLine("▾ ", b.summary), w));
           for (const r of layoutRows(b.body, w - 2, opts)) {
             out.push(r.t === "image" ? { ...r, indent: r.indent + 2 } : r.spans.length ? { ...r, spans: [{ text: "  ", style: "plain" }, ...r.spans] } : r);
           }

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -254,11 +254,47 @@ test("two clicks too far apart, on different rows, or with a drag between them d
   expect(f[fold]!.trimStart().startsWith("▸")).toBe(true);
 });
 
+test("a drag that starts on body text, or a press on plain text, between two clicks on a row starts the double-click over", async () => {
+  const { s, frame } = await renderPr();
+  const f = await frame();
+  const fold = rowOf(f, "2 bot comments");
+  const body = rowOf(f, "line 3 of the review");
+  // A frozen clock, so the gestures below are always inside the double-click window however long the mock mouse takes.
+  const real = Date.now();
+  let clock = real;
+  const spy = spyOn(Date, "now").mockImplementation(() => clock);
+  try {
+    clock += 1000;
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.pressDown(4, body);
+    await s.mockMouse.emitMouseEvent("drag", 30, body + 1);
+    await s.mockMouse.release(30, body + 1);
+    await s.mockMouse.click(4, fold);
+    let after = await frame();
+    expect(after[fold]!.trimStart().startsWith("▸")).toBe(true);
+    clock += 1000;
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.click(6, body);
+    await s.mockMouse.click(4, fold);
+    after = await frame();
+    expect(after[fold]!.trimStart().startsWith("▸")).toBe(true);
+    // control: the same two clicks with nothing between them do open it
+    clock += 1000;
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.click(4, fold);
+    await Bun.sleep(300);
+    const opened = await frame();
+    expect(opened[rowOf(opened, "2 bot comments")]!.trimStart().startsWith("▾")).toBe(true);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
 const linked: PrDetail = {
   ...detail,
   conversation: [
     ...detail.conversation.slice(0, 3),
-    comment("h2", 4, "bob", false, "bob one see [the guide](https://guide.test/x?y=1) or [rel](/o/r/pull/3)\n\nbob two https://bare.test/p.\n\nbob three"),
+    comment("h2", 4, "bob", false, "bob one see [the guide](https://guide.test/x?y=1) or [rel](/o/r/pull/3)\n\nbob two https://bare.test/p.\n\n| Check | Result |\n| --- | --- |\n| lint | [log](https://ci.test/lint) |"),
     detail.conversation[4]!,
   ],
 };
@@ -286,6 +322,18 @@ test("a click on a link in a comment opens it, and moves nothing; a click beside
   s.mockInput.pressEnter();
   f = await frame();
   expect(capped(f)).toBe(false);
+});
+
+test("a link inside a table cell opens on a click", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, linked);
+  const f = await frame();
+  const y = rowOf(f, "lint");
+  expect(y).toBeGreaterThanOrEqual(0);
+  const x = f[y]!.indexOf("log");
+  await s.mockMouse.click(x + 1, y);
+  await s.mockMouse.click(f[y]!.indexOf("lint"), y);
+  expect(await opened(1)).toEqual(["https://ci.test/lint"]);
 });
 
 test("dragging across a link selects text and opens nothing", async () => {

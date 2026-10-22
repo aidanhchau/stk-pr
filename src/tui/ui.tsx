@@ -363,11 +363,20 @@ export type PillVariant = "neutral" | "primary" | "secondary" | "danger-quiet";
 let tapping: { x: number; y: number; dragged: boolean; owner: object } | null = null;
 /** The last finished tap of a `useDoubleTap` element, waiting for its second. A drag anywhere forgets it. */
 let lastTap: { owner: object; x: number; y: number; at: number } | null = null;
+/** Root drag handler. A drag that starts on a tap element is a drag once it is past one cell; one that starts anywhere else (body text) is one at once. */
 const cancelTap = (e: MouseEvent) => {
-  if (tapping && (Math.abs(tapping.x - e.x) > 1 || tapping.y !== e.y)) {
+  if (!tapping) lastTap = null;
+  else if (Math.abs(tapping.x - e.x) > 1 || tapping.y !== e.y) {
     tapping.dragged = true;
     lastTap = null;
   }
+};
+/**
+ * Root press handler. A press bubbles up to it after the pressed element's own handler has set `tapping`, so a press that isn't on the
+ * element waiting for its second tap (a plain-text press has no `tapping` at all) starts the count over.
+ */
+const forgetStrayTap = () => {
+  if (lastTap && tapping?.owner !== lastTap.owner) lastTap = null;
 };
 
 /**
@@ -378,11 +387,14 @@ const cancelTap = (e: MouseEvent) => {
  * `onTap` gets the release event. With `hit`, only a press it accepts starts a tap, and that press goes no further up (so a link inside a
  * double-tap row is not also a tap of the row); any other press is left to the elements above.
  */
-export function useTap(onTap?: (e: MouseEvent) => void, hit?: (e: MouseEvent) => boolean) {
+export function useTap(onTap?: (e: MouseEvent) => void, hit?: (e: MouseEvent) => boolean, waiting?: object) {
   const renderer = useRenderer();
-  const me = useRef({});
+  const own = useRef({});
+  const me = waiting ?? own.current;
   return {
     onMouseDown: (e: MouseEvent) => {
+      renderer.root.onMouseDrag = cancelTap;
+      renderer.root.onMouseDown = forgetStrayTap;
       if (hit) {
         if (!hit(e)) {
           tapping = null;
@@ -390,12 +402,11 @@ export function useTap(onTap?: (e: MouseEvent) => void, hit?: (e: MouseEvent) =>
         }
         e.stopPropagation();
       }
-      tapping = { x: e.x, y: e.y, dragged: false, owner: me.current };
-      renderer.root.onMouseDrag = cancelTap;
+      tapping = { x: e.x, y: e.y, dragged: false, owner: me };
     },
     onMouseUp: (e: MouseEvent) => {
       const d = tapping;
-      if (!d || d.owner !== me.current) return;
+      if (!d || d.owner !== me) return;
       tapping = null;
       if (d.dragged || Math.abs(d.x - e.x) > 1 || d.y !== e.y) return;
       onTap?.(e);
@@ -422,7 +433,7 @@ export function useDoubleTap(onOpen?: () => void) {
       if (renderer.getSelection()) renderer.clearSelection();
       onOpen?.();
     } else lastTap = { owner: me.current, x: e.x, y: e.y, at: now };
-  });
+  }, undefined, me.current);
 }
 
 /** A `<box>` that runs `onOpen` on a double-click (see `useDoubleTap`). */

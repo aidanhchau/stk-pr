@@ -300,4 +300,44 @@ describe("link spans", () => {
     expect(resolveLink("mailto:a@b.test", base)).toBeNull();
     expect(resolveLink("file:///etc/passwd", base)).toBeNull();
   });
+
+  test("emphasis never starts inside a bare URL", () => {
+    expect(links("see https://github.com/o/r/blob/main/pkg/__init__.py now")).toEqual([["https://github.com/o/r/blob/main/pkg/__init__.py", "https://github.com/o/r/blob/main/pkg/__init__.py"]]);
+    expect(links("go https://y.test/*z* ok")).toEqual([["https://y.test/*z*", "https://y.test/*z*"]]);
+    expect(links("**bold https://a.test/x** and _plain_")).toEqual([["https://a.test/x", "https://a.test/x"]]);
+  });
+
+  test("an <autolink> keeps its whole destination, trailing punctuation included", () => {
+    expect(links("go <https://example.com/path_> and <https://example.com/a.>")).toEqual([["https://example.com/path_", "https://example.com/path_"], ["https://example.com/a.", "https://example.com/a."]]);
+  });
+
+  test("a [text](<url>) destination loses its angle brackets", () => {
+    expect(links("[guide](<https://example.com/docs>) and [rel](</o/r/pull/3>)")).toEqual([["guide", "https://example.com/docs"], ["rel", "/o/r/pull/3"]]);
+    expect(resolveLink("https://example.com/docs", null)).toBe("https://example.com/docs");
+  });
+
+  test("links in table cells keep their url through aligned, narrow and image-table layouts", () => {
+    const body = "| Check | Result |\n| --- | --- |\n| lint | [log](https://ci.test/lint) |\n| unit | https://c.t/u |";
+    for (const w of [80, 22]) {
+      const l = links(body, w);
+      expect(l).toEqual([["log", "https://ci.test/lint"], ["https://c.t/u", "https://c.t/u"]]);
+    }
+    const aligned = spansOf(body, 80);
+    expect(aligned.map(plain)).toEqual(["Check  Result", "lint   log", "unit   https://c.t/u"]);
+    // the column of the link maps back to it
+    expect(linkAt(aligned[1]!, 7)).toBe("https://ci.test/lint");
+    expect(linkAt(aligned[1]!, 5)).toBeUndefined();
+    const withImage = "| Name | Shot |\n| --- | --- |\n| a [doc](https://d.test/a) | ![x](https://img.test/x.png) |";
+    expect(links(withImage)).toEqual([["doc", "https://d.test/a"]]);
+  });
+
+  test("links in a <details> summary keep their url", () => {
+    const body = "<details><summary>Proof: [run](https://ci.test/run)</summary>\n\nbody\n</details>";
+    for (const open of [true, false]) {
+      const rows = layoutBlocks(parseComment(body).blocks, 80, { details: open });
+      const found = rows.flat().filter((x) => x.url);
+      expect(found.map((x) => [x.text, x.url])).toEqual([["run", "https://ci.test/run"]]);
+      expect(plain(rows[0]!)).toBe(`${open ? "▾" : "▸"} Proof: run`);
+    }
+  });
 });
