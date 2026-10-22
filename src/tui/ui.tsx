@@ -395,6 +395,8 @@ export function useTap(onTap?: (e: MouseEvent) => void, hit?: (e: MouseEvent) =>
     onMouseDown: (e: MouseEvent) => {
       renderer.root.onMouseDrag = cancelTap;
       renderer.root.onMouseDown = forgetStrayTap;
+      // A link press stops propagation below, so the root never sees it: forget another element's pending double-tap here.
+      if (lastTap && lastTap.owner !== me) lastTap = null;
       if (hit) {
         if (!hit(e)) {
           tapping = null;

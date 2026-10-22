@@ -336,6 +336,28 @@ test("a link inside a table cell opens on a click", async () => {
   expect(await opened(1)).toEqual(["https://ci.test/lint"]);
 });
 
+test("a link click between two clicks on a row starts the double-click over", async () => {
+  const opened = fakeOpener();
+  const { s, frame } = await renderPr(40, linked);
+  const f = await frame();
+  const fold = rowOf(f, "2 bot comments");
+  const y = rowOf(f, "bob one see");
+  expect(fold).toBeGreaterThanOrEqual(0);
+  // A frozen clock, so the three clicks are always inside the double-click window however long the mock mouse takes.
+  let clock = Date.now() + 1000;
+  const spy = spyOn(Date, "now").mockImplementation(() => clock);
+  try {
+    await s.mockMouse.click(4, fold);
+    await s.mockMouse.click(f[y]!.indexOf("the guide") + 3, y);
+    await s.mockMouse.click(4, fold);
+    expect(await opened(1)).toEqual(["https://guide.test/x?y=1"]);
+    const after = await frame();
+    expect(after[fold]!.trimStart().startsWith("▸")).toBe(true);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
 test("dragging across a link selects text and opens nothing", async () => {
   const opened = fakeOpener();
   const { s, frame } = await renderPr(40, linked);
