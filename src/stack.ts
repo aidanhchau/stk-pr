@@ -173,6 +173,10 @@ export function blockers(pr: PullRequest, trunk: string, rules?: RepoRules | nul
 /** Blockers a hard stop for the merge itself: conflicts and drafts can never be bypassed. */
 export const isHardBlocker = (b: Blocker): boolean => b.kind === "conflict" || b.kind === "draft";
 
+/** Queue admission can wait on these conditions, but a known failing check still blocks enqueueing. */
+export const isQueueDeferrableBlocker = (b: Blocker): boolean =>
+  b.kind === "checks" ? b.failing.length === 0 : b.kind === "required-check" || b.kind === "blocked" || b.kind === "checking";
+
 /**
  * Blockers of a stack member judged as if based on the trunk. A member with a parent is only ever
  * "behind" its parent's branch, which restacking/native landing resolves, so that note is dropped.
@@ -187,7 +191,7 @@ export interface PlanOptions {
   force: boolean;
   /** Stop after merging this PR number (inclusive). */
   upTo?: number;
-  /** Base-branch rules of the repo (required checks), when known. */
+  /** Base-branch rules of the repo, including required checks and merge queue policy, when known. */
   rules?: RepoRules | null;
   /** Repo dir used for restacks/pushes of branches without a worktree. Defaults to the first worktree. */
   repoDir?: string;
@@ -199,23 +203,29 @@ export interface PlanOptions {
  * force mode there is no wait, and the child's merge is `--admin` with a `checks` bypass. The plan
  * ends (without a step for the offending PR) at the first PR that is blocked, or that has a
  * non-bypassable blocker (conflict, draft) even with `force`; callers report `blockers()`.
+ * Queue plans defer pending checks and transient mergeability to GitHub, use the queue's method without
+ * a pinned head or bypass, and still stop for failing checks/review/threads even when force was requested.
  */
 export function planStackMerge(stack: Stack, opts: PlanOptions, worktrees: Worktree[]): PlanStep[] {
   const { trunk, prs } = stack;
   const repoDir = opts.repoDir ?? worktrees[0]?.path ?? ".";
+  const queue = opts.rules?.mergeQueue;
+  const method = queue?.method ?? opts.method;
+  const force = opts.force && !queue;
   const plan: PlanStep[] = [];
 
   for (let i = 0; i < prs.length; i++) {
     const pr = prs[i]!;
     const parent = i > 0 ? prs[i - 1]! : null;
     const all = memberBlockers(pr, trunk, parent !== null, opts.rules);
-    // A restacked child's checks are re-run on its new head: normal mode gates on `wait-checks`, so the
-    // known (old-head) check blockers are dropped. Force mode can't wait, so it bypasses them instead.
-    const restacked = parent !== null && opts.method !== "merge";
-    const bypass = restacked && !opts.force ? all.filter((b) => b.kind !== "checks") : all;
-    if (bypass.length > 0 && !opts.force) break;
+    // Outside queues, a restacked child's checks are re-run on its new head: normal mode gates on
+    // `wait-checks`, so old-head blockers are dropped. Queues still stop for known failing checks.
+    const restacked = parent !== null && method !== "merge";
+    const afterRestack = restacked && !force && !queue ? all.filter((b) => b.kind !== "checks") : all;
+    const bypass = queue ? afterRestack.filter((b) => !isQueueDeferrableBlocker(b)) : afterRestack;
+    if (bypass.length > 0 && !force) break;
     if (bypass.some(isHardBlocker)) break;
-    if (restacked && opts.force) {
+    if (restacked && force) {
       const known = bypass.find((b) => b.kind === "checks");
       const unverified: Blocker = {
         kind: "checks",
@@ -228,7 +238,7 @@ export function planStackMerge(stack: Stack, opts: PlanOptions, worktrees: Workt
 
     if (parent) {
       plan.push({ kind: "retarget", pr: pr.number, from: parent.headRef, to: trunk });
-      if (opts.method !== "merge") {
+      if (method !== "merge") {
         const wt = worktreeForBranch(worktrees, pr.headRef);
         plan.push({
           kind: "restack",
@@ -240,12 +250,12 @@ export function planStackMerge(stack: Stack, opts: PlanOptions, worktrees: Workt
           worktree: wt?.path ?? null,
         });
         plan.push({ kind: "push", branch: pr.headRef, expectedRemoteSha: pr.headSha, cwd: wt?.path ?? repoDir });
-        if (!opts.force) plan.push({ kind: "wait-checks", pr: pr.number });
+        if (!force) plan.push({ kind: "wait-checks", pr: pr.number });
       }
     }
-    // A restacked child's head moves before its merge, so only unmoved heads can be pinned.
-    const sha = restacked ? undefined : pr.headSha;
-    plan.push({ kind: "merge", pr: pr.number, method: opts.method, admin: opts.force && bypass.length > 0, bypass, ...(sha ? { sha } : {}) });
+    // Queue requests cannot pin a head; restacked children also move before their merge.
+    const sha = queue || restacked ? undefined : pr.headSha;
+    plan.push({ kind: "merge", pr: pr.number, method, admin: force && bypass.length > 0, bypass, ...(sha ? { sha } : {}) });
     if (opts.upTo === pr.number) break;
   }
   return plan;
@@ -257,16 +267,23 @@ export function planStackMerge(stack: Stack, opts: PlanOptions, worktrees: Workt
  * `stack.prs` is the open native stack, bottom first; `upTo` (default: the top) is the highest PR to land.
  * Like the classic plan it stops at the first blocked PR, merging only the unblocked prefix; empty when
  * even the bottom PR is blocked. Callers report `blockers()`.
+ * Queue plans follow the same enqueue policy as classic plans: queue-evaluated blockers are deferred,
+ * but remaining blockers cannot be bypassed, and merge steps use the queue method without a pinned head.
  */
 export function planNativeStackMerge(stack: Stack, opts: Pick<PlanOptions, "method" | "force" | "upTo" | "rules">): PlanStep[] {
   const { trunk, prs } = stack;
+  const queue = opts.rules?.mergeQueue;
+  const method = queue?.method ?? opts.method;
+  const force = opts.force && !queue;
   const own: Blocker[][] = [];
   let last = -1;
   for (let i = 0; i < prs.length; i++) {
     const pr = prs[i]!;
     // a native stack lands on its trunk whatever each member's own base says (a stale base is flagged by the service)
-    const all = memberBlockers(pr, trunk, i > 0, opts.rules).filter((b) => b.kind !== "base-not-trunk");
-    if (all.length > 0 && !opts.force) break;
+    const all = memberBlockers(pr, trunk, i > 0, opts.rules).filter(
+      (b) => b.kind !== "base-not-trunk" && (!queue || !isQueueDeferrableBlocker(b)),
+    );
+    if (all.length > 0 && !force) break;
     if (all.some(isHardBlocker)) break;
     own.push(all);
     last = i;
@@ -280,7 +297,7 @@ export function planNativeStackMerge(stack: Stack, opts: Pick<PlanOptions, "meth
   const flush = () => {
     if (run.length === 0) return;
     const top = prs[run[run.length - 1]!]!;
-    plan.push({ kind: "merge", pr: top.number, method: opts.method, admin: false, bypass: [], sha: top.headSha, includes: [...run].map((i) => prs[i]!.number) });
+    plan.push({ kind: "merge", pr: top.number, method, admin: false, bypass: [], ...(!queue ? { sha: top.headSha } : {}), includes: [...run].map((i) => prs[i]!.number) });
     run = [];
   };
   for (let i = 0; i <= last; i++) {
@@ -291,7 +308,7 @@ export function planNativeStackMerge(stack: Stack, opts: Pick<PlanOptions, "meth
     }
     flush();
     const pr = prs[i]!;
-    plan.push({ kind: "merge", pr: pr.number, method: opts.method, admin: true, bypass: needs, sha: pr.headSha, includes: [pr.number] });
+    plan.push({ kind: "merge", pr: pr.number, method, admin: true, bypass: needs, sha: pr.headSha, includes: [pr.number] });
   }
   flush();
   return plan;

@@ -11,11 +11,13 @@ interface Put {
   pr: number;
   sha?: string;
   bypass: boolean;
-  method: string;
+  method?: string;
 }
 
 interface FakeOptions {
   review: "required" | "approved";
+  mergeQueue?: boolean;
+  pendingChecks?: boolean;
   /** Exactly these PRs need a review (and so a bypass); overrides `review`. */
   reviewRequired?: number[];
   checkingReads?: number;
@@ -58,8 +60,9 @@ interface FakeOptions {
  * order of every mutation. `divergedLocal` gives b202 a local commit that is not on origin; `originMoved` makes
  * origin/b202 differ from the head the stack was read at.
  */
-function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; git: string[]; events: string[]; rest: string[] } {
+function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; payloads: unknown[]; pushes: string[]; git: string[]; events: string[]; rest: string[] } {
   const puts: Put[] = [];
+  const payloads: unknown[] = [];
   const pushes: string[] = [];
   const git: string[] = [];
   const events: string[] = [];
@@ -85,7 +88,9 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
     headRefName: `b${n}`, baseRefName: bases[n], headRefOid: n === B && oldHeadLeft > 0 ? "shaB0" : heads[n],
     mergeable: n === (o.dirtyMember ?? C) && dirtyLeft > 0 ? "CONFLICTING" : n === B && checkingLeft > 0 && o.checkingAs === "mergeable" ? "UNKNOWN" : "MERGEABLE",
     mergeStateStatus: n === (o.dirtyMember ?? C) && dirtyLeft > 0 ? "DIRTY" : n === B && checkingLeft > 0 ? (o.checkingAs === "mergeable" ? "BLOCKED" : "UNKNOWN") : "CLEAN",
-    reviewDecision: requires(n) ? "REVIEW_REQUIRED" : "APPROVED", statusCheckRollup: null, createdAt: "", updatedAt: "", reviewThreads: { nodes: [] },
+    reviewDecision: requires(n) ? "REVIEW_REQUIRED" : "APPROVED",
+    statusCheckRollup: o.pendingChecks ? { contexts: { nodes: [{ __typename: "CheckRun", name: "ci", status: "IN_PROGRESS", conclusion: null }] } } : null,
+    createdAt: "", updatedAt: "", reviewThreads: { nodes: [] },
   });
   const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
   const no = () => ({ code: 1, stdout: "", stderr: "" });
@@ -117,8 +122,10 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
     if (a.startsWith("gh pr list")) return ok(JSON.stringify(originalChain.filter((n) => !merged.has(n)).map((n) => ({ number: n, headRefName: `b${n}`, baseRefName: bases[n] }))));
     if (a.includes("merge-async")) {
       const pr = Number(/pulls\/(\d+)\//.exec(argv.find((x) => x.includes("merge-async"))!)![1]);
-      const body = JSON.parse(opts?.stdin ?? "{}") as { merge_method: MergeMethod; sha?: string; bypass_rules?: boolean };
+      const body = JSON.parse(opts?.stdin ?? "{}") as { merge_method?: MergeMethod; sha?: string; bypass_rules?: boolean };
       const fail = (message: string) => ({ code: 1, stdout: `HTTP/2.0 400 Bad Request\r\n\r\n${JSON.stringify({ status: "failed", details: { message } })}`, stderr: "" });
+      if (o.mergeQueue && Object.keys(body).length > 0) return fail("Custom merge params are not supported when merging via a merge queue");
+      payloads.push(body);
       if (body.bypass_rules && pr !== originalChain.find((m) => !merged.has(m))) return fail("Rules can only be bypassed when merging the bottom-most unmerged pull request in the stack.");
       if (body.sha && body.sha !== heads[pr]) return fail("Head branch was modified. Review and try the merge again.");
       const parent = originalChain[originalChain.indexOf(pr) - 1];
@@ -128,6 +135,7 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
       if (parent !== undefined && merged.has(parent) && body.merge_method === "squash" && heads[pr] === (pr === B ? "shaB0" : "sha203")) return fail("Merge conflict detected");
       puts.push({ pr, ...(body.sha ? { sha: body.sha } : {}), bypass: body.bypass_rules === true, method: body.merge_method });
       events.push(`merge ${pr}`);
+      if (o.mergeQueue) return http(200, { status: "enqueued", details: {} });
       for (const m of originalChain.filter((x) => x <= pr)) merged.add(m);
       if (pr === A && body.bypass_rules && o.dissolveOnBypass) {
         members = [];
@@ -142,6 +150,7 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
       return ok(`HTTP/2.0 200 OK\r\n\r\n${JSON.stringify({ status: "merged", details: {} })}`);
     }
     if (a.startsWith("gh repo view")) return ok(JSON.stringify({ owner: { login: "o" }, name: "r", defaultBranchRef: { name: "main" } }));
+    if (a.includes("rules/branches/main")) return http(200, o.mergeQueue ? [{ type: "merge_queue", parameters: { merge_method: "SQUASH" } }] : []);
     const compare = /^gh api -i repos\/o\/r\/compare\/(.+)\.\.\.(.+)$/.exec(a);
     if (compare) return http(200, { behind_by: o.behindBy ?? 0, ahead_by: 14 });
     const api = /^gh api -i (?:-X (\w+) )?repos\/o\/r\/(pulls\/(\d+)|stacks(?:\/\d+\/unstack)?)(?: |$)/.exec(a);
@@ -213,12 +222,28 @@ function fakeGithub(o: FakeOptions): { ctx: Ctx; puts: Put[]; pushes: string[]; 
     return { code: 1, stdout: "", stderr: `unexpected: ${a}` };
   };
   const ctx: Ctx = { exec, root: "/repo", slug: { owner: "o", name: "r" }, worktrees: [{ path: "/wt-B", branch: `b${B}`, head: "shaB0", bare: false }] };
-  return { ctx, puts, pushes, git, events, rest };
+  return { ctx, puts, payloads, pushes, git, events, rest };
 }
 
 const noSleep = { attempts: 3, delayMs: 0, sleep: async () => {} };
 
 describe("stackMerge on a native stack", () => {
+  test("queue stacks with pending checks enqueue without custom params and display the queue method", async () => {
+    clearRulesCache();
+    const { ctx, puts, payloads, pushes } = fakeGithub({ review: "approved", mergeQueue: true, pendingChecks: true });
+    const r = await stackMerge(ctx, A, { method: "rebase", explicitMethod: true, force: false, upTo: B, replan: noSleep });
+    expect(payloads).toEqual([{}]);
+    expect(puts).toEqual([{ pr: B, bypass: false, method: undefined }]);
+    expect(pushes).toEqual([]);
+    expect(r.results.map((r) => r.step)).toEqual([
+      { kind: "merge", pr: B, method: "squash", admin: false, bypass: [], includes: [A, B] },
+    ]);
+    expect(r.results).toHaveLength(1);
+    expect(r.results[0]).toMatchObject({ ok: true, enqueued: true });
+    expect(r.merged).toEqual([]);
+    expect(r.remaining).toEqual([A, B]);
+  });
+
   test("forced squash with a review bypass on both PRs: A lands, B is rebased and retargeted, then B merges at its NEW head sha", async () => {
     clearRulesCache();
     const { ctx, puts, pushes, git, events, rest } = fakeGithub({ review: "required" });
