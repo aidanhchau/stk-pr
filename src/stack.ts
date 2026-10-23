@@ -173,6 +173,10 @@ export function blockers(pr: PullRequest, trunk: string, rules?: RepoRules | nul
 /** Blockers a hard stop for the merge itself: conflicts and drafts can never be bypassed. */
 export const isHardBlocker = (b: Blocker): boolean => b.kind === "conflict" || b.kind === "draft";
 
+/** Queue admission can wait on these conditions, but a known failing check still blocks enqueueing. */
+export const isQueueDeferrableBlocker = (b: Blocker): boolean =>
+  b.kind === "checks" ? b.failing.length === 0 : b.kind === "required-check" || b.kind === "blocked" || b.kind === "checking";
+
 /**
  * Blockers of a stack member judged as if based on the trunk. A member with a parent is only ever
  * "behind" its parent's branch, which restacking/native landing resolves, so that note is dropped.
@@ -199,8 +203,8 @@ export interface PlanOptions {
  * force mode there is no wait, and the child's merge is `--admin` with a `checks` bypass. The plan
  * ends (without a step for the offending PR) at the first PR that is blocked, or that has a
  * non-bypassable blocker (conflict, draft) even with `force`; callers report `blockers()`.
- * Queue plans defer checks and transient mergeability to GitHub, use the queue's method without a
- * pinned head or bypass, and still stop for review/thread blockers even when force was requested.
+ * Queue plans defer pending checks and transient mergeability to GitHub, use the queue's method without
+ * a pinned head or bypass, and still stop for failing checks/review/threads even when force was requested.
  */
 export function planStackMerge(stack: Stack, opts: PlanOptions, worktrees: Worktree[]): PlanStep[] {
   const { trunk, prs } = stack;
@@ -214,13 +218,11 @@ export function planStackMerge(stack: Stack, opts: PlanOptions, worktrees: Workt
     const pr = prs[i]!;
     const parent = i > 0 ? prs[i - 1]! : null;
     const all = memberBlockers(pr, trunk, parent !== null, opts.rules);
-    // A restacked child's checks are re-run on its new head: normal mode gates on `wait-checks`, so the
-    // known (old-head) check blockers are dropped. Force mode can't wait, so it bypasses them instead.
+    // Outside queues, a restacked child's checks are re-run on its new head: normal mode gates on
+    // `wait-checks`, so old-head blockers are dropped. Queues still stop for known failing checks.
     const restacked = parent !== null && method !== "merge";
-    const afterRestack = restacked && !force ? all.filter((b) => b.kind !== "checks") : all;
-    const bypass = queue
-      ? afterRestack.filter((b) => b.kind !== "checks" && b.kind !== "required-check" && b.kind !== "blocked" && b.kind !== "checking")
-      : afterRestack;
+    const afterRestack = restacked && !force && !queue ? all.filter((b) => b.kind !== "checks") : all;
+    const bypass = queue ? afterRestack.filter((b) => !isQueueDeferrableBlocker(b)) : afterRestack;
     if (bypass.length > 0 && !force) break;
     if (bypass.some(isHardBlocker)) break;
     if (restacked && force) {
@@ -279,7 +281,7 @@ export function planNativeStackMerge(stack: Stack, opts: Pick<PlanOptions, "meth
     const pr = prs[i]!;
     // a native stack lands on its trunk whatever each member's own base says (a stale base is flagged by the service)
     const all = memberBlockers(pr, trunk, i > 0, opts.rules).filter(
-      (b) => b.kind !== "base-not-trunk" && (!queue || (b.kind !== "checks" && b.kind !== "required-check" && b.kind !== "blocked" && b.kind !== "checking")),
+      (b) => b.kind !== "base-not-trunk" && (!queue || !isQueueDeferrableBlocker(b)),
     );
     if (all.length > 0 && !force) break;
     if (all.some(isHardBlocker)) break;

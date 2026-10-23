@@ -198,6 +198,8 @@ stk [--repo DIR] [--json] <command>
 
 `--force` merges through GitHub's merge-async API with `bypass_rules: true`. That bypasses failing or pending checks, missing review, and unresolved threads, as far as your repository permissions allow. It never bypasses a merge conflict or a draft PR; those still block. Every merge runs as a detached job (`stk jobs`), so it keeps going after you close the TUI.
 
+For a merge-queue target, GitHub owns the merge method and checks pending conditions before landing. Pending checks, missing required contexts, and transient repository-rule/mergeability states do not prevent enqueueing; known failing checks still block it. Stack plans likewise stop before a member with failing checks. `--force` cannot bypass a merge queue, and `merge --force --dry-run` prints that reason without enqueueing.
+
 While a merge request is pending stk polls its status. A poll that fails for a transient reason (network, TLS, timeout, a 5xx) is retried up to four times with a doubling delay, never past the merge's own 10-minute limit (running into it is a `merge-timeout`). If the status still cannot be read, stk re-reads the PR itself: merged counts as merged (with its merge commit), and a PR that is still open is reported as `the outcome of the merge of #N is unknown` with the poll error, so check GitHub before merging again. The merge request itself is never sent twice.
 
 ## Stack merge

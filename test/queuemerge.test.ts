@@ -52,7 +52,6 @@ afterEach(() => clearRulesCache());
 describe("service merge queues", () => {
   for (const [name, pr, required] of [
     ["pending PR checks", { statusCheckRollup: [pending] }, []],
-    ["failing PR checks", { statusCheckRollup: [failing] }, []],
     ["a missing required check", {}, ["queue-ci"]],
     ["an unexplained BLOCKED state", { mergeStateStatus: "BLOCKED" }, []],
     ["mergeability still checking", { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" }, []],
@@ -64,6 +63,20 @@ describe("service merge queues", () => {
       expect(result).toMatchObject({ number: 7, method: "squash", admin: false, bypassed: [], status: "enqueued" });
       // Queue requests cannot carry custom method, pinned SHA or bypass parameters.
       expect(puts).toEqual([{}]);
+    });
+  }
+
+  for (const checks of [[failing], [failing, { ...pending, name: "pending-ci" }]]) {
+    test(`failing checks block enqueueing${checks.length > 1 ? " even with pending checks" : ""}`, async () => {
+      const { ctx, puts } = world({ pr: { statusCheckRollup: checks } });
+      const blocker = { kind: "checks", failing: ["optional-ci"], pending: checks.length > 1 ? ["pending-ci"] : [] };
+      expect(await merge(ctx, 7, { method: "rebase", force: false, dryRun: true })).toMatchObject({
+        wouldMerge: false, blockers: [blocker],
+      });
+      await expect(merge(ctx, 7, { method: "rebase", force: false })).rejects.toMatchObject({
+        code: "blocked", data: { blockers: [blocker] },
+      });
+      expect(puts).toEqual([]);
     });
   }
 

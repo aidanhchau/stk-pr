@@ -195,6 +195,23 @@ describe("cli", () => {
     expect(has("gh", "api", "-i", "-X", "PUT")).toBe(false);
   });
 
+  test("merge --force --dry-run prints why a merge queue cannot be bypassed", async () => {
+    const { run, has } = await setup([
+      [["gh", "repo", "view", "--json", "owner,name"], { stdout: '{"owner":{"login":"o"},"name":"cli-queue"}' }],
+      [["gh", "api", "-i", "repos/o/cli-queue/rules/branches/main"], {
+        stdout: `HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n${JSON.stringify([
+          { type: "merge_queue", parameters: { merge_method: "SQUASH" } },
+        ])}`,
+      }],
+    ]);
+    const r = await run("merge", "10", "--force", "--dry-run");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("would NOT merge #10");
+    expect(r.out).toContain("\n#10 targets a merge queue: --force cannot bypass it; run without --force to enqueue");
+    expect(has("gh", "api", "-i", "repos/o/cli-queue/rules/branches/main")).toBe(true);
+    expect(has("gh", "api", "-i", "-X", "PUT")).toBe(false);
+  });
+
   test("gh failure becomes an error envelope", async () => {
     const { run } = await setup([[["gh", "pr", "list"], { code: 1, stderr: "boom\n" }]]);
     const r = await run("--json", "prs");

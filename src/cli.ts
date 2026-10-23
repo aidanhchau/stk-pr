@@ -198,7 +198,7 @@ async function cmdMerge(ctx: Ctx, o: Opts, args: string[]): Promise<Result> {
     const text = d.wouldMerge
       ? `would ${force ? "force-merge" : "merge"} #${n} (${d.method})${d.bypass.length ? `, bypassing ${describeBlockers(d.bypass)}` : ""}`
       : `would NOT merge #${n}: ${describeBlockers(force ? unbypassable : d.blockers)}`;
-    return { data: d, text: d.methodNote ? `${text}\n${d.methodNote}` : text };
+    return { data: d, text: `${text}${d.methodNote ? `\n${d.methodNote}` : ""}${d.note ? `\n${d.note}` : ""}` };
   }
   const d = await merge(ctx, n, { method, explicitMethod, force });
   const verb = d.status === "enqueued" ? "queued" : force ? "force-merged" : "merged";

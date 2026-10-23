@@ -60,7 +60,7 @@ import {
   type PrSummary,
   type ReviewThread,
 } from "./github";
-import { blockers, chainThrough, executePlan, findForks, isHardBlocker, memberBlockers, planNativeStackMerge, planStackMerge, stackFor, treeOf, type ExecuteDeps, type Fork } from "./stack";
+import { blockers, chainThrough, executePlan, findForks, isHardBlocker, isQueueDeferrableBlocker, memberBlockers, planNativeStackMerge, planStackMerge, stackFor, treeOf, type ExecuteDeps, type Fork } from "./stack";
 import { assertMethodAllowed, effectiveMethod, fallbackNote, intersectMethods } from "./methods";
 import { resolveRepo } from "./repos";
 import { roleRank, sessionPrRefs } from "./session";
@@ -515,8 +515,8 @@ export async function merge(
   const method = settled.method;
 
   let bs = blockers(pr, trunk, rules);
-  // The queue re-checks these conditions when admitting/merging the PR; they do not prevent enqueueing.
-  if (queue) bs = bs.filter((b) => !["checks", "required-check", "blocked", "checking"].includes(b.kind));
+  // The queue evaluates pending checks and transient mergeability; known failing checks still block.
+  if (queue) bs = bs.filter((b) => !isQueueDeferrableBlocker(b));
   if (queue && force) {
     return { wouldMerge: false, method, admin: false, bypass: [], blockers: [...bs, { kind: "blocked" }], note: queueForceReason };
   }

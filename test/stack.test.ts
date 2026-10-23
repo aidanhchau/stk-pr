@@ -286,7 +286,7 @@ describe("planStackMerge", () => {
   test("queue plans enqueue pending checks with the queue method, without a pinned head or bypass", () => {
     const stack = stack3();
     stack.prs[0]!.checks = [{ name: "ci", state: "pending", url: null }];
-    stack.prs[1]!.checks = [{ name: "ci", state: "fail", url: null }];
+    stack.prs[1]!.checks = [{ name: "ci", state: "pending", url: null }];
     const plan = planStackMerge(stack, { method: "merge", force: false, rules: queueRules }, wts);
     expect(plan.filter((s) => s.kind === "merge")).toEqual([
       { kind: "merge", pr: 1, method: "squash", admin: false, bypass: [] },
@@ -295,6 +295,26 @@ describe("planStackMerge", () => {
     ]);
     expect(plan.filter((s) => s.kind === "restack").map((s) => s.pr)).toEqual([2, 3]);
     expect(plan.filter((s) => s.kind === "wait-checks").map((s) => s.pr)).toEqual([2, 3]);
+  });
+
+  test("queue plans stop before failing checks, even with pending checks or force", () => {
+    for (const method of ["squash", "merge", "rebase"] as const) {
+      const rules = { ...queueRules, mergeQueue: { method } };
+      for (const force of [false, true]) {
+        for (const pending of [false, true]) {
+          for (const index of [0, 1]) {
+            const stack = stack3();
+            stack.prs[index]!.checks = [
+              { name: "ci", state: "fail", url: null },
+              ...(pending ? [{ name: "pending-ci", state: "pending" as const, url: null }] : []),
+            ];
+            expect(planStackMerge(stack, { method, force, rules }, wts)).toEqual(
+              index === 0 ? [] : [{ kind: "merge", pr: 1, method, admin: false, bypass: [] }],
+            );
+          }
+        }
+      }
+    }
   });
 
   test("queue plans defer missing required checks, unexplained BLOCKED, and checking to GitHub", () => {
@@ -541,11 +561,31 @@ describe("planNativeStackMerge", () => {
   });
 
   test("queue plans enqueue a pending-check stack as one unpinned merge using the queue method", () => {
-    const stack = native({ checks: [{ name: "ci", state: "pending", url: null }] }, { checks: [{ name: "ci", state: "fail", url: null }] });
+    const stack = native({ checks: [{ name: "ci", state: "pending", url: null }] }, { checks: [{ name: "ci", state: "pending", url: null }] });
     for (const force of [false, true]) {
       expect(planNativeStackMerge(stack, { method: "rebase", force, rules: queueRules })).toEqual([
         { kind: "merge", pr: 3, method: "squash", admin: false, bypass: [], includes: [1, 2, 3] },
       ]);
+    }
+  });
+
+  test("queue plans stop before failing checks, even with pending checks or force", () => {
+    for (const method of ["squash", "merge", "rebase"] as const) {
+      const rules = { ...queueRules, mergeQueue: { method } };
+      for (const force of [false, true]) {
+        for (const pending of [false, true]) {
+          const failing = {
+            checks: [
+              { name: "ci", state: "fail" as const, url: null },
+              ...(pending ? [{ name: "pending-ci", state: "pending" as const, url: null }] : []),
+            ],
+          };
+          expect(planNativeStackMerge(native(failing), { method, force, rules })).toEqual([]);
+          expect(planNativeStackMerge(native({}, failing), { method, force, rules })).toEqual([
+            { kind: "merge", pr: 1, method, admin: false, bypass: [], includes: [1] },
+          ]);
+        }
+      }
     }
   });
 
