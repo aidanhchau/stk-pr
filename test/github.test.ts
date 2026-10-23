@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import {
+  branchRules,
   closeAndReopenPr,
   closePr,
   markReady,
@@ -23,7 +24,7 @@ import {
   waitChecks,
   withThreads,
 } from "../src/github";
-import { StkError, type Exec } from "../src/types";
+import { StkError, type Exec, type MergeMethod } from "../src/types";
 
 const fx = (name: string) => Bun.file(new URL(`./fixtures/${name}`, import.meta.url)).text();
 
@@ -178,15 +179,61 @@ const SLUG = { owner: "o", name: "r" };
 const PUT = ["gh", "api", "-i", "-X", "PUT", "repos/o/r/pulls/5/merge-async"];
 const pending = { status: "pending", details: { uuid: "u-1", message: "queued" } };
 
+describe("branchRules", () => {
+  const endpoint = ["gh", "api", "-i", "repos/o/r/rules/branches/dev"];
+
+  test("preserves the live merge queue method alongside status checks and pull request rules", async () => {
+    const { exec } = fake([[endpoint, http(200, [
+      { type: "merge_queue", parameters: { merge_method: "SQUASH", grouping_strategy: "ALLGREEN" } },
+      { type: "required_status_checks", parameters: { required_status_checks: [{ context: "quality-check" }, { context: "test" }] } },
+      { type: "pull_request", parameters: { require_code_owner_review: true, allowed_merge_methods: ["squash"] } },
+    ])]]);
+    expect(await branchRules(exec, SLUG, "dev")).toEqual({
+      requiredChecks: ["quality-check", "test"],
+      codeOwnerReview: true,
+      allowedMergeMethods: ["squash"],
+      mergeQueue: { method: "squash" },
+    });
+  });
+
+  test("accepts queue merge methods case-insensitively", async () => {
+    for (const [raw, method] of [
+      ["SQUASH", "squash"], ["MERGE", "merge"], ["REBASE", "rebase"],
+      ["squash", "squash"], ["merge", "merge"], ["rebase", "rebase"], ["ReBaSe", "rebase"],
+    ] satisfies [string, MergeMethod][]) {
+      const { exec } = fake([[endpoint, http(200, [{ type: "merge_queue", parameters: { merge_method: raw } }])]]);
+      expect((await branchRules(exec, SLUG, "dev")).mergeQueue).toEqual({ method });
+    }
+  });
+
+  test("omits merge queue configuration when no queue rule applies", async () => {
+    const { exec } = fake([[endpoint, http(200, [
+      { type: "pull_request", parameters: { require_code_owner_review: false } },
+    ])]]);
+    const rules = await branchRules(exec, SLUG, "dev");
+    expect(rules).toEqual({ requiredChecks: [], codeOwnerReview: false });
+    expect(rules.mergeQueue).toBeUndefined();
+  });
+});
+
 describe("merge-async", () => {
   test("request argv + body: method, pinned sha, bypass only when asked", async () => {
     const { exec, calls } = fake([[PUT, http(202, pending)]]);
     await requestMergeAsync(exec, SLUG, 5, { method: "squash", sha: "abc" });
     await requestMergeAsync(exec, SLUG, 5, { method: "rebase", bypass: true });
+    await requestMergeAsync(exec, SLUG, 5, { method: "merge", sha: "def", bypass: true, queue: false });
     expect(calls[0]!.argv).toEqual([...PUT, "--input", "-"]);
     expect(JSON.parse(calls[0]!.stdin!)).toEqual({ merge_method: "squash", sha: "abc" });
     expect(JSON.parse(calls[1]!.stdin!)).toEqual({ merge_method: "rebase", bypass_rules: true });
+    expect(JSON.parse(calls[2]!.stdin!)).toEqual({ merge_method: "merge", sha: "def", bypass_rules: true });
     expect(calls.flatMap((c) => c.argv)).not.toContain("--delete-branch");
+  });
+
+  test("queue requests omit every custom merge parameter", async () => {
+    const { exec, calls } = fake([[PUT, http(202, pending)]]);
+    await requestMergeAsync(exec, SLUG, 5, { method: "rebase", sha: "abc", bypass: true, queue: true });
+    expect(calls[0]!.argv).toEqual([...PUT, "--input", "-"]);
+    expect(JSON.parse(calls[0]!.stdin!)).toEqual({});
   });
 
   test("202 pending, 409 pending (existing uuid), 200 merged/enqueued", async () => {

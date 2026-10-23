@@ -680,6 +680,8 @@ export interface MergeAsyncOptions {
   sha?: string;
   /** Bypass repository rules the caller is allowed to bypass (the force merge). */
   bypass?: boolean;
+  /** Enqueue using the branch's queue configuration, without custom merge parameters. */
+  queue?: boolean;
 }
 
 /** Where a merge-async request stands. `sha` is the merge commit once merged. */
@@ -780,9 +782,12 @@ export async function requestMergeAsync(
   opts: MergeAsyncOptions,
 ): Promise<MergeAsyncState> {
   const { owner, name } = await slugOf(exec, where);
-  const payload: Record<string, unknown> = { merge_method: opts.method };
-  if (opts.sha) payload.sha = opts.sha;
-  if (opts.bypass) payload.bypass_rules = true;
+  const payload: Record<string, unknown> = {};
+  if (!opts.queue) {
+    payload.merge_method = opts.method;
+    if (opts.sha) payload.sha = opts.sha;
+    if (opts.bypass) payload.bypass_rules = true;
+  }
   const res = await ghApiRaw(
     exec,
     where,
@@ -1211,14 +1216,14 @@ export async function behindBy(exec: Exec, where: Where, base: string, head: str
 }
 
 /**
- * What the rules on `branch` require (REST `rules/branches/{branch}`, ONE call): required status check contexts and
- * whether the pull_request rule demands code owner review. Rulesets only; classic branch protection is not listed.
+ * What the rules on `branch` require (REST `rules/branches/{branch}`, ONE call): required checks, code owner
+ * review, allowed merge methods and merge queue configuration. Rulesets only; classic protection is not listed.
  */
 export async function branchRules(exec: Exec, where: Where, branch: string): Promise<RepoRules> {
   const { owner, name } = await slugOf(exec, where);
   const res = await ghApiRaw(exec, where, [`repos/${owner}/${name}/rules/branches/${encodeURIComponent(branch)}`]);
   if (res.status !== 200) throw apiError(res, `rules of ${branch}`);
-  type Rule = { type?: string; parameters?: { require_code_owner_review?: boolean; allowed_merge_methods?: string[]; required_status_checks?: { context?: string }[] } };
+  type Rule = { type?: string; parameters?: { require_code_owner_review?: boolean; allowed_merge_methods?: string[]; merge_method?: string; required_status_checks?: { context?: string }[] } };
   const rules = Array.isArray(res.body) ? (res.body as Rule[]) : [];
   const requiredChecks: string[] = [];
   for (const r of rules) {
@@ -1233,10 +1238,15 @@ export async function branchRules(exec: Exec, where: Where, branch: string): Pro
     const known = list.filter((m): m is MergeMethod => m === "squash" || m === "merge" || m === "rebase");
     allowed = allowed ? allowed.filter((m) => known.includes(m)) : known;
   }
+  const queueMethod = rules.find((r) => r.type === "merge_queue")?.parameters?.merge_method?.toLowerCase();
+  const mergeQueue: RepoRules["mergeQueue"] = queueMethod === "squash" || queueMethod === "merge" || queueMethod === "rebase"
+    ? { method: queueMethod }
+    : undefined;
   return {
     requiredChecks,
     codeOwnerReview: rules.some((r) => r.type === "pull_request" && r.parameters?.require_code_owner_review === true),
     ...(allowed ? { allowedMergeMethods: allowed } : {}),
+    ...(mergeQueue ? { mergeQueue } : {}),
   };
 }
 

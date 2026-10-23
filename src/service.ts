@@ -496,7 +496,7 @@ export function merge(ctx: Ctx, n: number, opts: MergeOpts & { dryRun?: boolean 
 /**
  * Merge one PR via GitHub's merge-async API, resolving once the request is final (merged or enqueued).
  * Throws StkError("blocked", data: {blockers}) when blocked (never for dry runs), "merge-timeout" if
- * GitHub is still working after 10 minutes. `force` sends bypass_rules.
+ * GitHub is still working after 10 minutes. `force` sends bypass_rules only outside merge queues.
  */
 export async function merge(
   ctx: Ctx,
@@ -507,11 +507,19 @@ export async function merge(
   const trunk = await trunkFor(ctx.exec, at(ctx));
   const [pr, rules] = await Promise.all([getPr(ctx.exec, at(ctx), n), rulesFor(ctx.exec, at(ctx), trunk)]);
   if (pr.state !== "OPEN") throw new StkError(`PR #${n} is ${pr.state.toLowerCase()}, not open`, "usage");
-  // against the PR's own base, right before anything is sent: a remembered method it rejects is swapped, an explicit one fails
-  const settled = await settleMethod(ctx, opts.method, pr.baseRef, opts.explicitMethod === true);
+  const queue = pr.baseRef === trunk ? rules?.mergeQueue : undefined;
+  const queueForceReason = `#${n} targets a merge queue: --force cannot bypass it; run without --force to enqueue`;
+  if (queue && force && !opts.dryRun) throw new StkError(queueForceReason, "blocked");
+  // A merge queue owns the method; otherwise settle it against the PR's own base just before sending.
+  const settled = queue ? { method: queue.method } : await settleMethod(ctx, opts.method, pr.baseRef, opts.explicitMethod === true);
   const method = settled.method;
 
   let bs = blockers(pr, trunk, rules);
+  // The queue re-checks these conditions when admitting/merging the PR; they do not prevent enqueueing.
+  if (queue) bs = bs.filter((b) => !["checks", "required-check", "blocked", "checking"].includes(b.kind));
+  if (queue && force) {
+    return { wouldMerge: false, method, admin: false, bypass: [], blockers: [...bs, { kind: "blocked" }], note: queueForceReason };
+  }
   let note: string | undefined;
   let nativeDownstack = false;
   const baseBlocker = bs.find((b) => b.kind === "base-not-trunk");
@@ -550,15 +558,14 @@ export async function merge(
   if (!mayMerge) {
     const why = force ? unbypassable : bs;
     throw new StkError(
-      `#${n} ${force ? "cannot be force-merged" : "is blocked"}: ${describeBlockers(why)}${force ? "" : " (use --force to bypass)"}`,
+      `#${n} ${force ? "cannot be force-merged" : "is blocked"}: ${describeBlockers(why)}${force || queue ? "" : " (use --force to bypass)"}`,
       "blocked",
       { blockers: why },
     );
   }
   const out = await mergeAsync(ctx.exec, at(ctx), n, {
     method,
-    bypass: force,
-    sha: pr.headSha,
+    ...(queue ? { queue: true } : { bypass: force, sha: pr.headSha }),
     ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
   });
   const fullNote = [note, settled.note].filter(Boolean).join("; ");
@@ -625,6 +632,10 @@ export interface PlanForResult {
  */
 async function planFor(ctx: Ctx, n: number, opts: PlanOpts): Promise<PlanForResult> {
   const first = await planForMethod(ctx, n, opts);
+  const queueMethod = first.rules?.mergeQueue?.method;
+  if (queueMethod) {
+    return { ...(queueMethod === opts.method ? first : await planForMethod(ctx, n, { ...opts, method: queueMethod })), method: queueMethod };
+  }
   const settled = await settleMethod(ctx, opts.method, first.trunk, opts.explicitMethod === true);
   if (settled.method === opts.method) return { ...first, method: opts.method };
   return { ...(await planForMethod(ctx, n, { ...opts, method: settled.method })), method: settled.method, ...(settled.note ? { methodNote: settled.note } : {}) };
@@ -816,7 +827,11 @@ export async function stackMerge(
     repoDir: stack.native ? (ctx.root ?? "") : requireRoot(ctx, "restack/merge a stack"),
     gh: {
       merge: (pr, m, admin, extra) =>
-        mergeAsync(ctx.exec, at(ctx), pr, { method: m, bypass: admin, ...(extra?.sha ? { sha: extra.sha } : {}), ...(extra?.onProgress ? { onProgress: extra.onProgress } : {}) }),
+        mergeAsync(ctx.exec, at(ctx), pr, {
+          method: first.rules?.mergeQueue?.method ?? m,
+          ...(first.rules?.mergeQueue ? { queue: true } : { bypass: admin, ...(extra?.sha ? { sha: extra.sha } : {}) }),
+          ...(extra?.onProgress ? { onProgress: extra.onProgress } : {}),
+        }),
       retarget: (pr, base) => retargetPr(ctx.exec, at(ctx), pr, base),
       waitChecks: async (pr) => {
         const expectedHeadSha = expectedHeads[pr] ?? (await getPr(ctx.exec, at(ctx), pr)).headSha;

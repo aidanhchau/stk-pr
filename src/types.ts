@@ -100,6 +100,8 @@ export interface RepoRules {
   codeOwnerReview: boolean;
   /** Merge methods the pull_request rule(s) allow (their `allowed_merge_methods`, intersected); absent when no rule restricts them. */
   allowedMergeMethods?: MergeMethod[];
+  /** The merge queue's required method, when this branch uses a queue. */
+  mergeQueue?: { method: MergeMethod };
 }
 
 export type MergeMethod = "squash" | "merge" | "rebase";
@@ -112,7 +114,7 @@ export type PlanStep =
       method: MergeMethod;
       admin: boolean;
       bypass: Blocker[];
-      /** Head SHA GitHub must still see (merge-async `sha`); omitted when an earlier step will move the head. */
+      /** Head SHA GitHub must still see (merge-async `sha`); omitted for merge queues or when an earlier step will move the head. */
       sha?: string;
       /** Native stack: every PR the one merge-async call lands (downstack first, `pr` last). */
       includes?: number[];
