@@ -129,6 +129,34 @@ async function renderPr(height = 40, data: PrDetail = detail, commits?: PrCommit
 
 const rowOf = (f: string[], text: string) => f.findIndex((l) => l.includes(text));
 
+test("the header and stack distinguish queued, open, draft and merged PRs", async () => {
+  const data: PrDetail = {
+    ...detail,
+    pr: { ...detail.pr, inMergeQueue: true },
+    conversation: [],
+    stack: {
+      trunk: "main",
+      prs: [7, 8, 9, 10],
+      native: true,
+      forks: [],
+      entries: [
+        { number: 7, title: "Queue member", state: "OPEN", isDraft: false, inMergeQueue: true, checks: "pass" },
+        { number: 8, title: "Open member", state: "OPEN", isDraft: false, checks: "pass" },
+        { number: 9, title: "Draft member", state: "OPEN", isDraft: true, checks: "none" },
+        { number: 10, title: "Merged member", state: "MERGED", isDraft: false, inMergeQueue: true, checks: "pass" },
+      ],
+    },
+  };
+  const { frame } = await renderPr(40, data);
+  const f = await frame();
+  expect(f[rowOf(f, data.pr.title) + 1]).toContain("Queued");
+  expect(f[rowOf(f, "Queue member")]).toContain("Queued");
+  expect(f[rowOf(f, "Open member")]).toContain("Open");
+  expect(f[rowOf(f, "Draft member")]).toContain("Draft");
+  expect(f[rowOf(f, "Merged member")]).toContain("Merged");
+  expect(f[rowOf(f, "Merged member")]).not.toContain("Queued");
+});
+
 test("zM closes a bot fold even while the cursor is on one of its members, leaving the cursor on the fold", async () => {
   const { s, frame } = await renderPr();
   let f = await frame();

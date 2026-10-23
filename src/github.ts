@@ -161,6 +161,7 @@ interface RawPr {
   author?: { login?: string } | null;
   state: string;
   isDraft: boolean;
+  isInMergeQueue?: boolean;
   headRefName: string;
   baseRefName: string;
   headRefOid: string;
@@ -192,6 +193,7 @@ function mapPr(raw: RawPr): PullRequest {
     author: raw.author?.login ?? "",
     state: state === "MERGED" ? "MERGED" : state === "CLOSED" ? "CLOSED" : "OPEN",
     isDraft: raw.isDraft,
+    ...(raw.isInMergeQueue !== undefined ? { inMergeQueue: raw.isInMergeQueue } : {}),
     headRef: raw.headRefName,
     baseRef: raw.baseRefName,
     headSha: raw.headRefOid,
@@ -252,37 +254,47 @@ export async function listPrs(
   return raw.map(mapPr);
 }
 
+/** Review-thread count and merge-queue membership loaded together for board PRs. */
+interface PrEnrichment {
+  threads: number;
+  inMergeQueue: boolean;
+}
+
 export async function unresolvedThreadCounts(
   exec: Exec,
   cwd: Where,
   numbers: number[],
-): Promise<Map<number, number>> {
-  const counts = new Map<number, number>();
+): Promise<Map<number, PrEnrichment>> {
+  const counts = new Map<number, PrEnrichment>();
   if (numbers.length === 0) return counts;
   const { owner, name } = await repoSlug(exec, cwd);
   const aliases = numbers
     .map(
       (n) =>
-        `pr${n}: pullRequest(number: ${n}) { reviewThreads(first: 100) { nodes { isResolved } } }`,
+        `pr${n}: pullRequest(number: ${n}) { isInMergeQueue reviewThreads(first: 100) { nodes { isResolved } } }`,
     )
     .join("\n    ");
   const query = `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {\n    ${aliases}\n  } }`;
   const out = await gh(exec, cwd, ["api", "graphql", "-f", `query=${query}`]);
   const j = parseJson<{
     data?: {
-      repository?: Record<string, { reviewThreads: { nodes: { isResolved: boolean }[] } } | null>;
+      repository?: Record<string, { isInMergeQueue: boolean; reviewThreads: { nodes: { isResolved: boolean }[] } } | null>;
     };
   }>(out, "graphql threads");
   const repo = j.data?.repository ?? {};
   for (const n of numbers) {
-    const nodes = repo[`pr${n}`]?.reviewThreads.nodes ?? [];
-    counts.set(n, nodes.filter((t) => !t.isResolved).length);
+    const pr = repo[`pr${n}`];
+    const nodes = pr?.reviewThreads.nodes ?? [];
+    counts.set(n, { threads: nodes.filter((t) => !t.isResolved).length, inMergeQueue: pr?.isInMergeQueue ?? false });
   }
   return counts;
 }
 
-export function withThreads(prs: PullRequest[], counts: Map<number, number>): PullRequest[] {
-  return prs.map((p) => ({ ...p, unresolvedThreads: counts.get(p.number) ?? p.unresolvedThreads }));
+export function withThreads(prs: PullRequest[], counts: Map<number, PrEnrichment>): PullRequest[] {
+  return prs.map((p) => {
+    const enrichment = counts.get(p.number);
+    return enrichment ? { ...p, unresolvedThreads: enrichment.threads, inMergeQueue: enrichment.inMergeQueue } : p;
+  });
 }
 
 export type FileStatus = "A" | "M" | "D" | "R";
@@ -429,6 +441,7 @@ export interface ReviewThread {
 }
 
 export interface Discussion {
+  inMergeQueue: boolean;
   threads: ReviewThread[];
   /** PR-level comments (minimized ones flagged), non-empty review bodies and APPROVED/CHANGES_REQUESTED reviews, oldest first. */
   conversation: ConversationEntry[];
@@ -474,6 +487,7 @@ interface GqlReview {
   url: string;
 }
 interface GqlPr {
+  isInMergeQueue?: boolean;
   reviewThreads: Page<GqlThread>;
   reviews: Page<GqlReview>;
   comments: Page<GqlComment>;
@@ -484,6 +498,7 @@ const EMPTY_PAGE = { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
 const ACTOR = "author { login __typename }";
 const DISCUSSION_QUERY = `query($o: String!, $r: String!, $n: Int!, $tc: String, $rc: String, $cc: String) {
   repository(owner: $o, name: $r) { pullRequest(number: $n) {
+    isInMergeQueue
     reviewThreads(first: 100, after: $tc) { pageInfo { hasNextPage endCursor } nodes {
       id isResolved isOutdated path line originalLine startLine originalStartLine resolvedBy { login }
       comments(first: 100) { pageInfo { hasNextPage endCursor } nodes { ${ACTOR} body createdAt url diffHunk viewerDidAuthor pullRequestReview { id } } }
@@ -565,7 +580,7 @@ export function mapDiscussion(pr: GqlPr): Discussion {
     });
   }
   conversation.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
-  return { threads, conversation };
+  return { threads, conversation, inMergeQueue: pr.isInMergeQueue ?? false };
 }
 
 /** Review threads, reviews and issue comments in one paginated GraphQL query (one request unless something exceeds 100). */
@@ -580,6 +595,7 @@ export async function prDiscussion(exec: Exec, cwd: Where, number: number): Prom
     const j = parseJson<{ data?: { repository?: { pullRequest?: Partial<GqlPr> | null } } }>(await gh(exec, cwd, args), "discussion");
     const pr = j.data?.repository?.pullRequest;
     if (!pr) break;
+    acc.isInMergeQueue = pr.isInMergeQueue ?? false;
     const pairs = [
       ["tc", "reviewThreads"],
       ["rc", "reviews"],
@@ -980,6 +996,7 @@ export interface PrSummary {
   title: string;
   state: PullRequest["state"];
   isDraft: boolean;
+  inMergeQueue?: boolean;
   checks: "pass" | "fail" | "pending" | "none";
   /** Set when GitHub reports conflicts with the base, or has not computed mergeability yet. */
   mergeIssue?: "conflict" | "checking" | "blocked";
@@ -1002,12 +1019,13 @@ interface GqlSummary {
   state: string;
   headRefName?: string;
   isDraft: boolean;
+  isInMergeQueue?: boolean;
   mergeable?: string;
   mergeStateStatus?: string;
   statusCheckRollup?: { state: string } | null;
 }
 
-const SUMMARY_FIELDS = "number headRefName title state isDraft mergeable mergeStateStatus statusCheckRollup { state }";
+const SUMMARY_FIELDS = "number headRefName title state isDraft isInMergeQueue mergeable mergeStateStatus statusCheckRollup { state }";
 
 function mapSummary(p: GqlSummary): PrSummary {
   const r = p.statusCheckRollup?.state;
@@ -1020,6 +1038,7 @@ function mapSummary(p: GqlSummary): PrSummary {
     title: p.title,
     state: p.state === "MERGED" ? "MERGED" : p.state === "CLOSED" ? "CLOSED" : "OPEN",
     isDraft: p.isDraft,
+    ...(p.isInMergeQueue !== undefined ? { inMergeQueue: p.isInMergeQueue } : {}),
     checks,
     ...(mergeIssue ? { mergeIssue } : {}),
   };
@@ -1061,7 +1080,7 @@ export async function nativeStack(exec: Exec, where: Where, number: number): Pro
   return { entries, position: pr.stackEntry.position };
 }
 
-const MEMBER_FIELDS = `number title url state isDraft headRefName baseRefName headRefOid mergeable mergeStateStatus reviewDecision createdAt updatedAt
+const MEMBER_FIELDS = `number title url state isDraft isInMergeQueue headRefName baseRefName headRefOid mergeable mergeStateStatus reviewDecision createdAt updatedAt
   author { login }
   statusCheckRollup { contexts(first: 100) { nodes { __typename ... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } }
   reviewThreads(first: 100) { nodes { isResolved } }`;
@@ -1379,7 +1398,7 @@ export async function waitChecks(
 
 export type SessionFetchedPr = PullRequest & { mergedAt: string | null; closedAt: string | null };
 
-const SESSION_PR_FIELDS = `number title url state isDraft headRefName baseRefName headRefOid
+const SESSION_PR_FIELDS = `number title url state isDraft isInMergeQueue headRefName baseRefName headRefOid
       mergeable mergeStateStatus reviewDecision mergedAt closedAt createdAt updatedAt author { login }
       reviewThreads(first: 100) { nodes { isResolved } }
       commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {

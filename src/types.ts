@@ -48,6 +48,8 @@ export interface PullRequest {
   author: string;
   state: "OPEN" | "CLOSED" | "MERGED";
   isDraft: boolean;
+  /** Membership in GitHub's merge queue; absent when not loaded. */
+  inMergeQueue?: boolean;
   /** Short branch names. */
   headRef: string;
   baseRef: string;

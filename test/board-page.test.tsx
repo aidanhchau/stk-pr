@@ -112,6 +112,23 @@ async function renderBoard(prs = largeBoard()) {
   return { s, store, frame, refresh, prs };
 }
 
+test("a queued PR keeps its queue status visible when its stack is selected", async () => {
+  const root: BoardEntry = { ...largeBoard()[0]!, title: "Queue-bound change", inMergeQueue: true };
+  const child: BoardEntry = { ...largeBoard()[1]!, baseRef: root.headRef };
+  const { s, frame, store } = await renderBoard([root, child]);
+  await frame();
+  s.mockInput.pressKey("j");
+  await frame();
+  s.mockInput.pressKey("k");
+  const f = await frame();
+  const y = rowOf(f, root.title);
+  expect(y).toBeGreaterThanOrEqual(0);
+  expect(f[y + 1]).toContain("queued");
+  expect(f[y + 1]).not.toContain("ready");
+  expect(f.join("\n")).toContain("Merge stack S");
+  expect(store.getState().boardCursor).toBe(keyOf(root));
+});
+
 test("counted movement and single-row movement reach and open a distant PR on a seventy-row board", async () => {
   const { s, store, frame, prs } = await renderBoard();
   const target = prs[65]!;

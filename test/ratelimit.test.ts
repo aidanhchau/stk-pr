@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { forgetRateLimit, nativeStack, rateLimitReset, viewPr } from "../src/github";
-import { prDetail, slugCtx, type Ctx, type PrDetail } from "../src/service";
+import { listBoard, prDetail, slugCtx, type Ctx, type PrDetail } from "../src/service";
 import { Store } from "../src/tui/store";
 import { StkError, type Exec } from "../src/types";
 
@@ -19,6 +19,7 @@ interface FakeOpts {
   total?: number;
   /** PR numbers that are MERGED (their native-stack summary and `pr view` say so). */
   merged?: number[];
+  queued?: number[];
   /** Extra branch-stacked PRs: PR → the PR whose branch it is based on (makes forks in the ref topology). */
   bases?: Record<number, number>;
 }
@@ -77,6 +78,7 @@ function fakeGithub(o: FakeOpts = {}): Fake {
     title: `PR ${n}`,
     state: o.merged?.includes(n) ? "MERGED" : "OPEN",
     isDraft: false,
+    isInMergeQueue: o.queued?.includes(n) ?? false,
     statusCheckRollup: [{ state: "SUCCESS" }, { state: "FAILURE" }, { state: "PENDING" }, null][i % 4] ?? null,
   });
   const page = { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] };
@@ -110,10 +112,11 @@ function fakeGithub(o: FakeOpts = {}): Fake {
     if (/pr\d+: pullRequest/.test(query)) {
       const nums = [...query.matchAll(/pr(\d+): pullRequest/g)].map((m) => Number(m[1]));
       const repo: Record<string, unknown> = {};
-      for (const n of nums) repo[`pr${n}`] = query.includes("statusCheckRollup") ? summary(n, n) : { reviewThreads: { nodes: [] } };
+      for (const n of nums) repo[`pr${n}`] = query.includes("statusCheckRollup") ? summary(n, n) : { isInMergeQueue: o.queued?.includes(n) ?? false, reviewThreads: { nodes: [] } };
       return ok({ data: { repository: repo } });
     }
-    return ok({ data: { repository: { pullRequest: { reviewThreads: page, reviews: page, comments: page } } } });
+    const n = Number(argv.find((a) => /^n=\d+$/.test(a))?.slice(2));
+    return ok({ data: { repository: { pullRequest: { isInMergeQueue: o.queued?.includes(n) ?? false, reviewThreads: page, reviews: page, comments: page } } } });
   };
   return { exec, state, ctx: slugCtx(exec, SLUG) };
 }
@@ -122,7 +125,7 @@ beforeEach(() => forgetRateLimit());
 
 describe("prDetail stack entries", () => {
   test("native stack: members come from the one native query, no per-member pr view", async () => {
-    const { ctx, state } = fakeGithub({ native: [10, 11, 12, 13, 14, 15] });
+    const { ctx, state } = fakeGithub({ native: [10, 11, 12, 13, 14, 15], queued: [11, 12] });
     const d = await prDetail(ctx, 12);
     expect(d.stack?.entries.map((e) => [e.number, e.title, e.checks])).toEqual([
       [10, "PR 10", "pass"],
@@ -132,6 +135,8 @@ describe("prDetail stack entries", () => {
       [14, "PR 14", "pass"],
       [15, "PR 15", "fail"],
     ]);
+    expect(d.pr.inMergeQueue).toBe(true);
+    expect(d.stack?.entries.filter((e) => e.inMergeQueue).map((e) => e.number)).toEqual([11, 12]);
     expect(state.calls.filter((c) => c[1] === "pr" && c[2] === "view")).toHaveLength(1);
     // repo view (trunk) + pr view + discussion + pr list refs + native stack
     expect(state.graphql).toBe(5);
@@ -147,10 +152,12 @@ describe("prDetail stack entries", () => {
   });
 
   test("non-native stack: all other members in one aliased query", async () => {
-    const { ctx, state } = fakeGithub({ chain: [1, 2, 3, 4] });
+    const { ctx, state } = fakeGithub({ chain: [1, 2, 3, 4], queued: [2, 3] });
     const d = await prDetail(ctx, 2);
     expect(d.stack?.prs).toEqual([1, 2, 3, 4]);
     expect(d.stack?.entries.map((e) => e.title)).toEqual(["PR 1", "PR 2", "PR 3", "PR 4"]);
+    expect(d.pr.inMergeQueue).toBe(true);
+    expect(d.stack?.entries.filter((e) => e.inMergeQueue).map((e) => e.number)).toEqual([2, 3]);
     expect(state.calls.filter((c) => c[1] === "pr" && c[2] === "view")).toHaveLength(1);
     const summaries = state.calls.filter((c) => c.some((a) => a.includes("pr1: pullRequest")));
     expect(summaries).toHaveLength(1);
@@ -180,6 +187,17 @@ describe("prDetail stack entries", () => {
       expect(d.stack?.forks).toEqual([{ parent: 1, children: [2, 3] }]);
     }
   });
+});
+
+test("board merges queue membership in the existing single enrichment query", async () => {
+  const { ctx, state } = fakeGithub({ total: 3, queued: [2] });
+  const board = await listBoard(ctx, "all");
+  expect(board.prs.map((p) => [p.number, p.inMergeQueue])).toEqual([[1, false], [2, true], [3, false]]);
+  const enrichment = state.calls.filter((c) => c.some((a) => a.includes("pr1: pullRequest")));
+  expect(enrichment).toHaveLength(1);
+  expect(enrichment[0]!.join(" ")).toContain("isInMergeQueue");
+  expect(enrichment[0]!.join(" ")).toContain("reviewThreads");
+  expect(state.graphql).toBe(3); // trunk, list, and the existing batch enrichment
 });
 
 describe("rate-limit error mapping", () => {
