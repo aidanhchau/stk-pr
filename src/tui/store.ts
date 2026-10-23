@@ -1471,7 +1471,7 @@ export class Store {
     if (open.some((e) => e.number === n)) return open;
     const b = Object.values(this.state.boards).flatMap((r) => r?.data?.prs ?? []).find((p) => p.number === n);
     const pr = d?.pr ?? b;
-    return pr ? [{ number: n, title: pr.title, state: "OPEN", isDraft: pr.isDraft, checks: "none" }] : [];
+    return pr ? [{ number: n, title: pr.title, state: "OPEN", isDraft: pr.isDraft, inMergeQueue: pr.inMergeQueue, checks: "none" }] : [];
   }
 
   private dropStackInfo(rk: RepoKey): void {

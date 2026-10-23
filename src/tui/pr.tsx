@@ -266,15 +266,15 @@ function byTree(a: { path: string }, b: { path: string }): number {
   return x.length - y.length;
 }
 
-type BadgePr = { state: "OPEN" | "CLOSED" | "MERGED"; isDraft: boolean };
+type BadgePr = { state: "OPEN" | "CLOSED" | "MERGED"; isDraft: boolean; inMergeQueue?: boolean };
 /** Badge text; the stack list sizes its badge column from it. */
-const badgeLabel = (pr: BadgePr) => (pr.state === "MERGED" ? "Merged" : pr.state === "CLOSED" ? "Closed" : pr.isDraft ? "Draft" : "Open");
+const badgeLabel = (pr: BadgePr) => (pr.state === "MERGED" ? "Merged" : pr.state === "CLOSED" ? "Closed" : pr.inMergeQueue ? "Queued" : pr.isDraft ? "Draft" : "Open");
 
 /** GitHub-style state badge: solid pill, white bold text. */
 function StateBadge({ pr }: { pr: BadgePr }) {
   const p = useTheme();
   const label = badgeLabel(pr);
-  const bg = pr.state === "MERGED" ? p.merged : pr.state === "CLOSED" ? p.closed : pr.isDraft ? p.draft : p.open;
+  const bg = pr.state === "MERGED" ? p.merged : pr.state === "CLOSED" ? p.closed : pr.inMergeQueue ? p.queued : pr.isDraft ? p.draft : p.open;
   return (
     <box flexDirection="row" flexShrink={0}>
       <text fg="#FFFFFF" bg={bg} wrapMode="none">

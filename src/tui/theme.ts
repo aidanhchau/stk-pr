@@ -54,8 +54,9 @@ export interface Palette {
   ok: string;
   /** Amber for pending/running states. */
   warn: string;
-  /** State badge fills (white text): PR open / merged / closed / draft. */
+  /** State badge fills (white text): PR open / queued / merged / closed / draft. */
   open: string;
+  queued: string;
   merged: string;
   closed: string;
   draft: string;
@@ -84,6 +85,7 @@ export const light: Palette = {
   ok: "#1A7F37",
   warn: "#9A6700",
   open: "#1F883D",
+  queued: "#BC4C00",
   merged: "#8250DF",
   closed: "#CF222E",
   draft: "#6E7781",
@@ -111,6 +113,7 @@ export const dark: Palette = {
   ok: "#3FB950",
   warn: "#D29922",
   open: "#238636",
+  queued: "#BC4C00",
   merged: "#8957E5",
   closed: "#DA3633",
   draft: "#6E7781",

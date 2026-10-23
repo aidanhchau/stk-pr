@@ -3,6 +3,7 @@ import {
   branchRules,
   closeAndReopenPr,
   closePr,
+  fetchSessionPrs,
   markReady,
   reopenPr,
   rerunFailedChecks,
@@ -11,6 +12,9 @@ import {
   mapDiscussion,
   mergeAsync,
   nativeStack,
+  nativeStackDetail,
+  prDetails,
+  prSummaries,
   prDiscussion,
   requestMergeAsync,
   retargetPr,
@@ -80,6 +84,20 @@ describe("listPrs", () => {
     expect(prs[1]).toMatchObject({ isDraft: true, mergeable: "CONFLICTING", reviewDecision: "APPROVED", checks: [] });
   });
 
+  test("passes through provided queue membership without requesting it from gh pr list", async () => {
+    const raws = JSON.parse(await fx("pr-list.json"));
+    const { exec, calls } = fake([[["gh", "pr", "list"], { stdout: JSON.stringify([
+      { ...raws[0], isInMergeQueue: true },
+      { ...raws[1], isInMergeQueue: false },
+      { ...raws[0], number: 12 },
+    ]) }]]);
+    const prs = await listPrs(exec, "/repo");
+    expect(prs.map((p) => p.inMergeQueue)).toEqual([true, false, undefined]);
+    expect(prs[2]).not.toHaveProperty("inMergeQueue");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.argv[calls[0]!.argv.indexOf("--json") + 1]).not.toContain("isInMergeQueue");
+  });
+
   test("gh failure throws StkError gh-failed", async () => {
     const { exec } = fake([[["gh", "pr", "list"], { code: 1, stderr: "boom" }]]);
     const err = await listPrs(exec, "/repo").catch((e) => e);
@@ -106,42 +124,85 @@ describe("viewPr", () => {
     expect((await view({ body: null })).out.pr.body).toBe("");
     expect((await view({})).out.pr.body).toBe("");
   });
+
+  test("passes through true and false queue membership while leaving missing values absent", async () => {
+    for (const inMergeQueue of [true, false, undefined]) {
+      const { out, calls } = await view(inMergeQueue === undefined ? {} : { isInMergeQueue: inMergeQueue });
+      expect(out.pr.inMergeQueue).toBe(inMergeQueue);
+      if (inMergeQueue === undefined) expect(out.pr).not.toHaveProperty("inMergeQueue");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.argv.at(-1)).not.toContain("isInMergeQueue");
+    }
+  });
 });
 
 describe("threads", () => {
   const repoView = [["gh", "repo", "view", "--json", "owner,name"], { stdout: '{"owner":{"login":"o"},"name":"r"}' }] as [string[], Reply];
 
-  test("one aliased graphql query, counts merged into PRs", async () => {
+  test("one aliased graphql query enriches thread counts and queue membership together", async () => {
+    const response = JSON.parse(await fx("threads-graphql.json"));
+    response.data.repository.pr10.isInMergeQueue = true;
+    response.data.repository.pr11.isInMergeQueue = false;
     const { exec, calls } = fake([
       repoView,
       [["gh", "pr", "list"], { stdout: await fx("pr-list.json") }],
-      [["gh", "api", "graphql"], { stdout: await fx("threads-graphql.json") }],
+      [["gh", "api", "graphql"], { stdout: JSON.stringify(response) }],
     ]);
     const prs = await listPrs(exec, "/repo");
     const counts = await unresolvedThreadCounts(exec, "/repo", prs.map((p) => p.number));
-    expect(counts.get(10)).toBe(2);
-    expect(counts.get(11)).toBe(0);
+    expect(counts.get(10)).toEqual({ threads: 2, inMergeQueue: true });
+    expect(counts.get(11)).toEqual({ threads: 0, inMergeQueue: false });
     const gql = calls.filter((c) => c.argv[2] === "graphql");
     expect(gql).toHaveLength(1);
     const query = gql[0]!.argv.find((a) => a.startsWith("query="))!;
     expect(query).toContain("pr10: pullRequest(number: 10)");
     expect(query).toContain("pr11: pullRequest(number: 11)");
     expect(query).toContain("reviewThreads(first: 100)");
+    expect(query.match(/isInMergeQueue/g)).toHaveLength(2);
     expect(query).toContain('owner: "o"');
     const merged = withThreads(prs, counts);
-    expect(merged.map((p) => p.unresolvedThreads)).toEqual([2, 0]);
+    expect(merged.map((p) => [p.unresolvedThreads, p.inMergeQueue])).toEqual([[2, true], [0, false]]);
+    expect(calls).toHaveLength(3);
   });
 
-  test("getPr includes threads", async () => {
+  test("getPr includes thread counts and queue membership without an extra query", async () => {
     const one = JSON.stringify(JSON.parse(await fx("pr-list.json"))[0]);
-    const { exec } = fake([
+    const response = JSON.parse(await fx("threads-graphql.json"));
+    response.data.repository.pr10.isInMergeQueue = true;
+    const { exec, calls } = fake([
       repoView,
       [["gh", "pr", "view", "10"], { stdout: one }],
-      [["gh", "api", "graphql"], { stdout: await fx("threads-graphql.json") }],
+      [["gh", "api", "graphql"], { stdout: JSON.stringify(response) }],
     ]);
     const pr = await getPr(exec, "/repo", 10);
     expect(pr.unresolvedThreads).toBe(2);
+    expect(pr.inMergeQueue).toBe(true);
     expect(pr.number).toBe(10);
+    expect(calls.filter((c) => c.argv[2] === "graphql")).toHaveLength(1);
+    expect(calls.find((c) => c.argv[1] === "pr")!.argv.at(-1)).not.toContain("isInMergeQueue");
+    expect(calls).toHaveLength(3);
+  });
+
+  test("missing fixture queue membership defaults to false", async () => {
+    const { exec } = fake([
+      repoView,
+      [["gh", "api", "graphql"], { stdout: await fx("threads-graphql.json") }],
+    ]);
+    const counts = await unresolvedThreadCounts(exec, "/repo", [10, 11]);
+    expect([...counts]).toEqual([
+      [10, { threads: 2, inMergeQueue: false }],
+      [11, { threads: 0, inMergeQueue: false }],
+    ]);
+  });
+
+  test("withThreads replaces both fields and preserves PRs absent from enrichment", async () => {
+    const { exec } = fake([[["gh", "pr", "list"], { stdout: await fx("pr-list.json") }]]);
+    const prs = (await listPrs(exec, "/repo")).map((p) => ({ ...p, unresolvedThreads: 7, inMergeQueue: true }));
+    const merged = withThreads(prs, new Map([[10, { threads: 0, inMergeQueue: false }]]));
+    expect(merged[0]).toMatchObject({ number: 10, unresolvedThreads: 0, inMergeQueue: false });
+    expect(merged[1]).toEqual(prs[1]);
+    expect(merged[1]).toMatchObject({ number: 11, unresolvedThreads: 7, inMergeQueue: true });
+    expect(prs[0]).toMatchObject({ unresolvedThreads: 7, inMergeQueue: true });
   });
 
   test("empty list makes no calls", async () => {
@@ -424,6 +485,81 @@ describe("nativeStack", () => {
   });
 });
 
+describe("GraphQL queue membership", () => {
+  const raws = [true, false, undefined].map((inMergeQueue, i) => ({
+    number: 10 + i, title: `PR ${10 + i}`, state: "OPEN", isDraft: false,
+    headRefName: `branch-${i}`, baseRefName: "main", headRefOid: `sha-${i}`,
+    ...(inMergeQueue !== undefined ? { isInMergeQueue: inMergeQueue } : {}),
+    reviewThreads: { nodes: [{ isResolved: false }, { isResolved: true }] },
+  }));
+  const aliases = Object.fromEntries(raws.map((pr) => [`pr${pr.number}`, pr]));
+  const reply = (repository: object) => ({ stdout: JSON.stringify({ data: { repository } }) });
+
+  test("prDetails maps provided membership from MEMBER_FIELDS in one query", async () => {
+    const { exec, calls } = fake([[["gh", "api", "graphql"], reply(aliases)]]);
+    const prs = await prDetails(exec, SLUG, [10, 11, 12]);
+    expect(prs.map((pr) => [pr.number, pr.inMergeQueue, pr.unresolvedThreads])).toEqual([
+      [10, true, 1], [11, false, 1], [12, undefined, 1],
+    ]);
+    expect(prs[2]).not.toHaveProperty("inMergeQueue");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.argv.find((a) => a.startsWith("query="))!.match(/isInMergeQueue/g)).toHaveLength(3);
+  });
+
+  test("nativeStackDetail maps each member's membership in the existing query", async () => {
+    const { exec, calls } = fake([[["gh", "api", "graphql"], reply({
+      defaultBranchRef: { name: "main" },
+      pullRequest: {
+        stackEntry: { position: 2 },
+        stack: { size: 3, entries: { nodes: raws.map((pr, i) => ({ position: i + 1, pullRequest: pr })) } },
+      },
+    })]]);
+    const stack = await nativeStackDetail(exec, SLUG, 11);
+    expect(stack!.members.map(({ pr }) => [pr.number, pr.inMergeQueue, pr.unresolvedThreads])).toEqual([
+      [10, true, 1], [11, false, 1], [12, undefined, 1],
+    ]);
+    expect(stack!.members[2]!.pr).not.toHaveProperty("inMergeQueue");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.argv.find((a) => a.startsWith("query="))).toContain("isInMergeQueue");
+  });
+
+  test("fetchSessionPrs maps membership from SESSION_PR_FIELDS in one query", async () => {
+    const { exec, calls } = fake([[["gh", "api", "graphql"], reply({
+      defaultBranchRef: { name: "main" }, ...aliases,
+    })]]);
+    const { prs } = await fetchSessionPrs(exec, SLUG, [10, 11, 12]);
+    expect(prs.map((pr) => [pr.number, pr.inMergeQueue, pr.unresolvedThreads])).toEqual([
+      [10, true, 1], [11, false, 1], [12, undefined, 1],
+    ]);
+    expect(prs[2]).not.toHaveProperty("inMergeQueue");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.argv.find((a) => a.startsWith("query="))!.match(/isInMergeQueue/g)).toHaveLength(3);
+  });
+
+  test("prSummaries maps true, false and absent membership from SUMMARY_FIELDS", async () => {
+    const { exec, calls } = fake([[["gh", "api", "graphql"], reply(aliases)]]);
+    const summaries = await prSummaries(exec, SLUG, [10, 11, 12]);
+    expect([...summaries.values()].map((pr) => pr.inMergeQueue)).toEqual([true, false, undefined]);
+    expect(summaries.get(12)).not.toHaveProperty("inMergeQueue");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.argv.find((a) => a.startsWith("query="))!.match(/isInMergeQueue/g)).toHaveLength(3);
+  });
+
+  test("nativeStack maps queue membership for summaries without extra lookups", async () => {
+    const { exec, calls } = fake([[["gh", "api", "graphql"], reply({
+      pullRequest: {
+        stackEntry: { position: 2 },
+        stack: { size: 3, entries: { nodes: raws.map((pr, i) => ({ position: i + 1, pullRequest: pr })) } },
+      },
+    })]]);
+    const stack = await nativeStack(exec, SLUG, 11);
+    expect(stack!.entries.map((pr) => pr.inMergeQueue)).toEqual([true, false, undefined]);
+    expect(stack!.entries[2]).not.toHaveProperty("inMergeQueue");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.argv.find((a) => a.startsWith("query="))).toContain("isInMergeQueue");
+  });
+});
+
 describe("retarget / trunk", () => {
   test("retarget argv", async () => {
     const { exec, calls } = fake([[["gh", "pr", "edit"], {}]]);
@@ -574,12 +710,34 @@ describe("discussion", () => {
   const actor = (login: string, bot = false) => ({ login, __typename: bot ? "Bot" : "User" });
   const page = <T>(nodes: T[], next: string | null = null) => ({ pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes });
   const empty = page<never>([]);
-  const pr = (p: { reviewThreads?: unknown; reviews?: unknown; comments?: unknown }) =>
+  const pr = (p: { isInMergeQueue?: boolean; reviewThreads?: unknown; reviews?: unknown; comments?: unknown }) =>
     JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: empty, reviews: empty, comments: empty, ...p } } } });
+
+  test("mapDiscussion carries explicit queue membership and defaults missing fixtures to false", () => {
+    const base = { reviewThreads: empty, reviews: empty, comments: empty };
+    expect(mapDiscussion({ ...base, isInMergeQueue: true }).inMergeQueue).toBe(true);
+    expect(mapDiscussion({ ...base, isInMergeQueue: false }).inMergeQueue).toBe(false);
+    expect(mapDiscussion(base).inMergeQueue).toBe(false);
+  });
+
+  test("prDiscussion gets true and false queue membership in its existing GraphQL query", async () => {
+    for (const isInMergeQueue of [true, false]) {
+      const { exec, calls } = fake([
+        repoView,
+        [["gh", "api", "graphql"], { stdout: pr({ isInMergeQueue }) }],
+      ]);
+      expect((await prDiscussion(exec, "/repo", 7)).inMergeQueue).toBe(isInMergeQueue);
+      const queries = calls.filter((c) => c.argv[2] === "graphql");
+      expect(queries).toHaveLength(1);
+      expect(queries[0]!.argv.find((a) => a.startsWith("query="))).toContain("isInMergeQueue");
+      expect(calls).toHaveLength(2);
+    }
+  });
 
   test("maps bots, outdated, urls; keeps every comment and non-empty review", async () => {
     const { exec } = fake([repoView, [["gh", "api", "graphql"], { stdout: await fx("discussion-single-pr.json") }]]);
     const d = await prDiscussion(exec, "/repo", 102);
+    expect(d.inMergeQueue).toBe(false);
     expect(d.conversation.every((e) => !e.minimized)).toBe(true);
     // sorted by time; the empty-body-free fixture keeps both reviews and issue comments
     expect(d.conversation.map((e) => [e.kind, e.author, e.isBot])).toEqual([
@@ -676,6 +834,7 @@ describe("discussion", () => {
         out = { data: { node: { comments: page([c("t1-b")]) } } };
       } else if (!has("tc=T-1") && !has("rc=R-1") && !has("cc=C-1")) {
         out = { data: { repository: { pullRequest: {
+          isInMergeQueue: true,
           reviewThreads: page([th("T1", page([c("t1-a")], "TC-1"))], "T-1"),
           reviews: page([rv(1)], "R-1"),
           comments: page([ic(1)], "C-1"),
@@ -683,6 +842,7 @@ describe("discussion", () => {
       } else {
         expect(has("tc=T-1") && has("rc=R-1") && has("cc=C-1")).toBe(true);
         out = { data: { repository: { pullRequest: {
+          isInMergeQueue: true,
           reviewThreads: page([th("T2", page([c("t2-a")]))]),
           reviews: page([rv(2)]),
           comments: page([ic(2)]),
@@ -691,12 +851,17 @@ describe("discussion", () => {
       return { code: 0, stdout: JSON.stringify(out), stderr: "" };
     };
     const d = await prDiscussion(exec, "/repo", 7);
+    expect(d.inMergeQueue).toBe(true);
     expect(d.threads.map((t) => [t.id, t.isOutdated, t.comments.map((x) => x.body)])).toEqual([
       ["T1", false, ["t1-a", "t1-b"]],
       ["T2", true, ["t2-a"]],
     ]);
     expect(d.conversation.map((e) => e.id)).toEqual(["rv1", "rv2", "ic1", "ic2"]);
     expect(queries.filter((q) => q.some((x) => x.startsWith("n=7"))).length).toBe(2);
+    expect(queries).toHaveLength(3);
+    for (const query of queries.filter((q) => q.includes("n=7"))) {
+      expect(query.find((a) => a.startsWith("query="))).toContain("isInMergeQueue");
+    }
   });
 });
 

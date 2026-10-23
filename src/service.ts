@@ -118,6 +118,7 @@ export interface StackEntry {
   title: string;
   state: PullRequest["state"];
   isDraft: boolean;
+  inMergeQueue?: boolean;
   /** Checks roll-up: any failure wins, then pending, else pass; `none` when it has no checks. */
   checks: "pass" | "fail" | "pending" | "none";
   /** Conflicts with its base, or mergeability still being computed. */
@@ -393,11 +394,11 @@ export async function prDetail(ctx: Ctx, n: number): Promise<PrDetail> {
           return undefined;
         })
       : undefined;
-  const pr = fillWorktrees([{ ...view.pr, unresolvedThreads, ...(behind !== undefined ? { behindBy: behind } : {}) }], ctx.worktrees)[0]!;
+  const pr = fillWorktrees([{ ...view.pr, unresolvedThreads, inMergeQueue: discussion.inMergeQueue, ...(behind !== undefined ? { behindBy: behind } : {}) }], ctx.worktrees)[0]!;
   let stack: PrDetail["stack"] = null;
   if (pr.state !== "OPEN" && native) {
     // GitHub keeps `stack` for merged/closed PRs, so merged members stay listed; the ref chain only knows open PRs
-    const entries = native.entries.map((e): StackEntry => (e.number === n ? { number: n, title: pr.title, state: pr.state, isDraft: pr.isDraft, checks: e.checks } : { number: e.number, title: e.title, state: e.state, isDraft: e.isDraft, checks: e.checks, ...(e.mergeIssue ? { mergeIssue: e.mergeIssue } : {}) }));
+    const entries = native.entries.map((e): StackEntry => (e.number === n ? { number: n, title: pr.title, state: pr.state, isDraft: pr.isDraft, inMergeQueue: pr.inMergeQueue, checks: e.checks } : { number: e.number, title: e.title, state: e.state, isDraft: e.isDraft, inMergeQueue: e.inMergeQueue, checks: e.checks, ...(e.mergeIssue ? { mergeIssue: e.mergeIssue } : {}) }));
     stack = { trunk, prs: entries.map((e) => e.number), entries, native: true, forks: [] };
   }
   if (!stack && pr.state === "OPEN" && refs) {
@@ -420,11 +421,11 @@ export async function prDetail(ctx: Ctx, n: number): Promise<PrDetail> {
             const cs = pr.checks.filter((c) => c.state !== "skipped");
             const checks = !cs.length ? "none" : cs.some((c) => c.state === "fail") ? "fail" : cs.some((c) => c.state === "pending") ? "pending" : "pass";
             const mergeIssue = blockerIssue(blockers(pr, trunk, rules));
-            return { number: n, title: pr.title, state: pr.state, isDraft: pr.isDraft, checks, ...(mergeIssue ? { mergeIssue } : {}), ...place };
+            return { number: n, title: pr.title, state: pr.state, isDraft: pr.isDraft, inMergeQueue: pr.inMergeQueue, checks, ...(mergeIssue ? { mergeIssue } : {}), ...place };
           }
           const p = known.get(r.number) ?? extra.get(r.number);
           return p
-            ? { number: p.number, title: p.title, state: p.state, isDraft: p.isDraft, checks: p.checks, ...(p.mergeIssue ? { mergeIssue: p.mergeIssue } : {}), ...place }
+            ? { number: p.number, title: p.title, state: p.state, isDraft: p.isDraft, inMergeQueue: p.inMergeQueue, checks: p.checks, ...(p.mergeIssue ? { mergeIssue: p.mergeIssue } : {}), ...place }
             : { number: r.number, title: "", state: "OPEN", isDraft: false, checks: "none", ...place };
         });
         stack = { trunk, prs: s.prs.map((p) => p.number), entries, native: native !== null, forks: tree?.forks ?? [] };

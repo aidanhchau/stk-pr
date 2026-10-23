@@ -376,8 +376,8 @@ function metaText(it: Item, wide: boolean, narrow: boolean, now: number, mode: G
   const pr = it.pr;
   const parts = [`#${pr.number}`];
   if (it.parent !== null) parts.push(`on #${it.parent}`);
-  // Time grouping hides status in the headings: say it per open row (merged/closed rows say it below).
-  if (mode === "time" && pr.state === "OPEN") parts.push(STATUS_WORD[statusOf(it)]);
+  // Queued PRs say so in every grouping; time grouping also needs the other open statuses per row.
+  if (pr.state === "OPEN" && (pr.inMergeQueue || mode === "time")) parts.push(pr.inMergeQueue ? "queued" : STATUS_WORD[statusOf(it)]);
   parts.push(pr.author);
   const opened = openedText(pr.createdAt, now);
   if (opened) parts.push(opened);
@@ -471,7 +471,7 @@ const BoardRow = memo(function BoardRow({ it, selected, busy, titleW, wide, narr
   const wt = hasWt ? (pr.worktree ? "  wt" : " ".repeat(WT_W)) : "";
   const done = pr.state !== "OPEN";
   const metaStr = `${showRepo && pr.repo ? `${pr.repo.name} ` : ""}${metaText(it, wide, narrow, now, mode)}`;
-  const word = pr.state === "MERGED" ? "merged" : pr.state === "CLOSED" ? "closed" : "";
+  const word = pr.state === "MERGED" ? "merged" : pr.state === "CLOSED" ? "closed" : pr.inMergeQueue ? "queued" : "";
   const at = word ? metaStr.lastIndexOf(word) : -1;
   const meta =
     at < 0 ? (
@@ -479,7 +479,7 @@ const BoardRow = memo(function BoardRow({ it, selected, busy, titleW, wide, narr
     ) : (
       <text wrapMode="none" truncate fg={mutedFg}>
         {metaStr.slice(0, at)}
-        <span fg={pr.state === "MERGED" ? p.merged : p.closed}>{word}</span>
+        <span fg={pr.state === "MERGED" ? p.merged : pr.state === "CLOSED" ? p.closed : p.queued}>{word}</span>
         {metaStr.slice(at + word.length)}
       </text>
     );
